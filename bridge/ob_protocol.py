@@ -69,8 +69,15 @@ async def _handle_ob_api(data: dict):
             if seg_type == "text":
                 text = seg_data.get("text", "")
                 if text:
-                    await asyncio.to_thread(state.sender_instance.send_text, contact, text)
-                    log.info("[OB11] 文字已发送: characters=%s", len(text))
+                    sent = await asyncio.to_thread(
+                        state.sender_instance.send_text,
+                        contact,
+                        text,
+                    )
+                    if sent is True:
+                        log.info("[OB11] 文字已发送: characters=%s", len(text))
+                    else:
+                        log.error("[OB11] 消息发送失败")
 
             elif seg_type == "image":
                 file_val = seg_data.get("file", "")
@@ -78,6 +85,7 @@ async def _handle_ob_api(data: dict):
                     continue
 
                 img_path = None
+                temporary_image = False
 
                 # AstrBot 通过 aiocqhttp 发图片时用 base64:// 格式
                 if file_val.startswith("base64://"):
@@ -86,6 +94,7 @@ async def _handle_ob_api(data: dict):
                         b64_data = file_val[9:]
                         img_path = await asyncio.to_thread(_decode_base64_image, b64_data)
                         if img_path:
+                            temporary_image = True
                             log.info("[OB11] 图片已解码")
                     except Exception:
                         log.warning("[OB11] base64 图片解码失败")
@@ -106,19 +115,33 @@ async def _handle_ob_api(data: dict):
                 if img_path:
                     try:
                         # 使用线程池执行同步的 UIA 发送，避免阻塞事件循环
-                        await asyncio.to_thread(state.sender_instance.send_image, contact, img_path)
-                        log.info("[OB11] 图片已发送")
+                        sent = await asyncio.to_thread(
+                            state.sender_instance.send_image,
+                            contact,
+                            img_path,
+                        )
+                        if sent is True:
+                            log.info("[OB11] 图片已发送")
+                        else:
+                            log.error("[OB11] 消息发送失败")
                     finally:
                         # 临时文件用完删除
-                        if img_path and "tmp" in img_path:
+                        if temporary_image:
                             try:
                                 os.unlink(img_path)
                             except Exception:
                                 pass
 
             elif seg_type == "face":
-                await asyncio.to_thread(state.sender_instance.send_text, contact, "[表情]")
-                log.info("[OB11] 表情已发送")
+                sent = await asyncio.to_thread(
+                    state.sender_instance.send_text,
+                    contact,
+                    "[表情]",
+                )
+                if sent is True:
+                    log.info("[OB11] 表情已发送")
+                else:
+                    log.error("[OB11] 消息发送失败")
 
             # 其他类型（record, video 等）忽略
 
@@ -207,11 +230,48 @@ def push_event(event: dict) -> bool:
         return False
 
 
+def _close_failed_tempfile(tmp) -> None:
+    """Best-effort close without replacing the operation's original error."""
+    try:
+        tmp.close()
+        return
+    except BaseException:
+        pass
+
+    try:
+        raw_file = tmp.file
+    except BaseException:
+        return
+    try:
+        raw_file.close()
+    except BaseException:
+        pass
+
+
+def _discard_owned_tempfile(tmp, owned_path: str) -> None:
+    """Close and remove only the temporary path created by this module."""
+    _close_failed_tempfile(tmp)
+    for attempt in range(2):
+        try:
+            os.unlink(owned_path)
+            return
+        except FileNotFoundError:
+            return
+        except BaseException:
+            if attempt == 0:
+                _close_failed_tempfile(tmp)
+
+
 def _decode_base64_image(b64_data: str) -> str | None:
     """在线程池中执行：解码 base64 图片并保存为临时文件。"""
-    import tempfile
     img_data = base64.b64decode(b64_data)
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    tmp.write(img_data)
-    tmp.close()
-    return tmp.name
+    owned_path = os.fspath(tmp.name)
+    try:
+        tmp.write(img_data)
+        tmp.flush()
+        tmp.close()
+    except BaseException:
+        _discard_owned_tempfile(tmp, owned_path)
+        raise
+    return owned_path

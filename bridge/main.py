@@ -15,7 +15,7 @@ import requests
 
 import state
 import config
-from senders import create_sender
+from uia_fixed_sender import UiaFixedSender
 from ob_client import _run_ob_client
 from bridge_core import WeFlowBridge
 from web_panel import WebHandler, PAGE
@@ -33,7 +33,7 @@ def _start_bridge():
             return
         state.running = True
     state.paused.clear()
-    state.sender_instance = create_sender()
+    state.sender_instance = UiaFixedSender(config.UIA_FIXED_CALIBRATION)
 
     if not state.ob_client_started:
         t = threading.Thread(target=_run_ob_client, daemon=True, name="ob11-client")
@@ -82,16 +82,12 @@ def _stop_bridge():
 
 
 def _bridge_loop():
-    import ctypes
-    ctypes.windll.ole32.CoInitialize(None)
-
     if not config.ACCESS_TOKEN:
         log.error("❌ 未配置 access_token")
         state.running = False
         return
 
-    send_method = config.SEND_METHOD if config.SEND_METHOD in ("weflow_api", "uia", "uia_fixed") else "other"
-    log.info("Bridge | endpoints=WeFlow,OB11 | send_method=%s", send_method)
+    log.info("Bridge | endpoints=WeFlow,OB11 | sender_mode=uia_fixed")
 
     bridge = WeFlowBridge(state.sender_instance)
     with state.bridge_lock:

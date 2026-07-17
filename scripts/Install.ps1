@@ -26,10 +26,17 @@ function ConvertFrom-AkashaCodePoints {
 
 function Get-AkashaLauncherNames {
   $install = (ConvertFrom-AkashaCodePoints -CodePoints @(0x5B89, 0x88C5)) + '.bat'
+  $calibrate = (ConvertFrom-AkashaCodePoints -CodePoints @(0x6821, 0x51C6)) + '.bat'
   $start = (ConvertFrom-AkashaCodePoints -CodePoints @(0x542F, 0x52A8)) + '.bat'
   $stop = (ConvertFrom-AkashaCodePoints -CodePoints @(0x505C, 0x6B62)) + '.bat'
   $health = (ConvertFrom-AkashaCodePoints -CodePoints @(0x5065, 0x5EB7, 0x68C0, 0x67E5)) + '.bat'
-  return [pscustomobject]@{ Install = $install; Start = $start; Stop = $stop; Health = $health }
+  return [pscustomobject]@{
+    Install = $install
+    Calibrate = $calibrate
+    Start = $start
+    Stop = $stop
+    Health = $health
+  }
 }
 
 function Get-AkashaInstallPayload {
@@ -37,7 +44,7 @@ function Get-AkashaInstallPayload {
   $entries = New-Object System.Collections.Generic.List[object]
   foreach ($name in @(
       'bridge_core.py', 'config.py', 'main.py', 'ob_client.py', 'ob_protocol.py', 'privacy.py',
-      'senders.py', 'state.py', 'uia_fixed_sender.py', 'uia_sender.py', 'web_panel.py',
+      'state.py', 'uia_fixed_sender.py', 'uia_support.py', 'calibrate_uia_fixed.py', 'web_panel.py',
       'config.example.json', 'requirements.txt', 'requirements.lock'
     )) {
     $entries.Add([pscustomobject]@{ Source = Join-Path 'bridge' $name; Destination = Join-Path 'app\bridge' $name })
@@ -45,11 +52,11 @@ function Get-AkashaInstallPayload {
   foreach ($name in @(
       'AkashaBot.Common.psm1', 'Test-Prerequisites.ps1', 'Initialize-Environments.ps1',
       'Initialize-Configuration.ps1', 'Start-Services.ps1', 'Stop-Services.ps1',
-      'Test-Health.ps1', 'Install.ps1'
+      'Test-Health.ps1', 'Calibrate-Uia.ps1', 'Install.ps1'
     )) {
     $entries.Add([pscustomobject]@{ Source = Join-Path 'scripts' $name; Destination = Join-Path 'scripts' $name })
   }
-  foreach ($name in @($launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
+  foreach ($name in @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
     $entries.Add([pscustomobject]@{ Source = $name; Destination = $name })
   }
   return $entries.ToArray()
@@ -360,7 +367,8 @@ function Install-AkashaPayload {
   $transactionId = [guid]::NewGuid().ToString('N')
   $stageRoot = Join-Path $Paths.State ('.install-stage-' + $transactionId)
   $rollbackRoot = Join-Path $Paths.State ('.install-rollback-' + $transactionId)
-  $topTargets = @('app\bridge', 'scripts') + @((Get-AkashaLauncherNames).Start, (Get-AkashaLauncherNames).Stop, (Get-AkashaLauncherNames).Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+  $launchers = Get-AkashaLauncherNames
+  $topTargets = @('app\bridge', 'scripts') + @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
   $movedOriginals = New-Object System.Collections.Generic.List[string]
   $committedTargets = New-Object System.Collections.Generic.List[string]
   $originalLocations = @{}
@@ -574,6 +582,7 @@ function Invoke-AkashaInstall {
     [scriptblock]$ShortcutCreator,
     [scriptblock]$ServiceStarter,
     [scriptblock]$HealthChecker,
+    [scriptblock]$CalibrationStatusReader,
     [scriptblock]$ReplacementHook
   )
 
@@ -588,6 +597,7 @@ function Invoke-AkashaInstall {
   if ($null -eq $ShortcutCreator) { $ShortcutCreator = { param($entries) New-AkashaShortcuts -Entries $entries } }
   if ($null -eq $ServiceStarter) { $ServiceStarter = { param($root) Start-AkashaServices -InstallRoot $root | Out-Null } }
   if ($null -eq $HealthChecker) { $HealthChecker = { param($root) Invoke-AkashaHealthCheck -InstallRoot $root } }
+  if ($null -eq $CalibrationStatusReader) { $CalibrationStatusReader = { param($configPath) Get-AkashaUiaCalibrationStatus -ConfigPath $configPath } }
 
   $payload = @(Get-AkashaInstallPayload)
   $sourceContext = Open-AkashaLifecycleRootContext -Root $SourceRoot
@@ -598,6 +608,7 @@ function Invoke-AkashaInstall {
   $paths = $null
   $version = ''
   $startAfterUnlock = $false
+  $calibrationRequired = $false
   $installStateActive = $false
   try {
     $version = Assert-AkashaInstallSource -Root $sourceContext.RootPath -Payload $payload
@@ -685,9 +696,18 @@ function Invoke-AkashaInstall {
       [pscustomobject]@{ Path = Join-Path $desktop ((ConvertFrom-AkashaCodePoints @(0x68C0, 0x67E5)) + ' AkashaBot.lnk'); Target = Join-Path $paths.Root $launchers.Health; WorkingDirectory = $paths.Root }
     )
     & $ShortcutCreator $shortcutEntries
+    $calibrationStatusValues = @(& $CalibrationStatusReader $paths.BridgeConfig)
+    if ($calibrationStatusValues.Count -ne 1 -or $calibrationStatusValues[0] -isnot [string] -or
+        @('required', 'invalid', 'ready') -cnotcontains [string]$calibrationStatusValues[0]) {
+      throw 'E_INSTALL_FAILED: Calibration status reader returned an unsupported value.'
+    }
+    $calibrationStatus = [string]$calibrationStatusValues[0]
+    $calibrationRequired = $calibrationStatus -cne 'ready'
+    $calibrationRequiredText = if ($calibrationRequired) { 'true' } else { 'false' }
+    Write-AkashaInstallLog -Paths $paths -Message ('phase=calibration calibration_required=' + $calibrationRequiredText)
     Write-AkashaInstallState -Paths $paths -Status 'installed' -Version $version
     Write-AkashaInstallLog -Paths $paths -Message ('phase=install status=completed version=' + $version)
-    $startAfterUnlock = -not $SkipStart
+    $startAfterUnlock = (-not $SkipStart) -and (-not $calibrationRequired)
   } catch {
     $code = Get-AkashaInstallErrorCode -ErrorRecord $_
     if ($installStateActive -and @('E_WEFLOW_NOT_DETECTED', 'E_WEFLOW_CONFIG_MISSING') -cnotcontains $code) {
@@ -710,12 +730,22 @@ function Invoke-AkashaInstall {
     $healthCode = [int](& $HealthChecker $paths.Root)
     if ($healthCode -ne 0) { throw 'E_HEALTH_FAILED: One or more services failed the aggregate health check.' }
   }
-  return [pscustomobject]@{ Status = 'installed'; Version = $version; InstallRoot = $paths.Root; Started = $startAfterUnlock }
+  return [pscustomobject]@{
+    Status = 'installed'
+    Version = $version
+    InstallRoot = $paths.Root
+    Started = $startAfterUnlock
+    CalibrationRequired = $calibrationRequired
+  }
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
   try {
-    Invoke-AkashaInstall -InstallRoot $InstallRoot -SourceRoot $SourceRoot -WeFlowInstallerPath $WeFlowInstallerPath -WeFlowConfigPath $WeFlowConfigPath -SkipStart:$SkipStart | Out-Null
+    $installResult = Invoke-AkashaInstall -InstallRoot $InstallRoot -SourceRoot $SourceRoot -WeFlowInstallerPath $WeFlowInstallerPath -WeFlowConfigPath $WeFlowConfigPath -SkipStart:$SkipStart
+    if ($installResult.CalibrationRequired) {
+      $launchers = Get-AkashaLauncherNames
+      Write-Host ('Calibration is required before startup. Run "' + $launchers.Calibrate + '" from the install directory.')
+    }
     exit 0
   } catch {
     [Console]::Error.WriteLine((Get-AkashaInstallErrorCode -ErrorRecord $_))

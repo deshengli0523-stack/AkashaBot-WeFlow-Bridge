@@ -107,7 +107,21 @@ function New-InstallFixture {
   $weFlow = Join-Path $installRoot 'external\WeFlow.exe'
   Copy-Item -LiteralPath $fixtureBinary -Destination $weFlow -Force
   Set-Content -LiteralPath (Join-Path $paths.Bridge 'main.py') -Value '# fixture' -Encoding ASCII
-  Set-Content -LiteralPath $paths.BridgeConfig -Value '{}' -Encoding ASCII
+  $validConfiguration = [pscustomobject][ordered]@{
+    uia_fixed_calibration = [pscustomobject][ordered]@{
+      schema_version = 1
+      completed = $true
+      coordinate_space = 'client_area_ratio'
+      points = [pscustomobject][ordered]@{
+        search_box = [pscustomobject][ordered]@{ x = 0.1; y = 0.1 }
+        first_result = [pscustomobject][ordered]@{ x = 0.2; y = 0.2 }
+        message_input = [pscustomobject][ordered]@{ x = 0.6; y = 0.8 }
+        send_button = [pscustomobject][ordered]@{ x = 0.9; y = 0.9 }
+      }
+      reference = [pscustomobject][ordered]@{ client_width = 1200; client_height = 800; aspect_ratio = 1.5; dpi = 96 }
+    }
+  }
+  [System.IO.File]::WriteAllText($paths.BridgeConfig, ($validConfiguration | ConvertTo-Json -Depth 16), (New-Object System.Text.UTF8Encoding($false)))
   Set-Content -LiteralPath (Join-Path $paths.AstrBotData 'fixture.txt') -Value 'fixture' -Encoding ASCII
   Set-Content -LiteralPath $paths.WeFlowPathState -Value $weFlow -Encoding ASCII
   return [pscustomobject]@{
@@ -259,6 +273,22 @@ try {
   } 'E_NOT_INSTALLED:*' 'Start did not fail closed when bridge main.py was missing.' | Out-Null
   $recordCountAfter = @(Get-ChildItem -LiteralPath $preflight.RecordRoot -File -ErrorAction SilentlyContinue).Count
   Assert-Equal $recordCountAfter $recordCountBefore 'Preflight failure launched a process.'
+
+  $requiredCalibration = New-InstallFixture -Name 'required-calibration'
+  [System.IO.File]::WriteAllText($requiredCalibration.Paths.BridgeConfig, '{}', (New-Object System.Text.UTF8Encoding($false)))
+  Assert-ThrowsLike {
+    Start-AkashaServices -InstallRoot $requiredCalibration.Root
+  } 'E_UIA_CALIBRATION_REQUIRED:*' 'Start accepted a missing calibration.' | Out-Null
+  Assert-Equal (@(Get-ChildItem -LiteralPath $requiredCalibration.RecordRoot -Filter '*.txt' -File).Count) 0 'Required calibration launched a process.'
+  Assert-True (-not (Test-Path -LiteralPath $requiredCalibration.Paths.ProcessState)) 'Required calibration added process state.'
+
+  $invalidCalibration = New-InstallFixture -Name 'invalid-calibration'
+  [System.IO.File]::WriteAllText($invalidCalibration.Paths.BridgeConfig, '{bad', (New-Object System.Text.UTF8Encoding($false)))
+  Assert-ThrowsLike {
+    Start-AkashaServices -InstallRoot $invalidCalibration.Root
+  } 'E_UIA_CALIBRATION_INVALID:*' 'Start accepted invalid calibration JSON.' | Out-Null
+  Assert-Equal (@(Get-ChildItem -LiteralPath $invalidCalibration.RecordRoot -Filter '*.txt' -File).Count) 0 'Invalid calibration launched a process.'
+  Assert-True (-not (Test-Path -LiteralPath $invalidCalibration.Paths.ProcessState)) 'Invalid calibration added process state.'
 
   $normal = New-InstallFixture -Name 'normal-start'
   $oldFixtureRecordDirectory = $env:FIXTURE_RECORD_DIR

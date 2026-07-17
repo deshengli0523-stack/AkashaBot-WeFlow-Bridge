@@ -17,6 +17,15 @@ function Set-JsonProperty {
   }
 }
 
+function Remove-JsonProperty {
+  param(
+    [Parameter(Mandatory)][psobject]$Object,
+    [Parameter(Mandatory)][string]$Name
+  )
+
+  $Object.PSObject.Properties.Remove($Name)
+}
+
 function New-HexToken {
   $bytes = New-Object byte[] 32
   $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -398,8 +407,16 @@ function Initialize-AkashaConfiguration {
   param(
     [Parameter(Mandatory)]$Paths,
     [Parameter(Mandatory)][string]$WeFlowConfigPath,
-    [scriptblock]$AstrBotInitializer
+    [scriptblock]$AstrBotInitializer,
+    [scriptblock]$JsonWriter
   )
+
+  if ($null -eq $JsonWriter) {
+    $JsonWriter = {
+      param([string]$Path, $Value)
+      Write-JsonAtomic -Path $Path -Value $Value
+    }
+  }
 
   Assert-AkashaConfigurationPreflight -Paths $Paths -WeFlowConfigPath $WeFlowConfigPath
   $pathSnapshot = New-AkashaConfigurationPathSnapshot -Paths $Paths
@@ -442,7 +459,9 @@ function Initialize-AkashaConfiguration {
     $freshBridgeCreated = $false
     $password = $null
     $astrBackup = $null
+    $bridgeBackup = $null
     $weFlowBackup = $null
+    $bridgeRollbackRequired = $false
     $weFlowWritten = $false
     $operationError = $null
     try {
@@ -547,21 +566,25 @@ function Initialize-AkashaConfiguration {
       }
       Set-JsonProperty -Object $astr -Name 'platform' -Value @($platforms)
 
+      $bridgeTemplatePath = Join-Path $Paths.Bridge 'config.example.json'
+      Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $bridgeTemplatePath
+      $bridgeTemplate = Read-AkashaConfigurationJson -Path $bridgeTemplatePath
+      if ($bridgeTemplate.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+        throw 'E_CONFIGURATION_SCHEMA: Bridge configuration must be a JSON object.'
+      }
+      $calibrationTemplateProperty = $bridgeTemplate.PSObject.Properties['uia_fixed_calibration']
+      if ($null -eq $calibrationTemplateProperty) {
+        throw 'E_CONFIGURATION_SCHEMA: Bridge configuration must be a JSON object.'
+      }
+
       if ($freshBridge) {
         $token = New-HexToken
-        $bridgeTemplatePath = Join-Path $Paths.Bridge 'config.example.json'
-        Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $bridgeTemplatePath
-        $bridge = Read-AkashaConfigurationJson -Path $bridgeTemplatePath
-        if ($bridge.GetType() -ne [System.Management.Automation.PSCustomObject]) {
-          throw 'E_CONFIGURATION_SCHEMA: Bridge configuration must be a JSON object.'
-        }
+        $bridge = $bridgeTemplate
         Set-JsonProperty -Object $bridge -Name 'access_token' -Value $token
         Set-JsonProperty -Object $bridge -Name 'astrbot_attachments' -Value (Join-Path $Paths.AstrBotData 'data\attachments')
         Set-JsonProperty -Object $bridge -Name 'bot_nicknames' -Value @()
         Set-JsonProperty -Object $bridge -Name 'bot_wxid' -Value ''
-        Set-JsonProperty -Object $bridge -Name 'image_caption_api_key' -Value ''
         Set-JsonProperty -Object $bridge -Name 'weflow_base_url' -Value 'http://127.0.0.1:5031'
-        Set-JsonProperty -Object $bridge -Name 'weflow_send_api' -Value 'http://127.0.0.1:5031/api/v1/message'
         Set-JsonProperty -Object $bridge -Name 'astrbot_ob_url' -Value 'ws://127.0.0.1:11229/ws'
       } else {
         Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
@@ -574,6 +597,30 @@ function Initialize-AkashaConfiguration {
         if ($token -cnotmatch '^[0-9a-f]{64}$') {
           throw 'E_BRIDGE_TOKEN: Existing bridge token is missing or invalid.'
         }
+        if ($null -eq $bridge.PSObject.Properties['uia_fixed_calibration']) {
+          Set-JsonProperty -Object $bridge -Name 'uia_fixed_calibration' -Value $calibrationTemplateProperty.Value
+        }
+      }
+
+      $legacyBridgeKeys = @(
+        'send_method',
+        'weflow_send_api',
+        'uia_fixed_search_x',
+        'uia_fixed_search_y',
+        'uia_fixed_first_result_x',
+        'uia_fixed_first_result_y',
+        'uia_fixed_input_x',
+        'uia_fixed_input_y',
+        'uia_fixed_send_x',
+        'uia_fixed_send_y',
+        'uia_fixed_search_delay',
+        'uia_fixed_switch_delay',
+        'uia_fixed_paste_delay',
+        'uia_fixed_clear_input',
+        'uia_fixed_use_enter_to_send'
+      )
+      foreach ($legacyBridgeKey in $legacyBridgeKeys) {
+        Remove-JsonProperty -Object $bridge -Name $legacyBridgeKey
       }
 
       $weFlow = Read-AkashaConfigurationJson -Path $WeFlowConfigPath
@@ -594,6 +641,11 @@ function Initialize-AkashaConfiguration {
           Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
           $astrBackup = Backup-AkashaFile -Path $astrConfigPath -BackupRoot $Paths.Backups
         }
+        if (-not $freshBridge) {
+          Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+          Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
+          $bridgeBackup = Backup-AkashaFile -Path $Paths.BridgeConfig -BackupRoot $Paths.Backups
+        }
         Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
         Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
         $weFlowBackup = Backup-AkashaFile -Path $WeFlowConfigPath -BackupRoot $Paths.Backups
@@ -606,20 +658,23 @@ function Initialize-AkashaConfiguration {
 
       try {
         Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
-        Write-JsonAtomic -Path $astrConfigPath -Value $astr
+        & $JsonWriter -Path $astrConfigPath -Value $astr
         Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
         if (@(Get-Process -Name 'WeFlow' -ErrorAction SilentlyContinue).Count -gt 0) {
           throw 'E_WEFLOW_RUNNING: Close WeFlow before updating its configuration.'
         }
-        Write-JsonAtomic -Path $WeFlowConfigPath -Value $weFlow
+        & $JsonWriter -Path $WeFlowConfigPath -Value $weFlow
         $weFlowWritten = $true
         if ($freshBridge) {
           Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
           Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeData
           New-Item -ItemType Directory -Force -Path $Paths.BridgeData | Out-Null
-          Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
-          Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
-          Write-JsonAtomic -Path $Paths.BridgeConfig -Value $bridge
+        }
+        Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+        Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
+        $bridgeRollbackRequired = -not $freshBridge
+        & $JsonWriter -Path $Paths.BridgeConfig -Value $bridge
+        if ($freshBridge) {
           $freshBridgeCreated = $true
         }
         if ($freshAstrBot) {
@@ -653,6 +708,26 @@ function Initialize-AkashaConfiguration {
 
     if ($null -ne $operationError) {
       $rollbackSucceeded = $true
+      if ($bridgeRollbackRequired -and $null -ne $bridgeBackup) {
+        if (-not (Invoke-AkashaRollbackStep {
+              Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+              Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
+              Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $bridgeBackup
+              Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
+              Copy-Item -LiteralPath $bridgeBackup -Destination $Paths.BridgeConfig -Force -ErrorAction Stop
+            })) {
+          $rollbackSucceeded = $false
+        }
+      }
+      if ($freshBridgeCreated -and (Test-Path -LiteralPath $Paths.BridgeConfig -PathType Leaf)) {
+        if (-not (Invoke-AkashaRollbackStep {
+              Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+              Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
+              Remove-Item -LiteralPath $Paths.BridgeConfig -Force -ErrorAction Stop
+            })) {
+          $rollbackSucceeded = $false
+        }
+      }
       if ($weFlowWritten -and $null -ne $weFlowBackup) {
         if (-not (Invoke-AkashaRollbackStep {
               Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
@@ -673,15 +748,6 @@ function Initialize-AkashaConfiguration {
               Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $astrBackup
               Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $astrConfigPath
               Copy-Item -LiteralPath $astrBackup -Destination $astrConfigPath -Force -ErrorAction Stop
-            })) {
-          $rollbackSucceeded = $false
-        }
-      }
-      if ($freshBridgeCreated -and (Test-Path -LiteralPath $Paths.BridgeConfig -PathType Leaf)) {
-        if (-not (Invoke-AkashaRollbackStep {
-              Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
-              Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
-              Remove-Item -LiteralPath $Paths.BridgeConfig -Force -ErrorAction Stop
             })) {
           $rollbackSucceeded = $false
         }

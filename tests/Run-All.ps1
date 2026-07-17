@@ -9,7 +9,7 @@ function Join-AkashaCharacters {
 }
 
 function Get-AkashaPublishedFiles {
-  $localOnly = @('.git', '.superpowers', '.worktrees')
+  $localOnly = @('.git', '.superpowers', '.worktrees', 'docs')
   return @(
     foreach ($entry in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop |
         Where-Object { $localOnly -cnotcontains $_.Name }) {
@@ -39,13 +39,17 @@ function Read-AkashaUtf8Strict {
   return [System.IO.File]::ReadAllText($Path, $encoding)
 }
 
-function Assert-AkashaTask7Layout {
+function Assert-AkashaTask8Layout {
   $requiredFiles = @(
     'tests\Run-All.ps1',
     '.github\workflows\ci.yml',
     'README.md',
     'INSTALL.md',
-    'SECURITY.md'
+    'SECURITY.md',
+    'bridge\calibrate_uia_fixed.py',
+    'bridge\uia_support.py',
+    'scripts\Calibrate-Uia.ps1',
+    (((Join-AkashaCharacters @(0x6821, 0x51C6))) + '.bat')
   )
   foreach ($relativePath in $requiredFiles) {
     $path = Join-Path $root $relativePath
@@ -60,8 +64,8 @@ function Assert-AkashaTask7Layout {
   }
 
   $publishedFiles = @(Get-AkashaPublishedFiles)
-  if ($publishedFiles.Count -ne 44) {
-    throw "Documentation/layout gate: expected 44 publish files, found $($publishedFiles.Count)."
+  if ($publishedFiles.Count -ne 50) {
+    throw "Documentation/layout gate: expected 50 publish files, found $($publishedFiles.Count)."
   }
 
   $updateLauncher = (Join-AkashaCharacters @(0x66F4, 0x65B0)) + '.bat'
@@ -132,8 +136,9 @@ jobs:
 
   $readme = Read-AkashaUtf8Strict -Path (Join-Path $root 'README.md')
   $install = Read-AkashaUtf8Strict -Path (Join-Path $root 'INSTALL.md')
+  $changelog = Read-AkashaUtf8Strict -Path (Join-Path $root 'CHANGELOG.md')
   $security = Read-AkashaUtf8Strict -Path (Join-Path $root 'SECURITY.md')
-  $publicDocs = $readme + "`n" + $install + "`n" + $security
+  $publicDocs = $readme + "`n" + $install + "`n" + $changelog + "`n" + $security
   foreach ($token in @(
     'Windows 10/11 x64',
     'Python 3.12 x64',
@@ -157,6 +162,14 @@ jobs:
     'E_INSTALL_RUNNING',
     'E_PROCESS_STATE',
     'E_HEALTH_FAILED',
+    'E_UIA_CALIBRATION_REQUIRED',
+    'E_UIA_CALIBRATION_INVALID',
+    'E_UIA_CALIBRATION_WINDOW',
+    'E_UIA_CALIBRATION_BUSY',
+    'E_UIA_RECALIBRATION_REQUIRED',
+    'data\logs',
+    'data\state',
+    'data\bridge\config.json',
     'tests\Run-All.ps1',
     'INSTALL.md',
     'SECURITY.md',
@@ -166,6 +179,40 @@ jobs:
     'OneBot v11'
   )) {
     Assert-AkashaContains -Text $publicDocs -Expected $token -Context 'public documentation'
+  }
+
+  $calibrationLauncher = (Join-AkashaCharacters @(0x6821, 0x51C6)) + '.bat'
+  $installSucceeded = Join-AkashaCharacters @(0x5B89, 0x88C5, 0x6210, 0x529F)
+  $loginAndMaximize = Join-AkashaCharacters @(0x767B, 0x5F55, 0x5E76, 0x6700, 0x5927, 0x5316, 0x5FAE, 0x4FE1)
+  $searchBox = Join-AkashaCharacters @(0x641C, 0x7D22, 0x6846)
+  $firstResult = Join-AkashaCharacters @(0x7B2C, 0x4E00, 0x6761, 0x641C, 0x7D22, 0x7ED3, 0x679C)
+  $messageInput = Join-AkashaCharacters @(0x6D88, 0x606F, 0x8F93, 0x5165, 0x6846)
+  $sendButton = Join-AkashaCharacters @(0x53D1, 0x9001, 0x6309, 0x94AE)
+  $startLauncher = (Join-AkashaCharacters @(0x542F, 0x52A8)) + '.bat'
+  $recalibrate = Join-AkashaCharacters @(0x91CD, 0x65B0, 0x6821, 0x51C6)
+  $aspectRatio = Join-AkashaCharacters @(0x5BBD, 0x9AD8, 0x6BD4)
+  foreach ($document in @(
+    [pscustomobject]@{ Name = 'README.md'; Text = $readme },
+    [pscustomobject]@{ Name = 'INSTALL.md'; Text = $install }
+  )) {
+    $orderedTokens = @($installSucceeded, $calibrationLauncher, $loginAndMaximize, $searchBox, $firstResult, $messageInput, $sendButton, $startLauncher)
+    $previousIndex = -1
+    foreach ($token in $orderedTokens) {
+      $index = $document.Text.IndexOf($token, [System.StringComparison]::Ordinal)
+      if ($index -le $previousIndex) {
+        throw "Documentation/layout gate: $($document.Name) does not describe the install-calibrate-start flow in order."
+      }
+      $previousIndex = $index
+    }
+    foreach ($token in @('DPI', $aspectRatio, $recalibrate)) {
+      Assert-AkashaContains -Text $document.Text -Expected $token -Context $document.Name
+    }
+  }
+
+  Assert-AkashaContains -Text $changelog -Expected '## 0.2.0 - 2026-07-17' -Context 'CHANGELOG.md'
+  $version = (Read-AkashaUtf8Strict -Path (Join-Path $root 'VERSION')).Trim()
+  if ($version -cne '0.2.0') {
+    throw "Documentation/layout gate: VERSION must be 0.2.0, found '$version'."
   }
 
   foreach ($relativeLink in @('INSTALL.md', 'SECURITY.md')) {
@@ -207,7 +254,7 @@ function Assert-AkashaPowerShellParses {
 }
 
 try {
-  Assert-AkashaTask7Layout
+  Assert-AkashaTask8Layout
   Assert-AkashaPowerShellParses
 
   $testSuites = @(
@@ -215,6 +262,7 @@ try {
     'Test-ProcessSafety.ps1',
     'Test-Initialization.ps1',
     'Test-Common.ps1',
+    'Test-Calibration.ps1',
     'Test-ReleaseHygiene.ps1',
     'Test-ReleaseHygieneRegression.ps1'
   )

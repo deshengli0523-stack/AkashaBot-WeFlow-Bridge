@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $gate = Join-Path $PSScriptRoot 'Test-ReleaseHygiene.ps1'
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("akashabot-release-hygiene-{0}" -f [guid]::NewGuid().ToString('N'))
-$localOnlyRootEntries = @('.git', '.superpowers', '.worktrees')
+$localOnlyRootEntries = @('.git', '.superpowers', '.worktrees', 'docs')
 
 function Get-FixturePath {
   param([string]$RelativePath)
@@ -31,10 +31,15 @@ function New-CleanFixture {
 }
 
 function Invoke-FixtureGate {
+  param([string]$GatePath)
+
+  if ([string]::IsNullOrWhiteSpace($GatePath)) {
+    $GatePath = $gate
+  }
   $previousErrorActionPreference = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $gate -RepositoryRoot $fixtureRoot 2>&1 | Out-String
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $GatePath -RepositoryRoot $fixtureRoot 2>&1 | Out-String
     $exitCode = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $previousErrorActionPreference
@@ -46,9 +51,12 @@ function Invoke-FixtureGate {
 }
 
 function Assert-GatePass {
-  param([string]$Case)
+  param(
+    [string]$Case,
+    [string]$GatePath
+  )
 
-  $result = Invoke-FixtureGate
+  $result = Invoke-FixtureGate -GatePath $GatePath
   if ($result.ExitCode -ne 0) {
     throw "$Case expected PASS but gate exited $($result.ExitCode): $($result.Output)"
   }
@@ -57,10 +65,11 @@ function Assert-GatePass {
 function Assert-GateFail {
   param(
     [string]$Case,
-    [string]$ExpectedMessage
+    [string]$ExpectedMessage,
+    [string]$GatePath
   )
 
-  $result = Invoke-FixtureGate
+  $result = Invoke-FixtureGate -GatePath $GatePath
   if ($result.ExitCode -eq 0) {
     throw "$Case expected gate failure, but it passed."
   }
@@ -98,11 +107,56 @@ function Assert-PrivatePathRejected {
   Copy-RepositoryFileToFixture -RelativePath 'README.md'
 }
 
+function Assert-UiaSupportMutationRejected {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$RelativePath,
+    [Parameter(Mandatory)][string]$Case,
+    [Parameter(Mandatory)][scriptblock]$Mutation
+  )
+
+  $originalText = (Get-Content -LiteralPath $Path -Raw -Encoding UTF8).Replace("`r`n", "`n")
+  $mutatedText = & $Mutation $originalText
+  if ($mutatedText -ceq $originalText) {
+    throw "$Case mutation did not change the fixture."
+  }
+  [System.IO.File]::WriteAllText($Path, $mutatedText, (New-Object System.Text.UTF8Encoding($false)))
+  Assert-GateFail -Case $Case -ExpectedMessage 'Private workspace path found'
+  Copy-RepositoryFileToFixture -RelativePath $RelativePath
+}
+
 try {
   New-CleanFixture
   Assert-GatePass -Case 'clean release fixture'
 
+  $duplicateGatePath = Get-FixturePath -RelativePath 'docs/release-hygiene-duplicate.ps1'
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $duplicateGatePath) | Out-Null
+  $gateText = (Get-Content -LiteralPath $gate -Raw -Encoding UTF8).Replace("`r`n", "`n")
+  $uniqueAllowlistPair = "  'THIRD_PARTY_NOTICES.md',`n  'VERSION',"
+  if ([regex]::Matches($gateText, [regex]::Escape($uniqueAllowlistPair)).Count -ne 1) {
+    throw 'Expected allowlist mutation precondition is missing.'
+  }
+  $duplicateAllowlistPair = "  'VERSION',`n  'VERSION',"
+  $gateText = $gateText.Replace($uniqueAllowlistPair, $duplicateAllowlistPair)
+  [System.IO.File]::WriteAllText($duplicateGatePath, $gateText, (New-Object System.Text.UTF8Encoding($false)))
+  Assert-GateFail -Case 'duplicate expected release allowlist entry' -ExpectedMessage 'duplicate entries' -GatePath $duplicateGatePath
+
+  $legacySenderMarker = 'weflow_' + 'api'
+  $startLauncherName = (-join @([char]0x542F, [char]0x52A8)) + '.bat'
+  $startLauncherPath = Get-FixturePath -RelativePath $startLauncherName
+  Add-Content -LiteralPath $startLauncherPath -Value ('rem copied legacy marker ' + $legacySenderMarker) -Encoding UTF8
+  Assert-GateFail -Case 'legacy marker in a root launcher' -ExpectedMessage 'Legacy sender/config marker'
+  Copy-RepositoryFileToFixture -RelativePath $startLauncherName
+
+  $securityPath = Get-FixturePath -RelativePath 'SECURITY.md'
+  Add-Content -LiteralPath $securityPath -Value ('Copied legacy marker: ' + $legacySenderMarker) -Encoding UTF8
+  Assert-GateFail -Case 'legacy marker in another public document' -ExpectedMessage 'Legacy sender/config marker'
+  Copy-RepositoryFileToFixture -RelativePath 'SECURITY.md'
+
   $backslash = [string][char]0x5c
+  $copiedFixturePath = 'C:' + $backslash + 'fixture' + $backslash + 'py.exe'
+  Assert-PrivatePathRejected -Case 'synthetic fixture path copied into public documentation' -Value $copiedFixturePath
+
   $userProfilePath = 'C:' + $backslash + ('Us' + 'ers') + $backslash + 'alice' + $backslash + 'private-project' + $backslash + 'source'
   Assert-PrivatePathRejected -Case 'personal Windows workspace path' -Value $userProfilePath
 
@@ -256,10 +310,9 @@ try {
     ('HKCU:' + $backslash + 'Device' + $backslash + 'Setting'),
     ('HKLM:' + $backslash + 'System' + 'Root' + $backslash + 'Setting'),
     ('HKCU:' + $backslash + 'Software' + $backslash + 'Device' + $backslash + 'Setting'),
-    ('HKLM:' + $backslash + 'Software' + $backslash + 'System' + 'Root' + $backslash + 'Setting'),
-    ('C:' + $backslash + 'fixture' + $backslash + 'source')
+    ('HKLM:' + $backslash + 'Software' + $backslash + 'System' + 'Root' + $backslash + 'Setting')
   ) -Encoding UTF8
-  Assert-GatePass -Case 'approved providers including namespace-like keys and explicit fixture path'
+  Assert-GatePass -Case 'approved providers including namespace-like keys'
   Copy-RepositoryFileToFixture -RelativePath 'README.md'
 
   $approvedUrlExamples = @(
@@ -369,9 +422,10 @@ try {
   Assert-GateFail -Case 'unquoted access token with comment' -ExpectedMessage 'Secret-shaped value found'
   Copy-RepositoryFileToFixture -RelativePath 'VERSION'
 
-  Set-Content -LiteralPath $versionPath -Value ("$passwordKey=short") -Encoding UTF8
+  $gitIgnorePath = Get-FixturePath -RelativePath '.gitignore'
+  Add-Content -LiteralPath $gitIgnorePath -Value ("$passwordKey=short") -Encoding UTF8
   Assert-GatePass -Case 'short ordinary assignment value'
-  Copy-RepositoryFileToFixture -RelativePath 'VERSION'
+  Copy-RepositoryFileToFixture -RelativePath '.gitignore'
 
   Set-FixtureConfigProperty -Name $passwordKey -Value $secretValue
   Assert-GateFail -Case 'quoted JSON password' -ExpectedMessage 'Secret-shaped value found'
@@ -400,20 +454,17 @@ try {
   Assert-GateFail -Case 'uppercase placeholder is not exempt' -ExpectedMessage 'Secret-shaped value found'
   Copy-RepositoryFileToFixture -RelativePath 'bridge/config.example.json'
 
-  foreach ($relativePath in @(
-    'docs/app.mjs',
-    'docs/resources.pak',
-    'tests/resources.pak',
-    'docs/chat-photo.jpg',
-    'docs/uploads/file.bin'
-  )) {
+  foreach ($relativePath in @('tests/resources.pak', 'chat-photo.jpg')) {
     $unexpectedPath = Get-FixturePath -RelativePath $relativePath
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $unexpectedPath) | Out-Null
     [System.IO.File]::WriteAllBytes($unexpectedPath, [byte[]](0x00, 0x01, 0x02, 0x03))
     Assert-GateFail -Case "unexpected publish artifact $relativePath" -ExpectedMessage "Unexpected publish file: $relativePath"
     Remove-Item -LiteralPath $unexpectedPath -Force
   }
-  Remove-Item -LiteralPath (Get-FixturePath -RelativePath 'docs/uploads') -Recurse -Force
+  $localDocsPath = Get-FixturePath -RelativePath 'docs/private-notes.txt'
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $localDocsPath) | Out-Null
+  Set-Content -LiteralPath $localDocsPath -Value ('local-only ' + $userProfilePath + ' ' + $secretValue) -Encoding UTF8
+  Assert-GatePass -Case 'development-only docs directory exclusion'
 
   $extraBridgePath = Get-FixturePath -RelativePath 'bridge/extra.py'
   Set-Content -LiteralPath $extraBridgePath -Value '# unexpected bridge file' -Encoding UTF8
@@ -433,15 +484,254 @@ try {
   $lockPath = Get-FixturePath -RelativePath 'bridge/requirements.lock'
   Set-Content -LiteralPath $lockPath -Value @(
     'requests==0.0.0',
-    'PyAutoGUI==0.9.54',
     'pyperclip==1.11.0',
-    'PyGetWindow==0.0.9',
-    'uiautomation==2.0.29',
     'Pillow==12.2.0',
     'websockets==16.0'
   ) -Encoding UTF8
   Assert-GateFail -Case 'dependency pin drift' -ExpectedMessage 'requirements.lock does not match the exact dependency pins.'
   Copy-RepositoryFileToFixture -RelativePath 'bridge/requirements.lock'
+
+  $requirementsPath = Get-FixturePath -RelativePath 'bridge/requirements.txt'
+  Add-Content -LiteralPath $requirementsPath -Value 'PyAutoGUI>=0.9.54' -Encoding UTF8
+  Assert-GateFail -Case 'direct dependency allowlist drift' -ExpectedMessage 'dependency names do not match the exact allowlist.'
+  Copy-RepositoryFileToFixture -RelativePath 'bridge/requirements.txt'
+
+  $installerLayoutRelativePath = 'tests/Test-InstallerLayout.ps1'
+  $installerLayoutPath = Get-FixturePath -RelativePath $installerLayoutRelativePath
+  $launcherAssertion = @(Get-Content -LiteralPath $installerLayoutPath -Encoding UTF8 |
+    Where-Object { $_.Contains('Calibrate-Uia') -and $_.Contains('$calibrateBat -match') })
+  if ($launcherAssertion.Count -ne 1) {
+    throw 'Calibration launcher exact-context regression precondition is missing.'
+  }
+  Add-Content -LiteralPath $installerLayoutPath -Value $launcherAssertion[0] -Encoding UTF8
+  Assert-GateFail -Case 'calibration launcher regex copied outside exact context' -ExpectedMessage 'Private workspace path found'
+  Copy-RepositoryFileToFixture -RelativePath $installerLayoutRelativePath
+
+  $bridgeRuntimeTestRelativePath = 'tests/python/test_bridge_runtime.py'
+  $bridgeRuntimeTestPath = Get-FixturePath -RelativePath $bridgeRuntimeTestRelativePath
+  $fixtureSecretLine = '"access_' + 'token": "private-' + 'token"'
+  Add-Content -LiteralPath $bridgeRuntimeTestPath -Value $fixtureSecretLine -Encoding UTF8
+  Assert-GateFail -Case 'test secret fixture copied outside exact context' -ExpectedMessage 'Secret-shaped value found'
+  Copy-RepositoryFileToFixture -RelativePath $bridgeRuntimeTestRelativePath
+
+  $uiaSupportTestRelativePath = 'tests/python/test_uia_support.py'
+  $uiaSupportTestPath = Get-FixturePath -RelativePath $uiaSupportTestRelativePath
+  $privateTestImagePath = 'C:' + $backslash + 'private' + $backslash + 'never-log-this.png'
+  Add-Content -LiteralPath $uiaSupportTestPath -Value ('# copied path ' + $privateTestImagePath) -Encoding UTF8
+  Assert-GateFail -Case 'test private path copied outside exact context' -ExpectedMessage 'Private workspace path found'
+  Copy-RepositoryFileToFixture -RelativePath $uiaSupportTestRelativePath
+
+  $relocatedPrivatePathLine = '            r"' + $privateTestImagePath + '",'
+  $uiaSupportLines = [System.Collections.Generic.List[string]]@(
+    Get-Content -LiteralPath $uiaSupportTestPath -Encoding UTF8
+  )
+  $relocatedPrivatePathIndex = $uiaSupportLines.IndexOf($relocatedPrivatePathLine)
+  if ($relocatedPrivatePathIndex -lt 0 -or
+      @($uiaSupportLines | Where-Object { $_ -ceq $relocatedPrivatePathLine }).Count -ne 1) {
+    throw 'Private image path relocation regression precondition is missing.'
+  }
+  $uiaSupportLines.RemoveAt($relocatedPrivatePathIndex)
+  $uiaSupportLines.Insert(0, $relocatedPrivatePathLine)
+  Set-Content -LiteralPath $uiaSupportTestPath -Value @($uiaSupportLines) -Encoding UTF8
+  Assert-GateFail -Case 'approved private image path relocated outside exact context' -ExpectedMessage 'Private workspace path found'
+  Copy-RepositoryFileToFixture -RelativePath $uiaSupportTestRelativePath
+
+  $ownershipTailLine = '            any(call[:2] == ("SetClipboardData", 8) for call in user32.calls)'
+  Assert-UiaSupportMutationRejected `
+    -Path $uiaSupportTestPath `
+    -RelativePath $uiaSupportTestRelativePath `
+    -Case 'approved private image ownership function tail mutated' `
+    -Mutation {
+      param($text)
+      if ([regex]::Matches($text, [regex]::Escape($ownershipTailLine)).Count -ne 1) {
+        throw 'Clipboard ownership tail mutation regression precondition is missing.'
+      }
+      return $text.Replace(
+        $ownershipTailLine,
+        '            any(call[:2] == ("SetClipboardData", 7) for call in user32.calls)'
+      )
+    }
+
+  $ownershipTail = [string]::Join("`n", @(
+    '        self.assertTrue('
+    $ownershipTailLine
+    '        )'
+    '        self.assertFalse('
+    '            any(call[0] == "GlobalFree" for call in kernel32.calls)'
+    '        )'
+  ))
+  $swappedOwnershipTail = [string]::Join("`n", @(
+    '        self.assertFalse('
+    '            any(call[0] == "GlobalFree" for call in kernel32.calls)'
+    '        )'
+    '        self.assertTrue('
+    $ownershipTailLine
+    '        )'
+  ))
+  $failureTail = [string]::Join("`n", @(
+    '        allocated_handle = next('
+    '            call[3] for call in kernel32.calls if call[0] == "GlobalAlloc"'
+    '        )'
+    '        self.assertIn(("GlobalFree", allocated_handle), kernel32.calls)'
+    '        self.assertIn(("CloseClipboard",), user32.calls)'
+  ))
+
+  Assert-UiaSupportMutationRejected `
+    -Path $uiaSupportTestPath `
+    -RelativePath $uiaSupportTestRelativePath `
+    -Case 'approved private image failure function tail moved' `
+    -Mutation {
+      param($text)
+      if ([regex]::Matches($text, [regex]::Escape($failureTail)).Count -ne 1) {
+        throw 'Clipboard failure tail move regression precondition is missing.'
+      }
+      return $text.Replace($failureTail, '') + "`n" + $failureTail
+    }
+
+  $failureTailLine = '        self.assertIn(("CloseClipboard",), user32.calls)'
+  Assert-UiaSupportMutationRejected `
+    -Path $uiaSupportTestPath `
+    -RelativePath $uiaSupportTestRelativePath `
+    -Case 'approved private image failure function tail mutated' `
+    -Mutation {
+      param($text)
+      if ([regex]::Matches($text, [regex]::Escape($failureTailLine)).Count -ne 1) {
+        throw 'Clipboard failure tail mutation regression precondition is missing.'
+      }
+      return $text.Replace(
+        $failureTailLine,
+        '        self.assertNotIn(("CloseClipboard",), user32.calls)'
+      )
+    }
+
+  Assert-UiaSupportMutationRejected `
+    -Path $uiaSupportTestPath `
+    -RelativePath $uiaSupportTestRelativePath `
+    -Case 'approved private image ownership assertions swapped' `
+    -Mutation {
+      param($text)
+      if ([regex]::Matches($text, [regex]::Escape($ownershipTail)).Count -ne 1) {
+        throw 'Clipboard ownership assertion swap regression precondition is missing.'
+      }
+      return $text.Replace($ownershipTail, $swappedOwnershipTail)
+    }
+
+  Assert-UiaSupportMutationRejected `
+    -Path $uiaSupportTestPath `
+    -RelativePath $uiaSupportTestRelativePath `
+    -Case 'approved private image failure function tail copied' `
+    -Mutation {
+      param($text)
+      if ([regex]::Matches($text, [regex]::Escape($failureTail)).Count -ne 1) {
+        throw 'Clipboard failure tail copy regression precondition is missing.'
+      }
+      return $text + "`n" + $failureTail
+    }
+
+  $ownershipBoundary = $ownershipTail + "`n`n    def test_copy_image_frees_untransferred_memory_on_failure(self):"
+  Assert-UiaSupportMutationRejected `
+    -Path $uiaSupportTestPath `
+    -RelativePath $uiaSupportTestRelativePath `
+    -Case 'approved private image function boundary modified' `
+    -Mutation {
+      param($text)
+      if ([regex]::Matches($text, [regex]::Escape($ownershipBoundary)).Count -ne 1) {
+        throw 'Clipboard function boundary mutation regression precondition is missing.'
+      }
+      return $text.Replace(
+        $ownershipBoundary,
+        $ownershipTail + "`n    # adjacent mutation`n`n    def test_copy_image_frees_untransferred_memory_on_failure(self):"
+      )
+    }
+
+  $wechatExecutablePath = 'C:' + $backslash + 'Program Files' + $backslash + 'Tencent' + $backslash + 'WeChat.exe'
+  $wechatExecutableLines = @(Get-Content -LiteralPath $uiaSupportTestPath -Encoding UTF8 |
+    Where-Object { $_.Contains($wechatExecutablePath) })
+  if ($wechatExecutableLines.Count -ne 1) {
+    throw 'Synthetic WeChat executable path regression precondition is missing.'
+  }
+  Add-Content -LiteralPath $uiaSupportTestPath -Value $wechatExecutableLines[0] -Encoding UTF8
+  Assert-GateFail -Case 'test executable fixture path duplicated outside exact context' -ExpectedMessage 'Private workspace path found'
+  Copy-RepositoryFileToFixture -RelativePath $uiaSupportTestRelativePath
+
+  $placeholderMarker = 'place' + 'holder'
+  Add-Content -LiteralPath $readmePath -Value ('unfinished ' + $placeholderMarker) -Encoding UTF8
+  Assert-GateFail -Case 'placeholder marker outside approved HTML file' -ExpectedMessage 'outside the three approved HTML attribute lines'
+  Copy-RepositoryFileToFixture -RelativePath 'README.md'
+
+  $webPanelRelativePath = 'bridge/web_panel.py'
+  $webPanelPath = Get-FixturePath -RelativePath $webPanelRelativePath
+  $approvedPlaceholderLines = @(Get-Content -LiteralPath $webPanelPath -Encoding UTF8 |
+    Where-Object { $_.Contains($placeholderMarker) })
+  if ($approvedPlaceholderLines.Count -ne 3) {
+    throw 'Approved HTML placeholder regression precondition is missing.'
+  }
+  Add-Content -LiteralPath $webPanelPath -Value $approvedPlaceholderLines[0] -Encoding UTF8
+  Assert-GateFail -Case 'approved HTML placeholder line duplicated' -ExpectedMessage 'outside the three approved HTML attribute lines'
+  Copy-RepositoryFileToFixture -RelativePath $webPanelRelativePath
+
+  $realLegacyKey = 'uia_fixed_' + 'send_y'
+  $readmePath = Get-FixturePath -RelativePath 'README.md'
+  Add-Content -LiteralPath $readmePath -Value ('Old coordinate: ' + $realLegacyKey) -Encoding UTF8
+  Assert-GateFail -Case 'real migration key in public documentation' -ExpectedMessage 'Legacy sender/config marker'
+  Copy-RepositoryFileToFixture -RelativePath 'README.md'
+
+  $runtimeRelativePath = 'bridge/config.py'
+  $runtimePath = Get-FixturePath -RelativePath $runtimeRelativePath
+  Add-Content -LiteralPath $runtimePath -Value ('# old coordinate ' + $realLegacyKey) -Encoding UTF8
+  Assert-GateFail -Case 'real migration key in bridge runtime code' -ExpectedMessage 'Legacy sender/config marker'
+  Copy-RepositoryFileToFixture -RelativePath $runtimeRelativePath
+
+  $initializerRelativePath = 'scripts/Initialize-Configuration.ps1'
+  $initializerPath = Get-FixturePath -RelativePath $initializerRelativePath
+  Add-Content -LiteralPath $initializerPath -Value ('$outside = ' + "'" + $realLegacyKey + "'") -Encoding UTF8
+  Assert-GateFail -Case 'real migration key outside initializer deletion allowlist' -ExpectedMessage 'found outside the approved initializer'
+  Copy-RepositoryFileToFixture -RelativePath $initializerRelativePath
+
+  $initializerLines = [System.Collections.Generic.List[string]]@(Get-Content -LiteralPath $initializerPath -Encoding UTF8)
+  $legacyBlockStart = $initializerLines.IndexOf('      $legacyBridgeKeys = @(')
+  $legacyRemovalLine = $initializerLines.FindIndex([Predicate[string]]{
+    param($line)
+    $line -ceq '        Remove-JsonProperty -Object $bridge -Name $legacyBridgeKey'
+  })
+  $legacyBlockEnd = $legacyRemovalLine + 1
+  if ($legacyBlockStart -lt 0 -or
+      $legacyRemovalLine -lt 0 -or
+      $legacyBlockEnd -ge $initializerLines.Count -or
+      $initializerLines[$legacyBlockEnd] -cne '      }') {
+    throw 'Initializer legacy deletion block regression precondition is missing.'
+  }
+  $legacyBlockCount = $legacyBlockEnd - $legacyBlockStart + 1
+  $legacyBlock = @($initializerLines.GetRange($legacyBlockStart, $legacyBlockCount))
+
+  Set-Content -LiteralPath $initializerPath -Value (@($initializerLines) + @('') + $legacyBlock) -Encoding UTF8
+  Assert-GateFail -Case 'initializer legacy deletion block duplicated' -ExpectedMessage 'does not match the exact approved context'
+  Copy-RepositoryFileToFixture -RelativePath $initializerRelativePath
+
+  $initializerLines = [System.Collections.Generic.List[string]]@(Get-Content -LiteralPath $initializerPath -Encoding UTF8)
+  $initializerLines.RemoveRange($legacyBlockStart, $legacyBlockCount)
+  Set-Content -LiteralPath $initializerPath -Value (@($initializerLines) + @('') + $legacyBlock) -Encoding UTF8
+  Assert-GateFail -Case 'initializer legacy deletion block relocated' -ExpectedMessage 'does not match the exact approved context'
+  Copy-RepositoryFileToFixture -RelativePath $initializerRelativePath
+
+  $configPath = Get-FixturePath -RelativePath 'bridge/config.example.json'
+  $configText = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
+  $configText = $configText.Replace('"completed": false', '"completed": true')
+  Set-Content -LiteralPath $configPath -Value $configText -Encoding UTF8
+  Assert-GateFail -Case 'completed calibration template' -ExpectedMessage 'incomplete calibration placeholder'
+  Copy-RepositoryFileToFixture -RelativePath 'bridge/config.example.json'
+
+  $sensitiveExamples = @(
+    (-join @([char]0x8054, [char]0x7CFB, [char]0x4EBA, [char]0xFF1A, [char]0x793A, [char]0x4F8B, [char]0x7528, [char]0x6237)),
+    (-join @([char]0x6D88, [char]0x606F, [char]0x793A, [char]0x4F8B, [char]0xFF1A, [char]0x793A, [char]0x4F8B, [char]0x5185, [char]0x5BB9)),
+    (-join @([char]0x7A97, [char]0x53E3, [char]0x6807, [char]0x9898, [char]0xFF1A, [char]0x793A, [char]0x4F8B, [char]0x7A97, [char]0x53E3)),
+    ((-join @([char]0x641C, [char]0x7D22, [char]0x6846, [char]0x5750, [char]0x6807, [char]0xFF1A)) + '123,456')
+  )
+  foreach ($sensitiveExample in $sensitiveExamples) {
+    Add-Content -LiteralPath $readmePath -Value $sensitiveExample -Encoding UTF8
+    Assert-GateFail -Case "sensitive public documentation example $sensitiveExample" -ExpectedMessage 'Sensitive calibration/contact/message/window example'
+    Copy-RepositoryFileToFixture -RelativePath 'README.md'
+  }
 
   $weflowDocumentationDirectory = Get-FixturePath -RelativePath 'docs/weflow-integration'
   New-Item -ItemType Directory -Force -Path $weflowDocumentationDirectory | Out-Null

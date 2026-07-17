@@ -432,6 +432,72 @@ function Write-ExistingBridgeFixture {
   Write-JsonAtomic -Path $Paths.BridgeConfig -Value $bridge
 }
 
+function New-UncompletedCalibrationFixture {
+  return [pscustomobject][ordered]@{
+    schema_version = 1
+    completed = $false
+    coordinate_space = 'client_area_ratio'
+    points = [pscustomobject][ordered]@{
+      search_box = $null
+      first_result = $null
+      message_input = $null
+      send_button = $null
+    }
+    reference = $null
+  }
+}
+
+function New-CompletedCalibrationFixture {
+  return [pscustomobject][ordered]@{
+    schema_version = 1
+    completed = $true
+    coordinate_space = 'client_area_ratio'
+    points = [pscustomobject][ordered]@{
+      search_box = [pscustomobject][ordered]@{ x = 0.1; y = 0.1 }
+      first_result = [pscustomobject][ordered]@{ x = 0.2; y = 0.2 }
+      message_input = [pscustomobject][ordered]@{ x = 0.6; y = 0.8 }
+      send_button = [pscustomobject][ordered]@{ x = 0.9; y = 0.9 }
+    }
+    reference = [pscustomobject][ordered]@{
+      client_width = 1200
+      client_height = 800
+      aspect_ratio = 1.5
+      dpi = 96
+    }
+  }
+}
+
+$legacyBridgeKeys = @(
+  'send_method',
+  'weflow_send_api',
+  'uia_fixed_search_x',
+  'uia_fixed_search_y',
+  'uia_fixed_first_result_x',
+  'uia_fixed_first_result_y',
+  'uia_fixed_input_x',
+  'uia_fixed_input_y',
+  'uia_fixed_send_x',
+  'uia_fixed_send_y',
+  'uia_fixed_search_delay',
+  'uia_fixed_switch_delay',
+  'uia_fixed_paste_delay',
+  'uia_fixed_clear_input',
+  'uia_fixed_use_enter_to_send'
+)
+
+$configurationSource = Get-Content -LiteralPath $configurationScript -Raw -Encoding UTF8
+$legacyAllowlistMatch = [regex]::Match(
+  $configurationSource,
+  '(?s)\$legacyBridgeKeys\s*=\s*@\((?<body>.*?)\)\s*foreach\s*\(\$legacyBridgeKey'
+)
+Assert-True $legacyAllowlistMatch.Success 'Legacy bridge keys are not isolated in the initializer deletion allowlist.'
+$legacyAllowlistBody = $legacyAllowlistMatch.Groups['body'].Value
+$configurationOutsideLegacyAllowlist = $configurationSource.Remove($legacyAllowlistMatch.Index, $legacyAllowlistMatch.Length)
+foreach ($legacyKey in $legacyBridgeKeys) {
+  Assert-True $legacyAllowlistBody.Contains("'$legacyKey'") "Initializer deletion allowlist is missing legacy key: $legacyKey"
+  Assert-True (-not $configurationOutsideLegacyAllowlist.Contains($legacyKey)) "Initializer uses a legacy bridge key outside the deletion allowlist: $legacyKey"
+}
+
 $configurationRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('akasha-configuration-' + [guid]::NewGuid().ToString('N'))
 $dashboardPasswordWasPresent = Test-Path Env:\ASTRBOT_DASHBOARD_INITIAL_PASSWORD
 $originalDashboardPassword = if ($dashboardPasswordWasPresent) { [string]$env:ASTRBOT_DASHBOARD_INITIAL_PASSWORD } else { $null }
@@ -898,12 +964,16 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal ([int]$freshAstr.platform[0].ws_reverse_port) 11229 'AstrBot reverse port is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].ws_reverse_token) '' 'AstrBot reverse token is not empty.'
   Assert-Equal ([string]$freshBridge.weflow_base_url) 'http://127.0.0.1:5031' 'Bridge WeFlow base URL is wrong.'
-  Assert-Equal ([string]$freshBridge.weflow_send_api) 'http://127.0.0.1:5031/api/v1/message' 'Bridge WeFlow send URL is wrong.'
   Assert-Equal ([string]$freshBridge.astrbot_ob_url) 'ws://127.0.0.1:11229/ws' 'Bridge OneBot URL is wrong.'
   Assert-Equal ([string]$freshBridge.astrbot_attachments) (Join-Path $fresh.Paths.AstrBotData 'data\attachments') 'Bridge attachment path is wrong.'
   Assert-Equal @($freshBridge.bot_nicknames).Count 0 'Fresh bridge nicknames were not cleared.'
   Assert-Equal ([string]$freshBridge.bot_wxid) '' 'Fresh bridge wxid was not cleared.'
   Assert-Equal ([string]$freshBridge.image_caption_api_key) '' 'Fresh bridge image API key was not cleared.'
+  $expectedUncompletedCalibration = New-UncompletedCalibrationFixture
+  Assert-Equal ($freshBridge.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress) ($expectedUncompletedCalibration | ConvertTo-Json -Depth 10 -Compress) 'Fresh bridge calibration is not the exact uncompleted schema.'
+  foreach ($legacyKey in $legacyBridgeKeys) {
+    Assert-True ($freshBridge.PSObject.Properties.Name -cnotcontains $legacyKey) "Fresh bridge retained legacy key: $legacyKey"
+  }
   Assert-True ([bool]$freshWeFlow.httpApiEnabled) 'WeFlow HTTP API was not enabled.'
   Assert-Equal ([string]$freshWeFlow.httpApiHost) '127.0.0.1' 'WeFlow HTTP host is wrong.'
   Assert-Equal ([int]$freshWeFlow.httpApiPort) 5031 'WeFlow HTTP port is wrong.'
@@ -941,10 +1011,22 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Write-ExistingAstrBotFixture $existing.Paths
   $existingToken = 'b' * 64
   Write-ExistingBridgeFixture -Paths $existing.Paths -Token $existingToken
+  $existingBridgeBefore = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+  $existingCalibration = New-CompletedCalibrationFixture
+  Set-JsonProperty -Object $existingBridgeBefore -Name 'uia_fixed_calibration' -Value $existingCalibration
+  Set-JsonProperty -Object $existingBridgeBefore -Name 'unknown_nonlegacy_field' -Value 'preserve-me'
+  Write-JsonAtomic -Path $existing.Paths.BridgeConfig -Value $existingBridgeBefore
+  $existingCalibrationJson = $existingCalibration | ConvertTo-Json -Depth 10 -Compress
+  $existingCalibrationBytes = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($existingCalibrationJson))
   $existingState = New-AstrBotInitializerState
   Initialize-AkashaConfiguration -Paths $existing.Paths -WeFlowConfigPath $existing.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer $existingState)
   Assert-Equal $existingState.Calls 0 'Existing AstrBot invoked the initializer.'
-  Assert-True ([string](Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json).access_token -ceq $existingToken) 'Existing valid bridge token changed.'
+  $existingBridgeAfter = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-True ([string]$existingBridgeAfter.access_token -ceq $existingToken) 'Existing valid bridge token changed.'
+  Assert-Equal ([string]$existingBridgeAfter.unknown_nonlegacy_field) 'preserve-me' 'Existing unknown non-legacy bridge field was lost.'
+  Assert-Equal ($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress) $existingCalibrationJson 'Existing schema 1 calibration was not preserved exactly.'
+  $existingCalibrationBytesAfter = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress)))
+  Assert-Equal $existingCalibrationBytesAfter $existingCalibrationBytes 'Existing schema 1 calibration was not byte-equivalent after update.'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $existing.Paths.AstrBotData 'FIRST_LOGIN.txt'))) 'Existing AstrBot received a new FIRST_LOGIN.txt.'
   $existingAstr = Get-Content -LiteralPath (Join-Path $existing.Paths.AstrBotData 'data\cmd_config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-Equal ([string]$existingAstr.preserve_fixture) 'astr-keep' 'Existing AstrBot root field was lost.'
@@ -960,6 +1042,99 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Initialize-AkashaConfiguration -Paths $existing.Paths -WeFlowConfigPath $existing.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer $existingState)
   $existingAstrRepeat = Get-Content -LiteralPath (Join-Path $existing.Paths.AstrBotData 'data\cmd_config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-Equal @($existingAstrRepeat.platform | Where-Object { $_.id -ceq 'akasha_ob11' }).Count 1 'Repeated platform upsert duplicated akasha_ob11.'
+
+  $legacy = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'legacy-bridge-success'
+  Write-ExistingAstrBotFixture $legacy.Paths
+  $legacyToken = 'c' * 64
+  $legacyBridge = [pscustomobject][ordered]@{
+    access_token = $legacyToken
+    unknown_nonlegacy_field = 'keep-legacy-unknown'
+    send_method = 'weflow_api'
+    weflow_send_api = 'http://127.0.0.1:5031/api/v1/message'
+    uia_fixed_search_x = 0.11
+    uia_fixed_search_y = 0.12
+    uia_fixed_first_result_x = 0.21
+    uia_fixed_first_result_y = 0.22
+    uia_fixed_input_x = 0.61
+    uia_fixed_input_y = 0.82
+    uia_fixed_send_x = 0.91
+    uia_fixed_send_y = 0.92
+    uia_fixed_search_delay = 0.45
+    uia_fixed_switch_delay = 0.75
+    uia_fixed_paste_delay = 0.15
+    uia_fixed_clear_input = $true
+    uia_fixed_use_enter_to_send = $true
+  }
+  Write-JsonAtomic -Path $legacy.Paths.BridgeConfig -Value $legacyBridge
+  Initialize-AkashaConfiguration -Paths $legacy.Paths -WeFlowConfigPath $legacy.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer (New-AstrBotInitializerState))
+  $legacyBridgeAfter = Get-Content -LiteralPath $legacy.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-Equal ([string]$legacyBridgeAfter.access_token) $legacyToken 'Legacy cleanup changed the valid bridge token.'
+  Assert-Equal ([string]$legacyBridgeAfter.unknown_nonlegacy_field) 'keep-legacy-unknown' 'Legacy cleanup removed an unknown non-legacy field.'
+  Assert-Equal ($legacyBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress) ($expectedUncompletedCalibration | ConvertTo-Json -Depth 10 -Compress) 'Legacy flat coordinates were migrated instead of adding the uncompleted schema.'
+  foreach ($legacyKey in $legacyBridgeKeys) {
+    Assert-True ($legacyBridgeAfter.PSObject.Properties.Name -cnotcontains $legacyKey) "Legacy cleanup retained key: $legacyKey"
+  }
+
+  $existingBridgeRollback = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'existing-bridge-rollback'
+  $rollbackToken = 'e' * 64
+  Write-ExistingBridgeFixture -Paths $existingBridgeRollback.Paths -Token $rollbackToken
+  $rollbackBridgeValue = Get-Content -LiteralPath $existingBridgeRollback.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+  $rollbackBridgeValue.PSObject.Properties.Remove('uia_fixed_calibration')
+  Set-JsonProperty -Object $rollbackBridgeValue -Name 'send_method' -Value 'uia'
+  Set-JsonProperty -Object $rollbackBridgeValue -Name 'unknown_nonlegacy_field' -Value 'rollback-keep'
+  Write-JsonAtomic -Path $existingBridgeRollback.Paths.BridgeConfig -Value $rollbackBridgeValue
+  $existingBridgeRollbackFingerprint = Get-FileFingerprint $existingBridgeRollback.Paths.BridgeConfig
+  $existingBridgeRollbackState = New-AstrBotInitializerState
+  $existingBridgeRollbackState.MakeFirstLoginDirectory = $true
+  Assert-ThrowsExact {
+    Initialize-AkashaConfiguration -Paths $existingBridgeRollback.Paths -WeFlowConfigPath $existingBridgeRollback.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer $existingBridgeRollbackState)
+  } 'E_CONFIGURATION_WRITE: Configuration files could not be written.' 'Existing bridge rollback fixture used the wrong error.'
+  Assert-Equal (Get-FileFingerprint $existingBridgeRollback.Paths.BridgeConfig) $existingBridgeRollbackFingerprint 'Existing bridge cleanup was not rolled back after a later transaction failure.'
+  $existingBridgeRollbackBackups = @(Get-ChildItem -LiteralPath $existingBridgeRollback.Paths.Backups -Recurse -File)
+  Assert-Equal $existingBridgeRollbackBackups.Count 2 'Existing bridge transaction did not back up both bridge and WeFlow configs.'
+
+  $bridgeRollbackArmIndex = $configurationSource.IndexOf('$bridgeRollbackRequired = -not $freshBridge', [System.StringComparison]::Ordinal)
+  $bridgeWriterCallIndex = $configurationSource.IndexOf('-Path $Paths.BridgeConfig -Value $bridge', [System.StringComparison]::Ordinal)
+  Assert-True ($bridgeRollbackArmIndex -ge 0 -and $bridgeRollbackArmIndex -lt $bridgeWriterCallIndex) 'Existing bridge rollback responsibility is not armed before the atomic writer call.'
+
+  $bridgeCleanupFailure = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'bridge-cleanup-failure-after-replace'
+  Write-ExistingAstrBotFixture $bridgeCleanupFailure.Paths
+  $bridgeCleanupToken = 'f' * 64
+  Write-ExistingBridgeFixture -Paths $bridgeCleanupFailure.Paths -Token $bridgeCleanupToken
+  $bridgeCleanupValue = Get-Content -LiteralPath $bridgeCleanupFailure.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+  $bridgeCleanupValue.PSObject.Properties.Remove('uia_fixed_calibration')
+  Set-JsonProperty -Object $bridgeCleanupValue -Name 'send_method' -Value 'uia'
+  Set-JsonProperty -Object $bridgeCleanupValue -Name 'unknown_nonlegacy_field' -Value 'cleanup-rollback-keep'
+  Write-JsonAtomic -Path $bridgeCleanupFailure.Paths.BridgeConfig -Value $bridgeCleanupValue
+  $bridgeCleanupOriginalFingerprint = Get-FileFingerprint $bridgeCleanupFailure.Paths.BridgeConfig
+  $bridgeCleanupAstrPath = Join-Path $bridgeCleanupFailure.Paths.AstrBotData 'data\cmd_config.json'
+  $bridgeCleanupAstrFingerprint = Get-FileFingerprint $bridgeCleanupAstrPath
+  $bridgeCleanupWeFlowFingerprint = Get-FileFingerprint $bridgeCleanupFailure.WeFlowConfigPath
+  $bridgeCleanupWriterState = [pscustomobject]@{ TargetWasReplaced = $false; Calls = 0 }
+  $bridgeCleanupFailingWriter = {
+    param([string]$Path, $Value)
+    $bridgeCleanupWriterState.Calls++
+    AkashaBot.Common\Write-JsonAtomic -Path $Path -Value $Value
+    if ([System.IO.Path]::GetFullPath($Path).Equals([System.IO.Path]::GetFullPath($bridgeCleanupFailure.Paths.BridgeConfig), [System.StringComparison]::OrdinalIgnoreCase)) {
+      $bridgeCleanupWriterState.TargetWasReplaced = (Get-FileFingerprint $Path) -cne $bridgeCleanupOriginalFingerprint
+      throw 'E_JSON_ATOMIC_CLEANUP: Unable to remove temporary JSON artifacts.'
+    }
+  }.GetNewClosure()
+  Assert-ThrowsExact {
+    Initialize-AkashaConfiguration -Paths $bridgeCleanupFailure.Paths -WeFlowConfigPath $bridgeCleanupFailure.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer (New-AstrBotInitializerState)) -JsonWriter $bridgeCleanupFailingWriter
+  } 'E_CONFIGURATION_WRITE: Configuration files could not be written.' 'Committed bridge replacement cleanup failure used the wrong transaction error.'
+  Assert-True $bridgeCleanupWriterState.TargetWasReplaced 'Cleanup failure injection did not observe a committed bridge replacement.'
+  Assert-Equal $bridgeCleanupWriterState.Calls 3 'Cleanup failure injection did not occur on the bridge write after AstrBot and WeFlow writes.'
+  Assert-Equal (Get-FileFingerprint $bridgeCleanupFailure.Paths.BridgeConfig) $bridgeCleanupOriginalFingerprint 'Committed bridge replacement was not restored after cleanup failure.'
+  Assert-Equal (Get-FileFingerprint $bridgeCleanupAstrPath) $bridgeCleanupAstrFingerprint 'Bridge cleanup failure did not restore AstrBot config.'
+  Assert-Equal (Get-FileFingerprint $bridgeCleanupFailure.WeFlowConfigPath) $bridgeCleanupWeFlowFingerprint 'Bridge cleanup failure did not restore WeFlow config.'
+  $bridgeCleanupBackupFingerprints = @(
+    Get-ChildItem -LiteralPath $bridgeCleanupFailure.Paths.Backups -Recurse -File |
+      ForEach-Object { Get-FileFingerprint $_.FullName }
+  )
+  Assert-True ($bridgeCleanupBackupFingerprints -ccontains $bridgeCleanupOriginalFingerprint) 'Bridge cleanup failure transaction did not retain an original bridge backup.'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $bridgeCleanupFailure.Paths.State 'configuration.lock'))) 'Bridge cleanup failure left the transaction lock behind.'
+  Assert-Equal @(Get-ChildItem -LiteralPath $bridgeCleanupFailure.Paths.BridgeData -Force -Filter '.config.json.*' -ErrorAction SilentlyContinue).Count 0 'Bridge cleanup failure left atomic JSON artifacts behind.'
 
   $invalidToken = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'invalid-token'
   Write-ExistingAstrBotFixture $invalidToken.Paths

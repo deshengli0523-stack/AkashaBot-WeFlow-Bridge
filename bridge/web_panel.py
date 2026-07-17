@@ -8,11 +8,11 @@ Web 控制面板模块。
 
 import json
 import logging
-import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import state
 import config
+from uia_support import CalibrationError, validate_calibration
 
 log = logging.getLogger("ob11-bridge")
 
@@ -228,7 +228,7 @@ function refreshDashboard() {
     document.getElementById('obStatus').style.color = s.ob_connected ? '#4caf50' : '#bdbdbd';
     document.getElementById('weflowStatus').textContent = s.weflow_connected ? '已连接' : '未连接';
     document.getElementById('weflowStatus').style.color = s.weflow_connected ? '#4caf50' : '#bdbdbd';
-    document.getElementById('sendMethod').textContent = s.send_method;
+    document.getElementById('sendMethod').textContent = s.sender_mode + (s.calibrated ? '（已标定）' : '（待标定）');
 
     document.getElementById('btnStart').disabled = s.running;
     document.getElementById('btnStop').disabled = !s.running;
@@ -274,12 +274,10 @@ function renderConfigForm(cfg) {
     {title:'WeFlow 连接', fields:[
       {key:'weflow_base_url', label:'WeFlow 地址', type:'text', ph:'http://127.0.0.1:5031'},
       {key:'access_token', label:'Access Token', type:'password', ph:'输入Token'},
-      {key:'weflow_send_api', label:'发送 API 地址', type:'text', ph:'http://127.0.0.1:5031/api/v1/message'},
     ]},
     {title:'机器人', fields:[
       {key:'bot_nicknames', label:'机器人昵称（多个用逗号隔开）', type:'text', ph:'山山酱(^'},
       {key:'bot_wxid', label:'机器人 wxid', type:'text', ph:'wxid_xxx'},
-      {key:'send_method', label:'发送方式', type:'select', opts:[{v:'uia',l:'UIA 自动化'},{v:'weflow_api',l:'WeFlow API'}]},
     ]},
     {title:'AstrBot 连接', fields:[
       {key:'astrbot_ob_url', label:'AstrBot OB 地址', type:'text', ph:'ws://127.0.0.1:11229/ws'},
@@ -326,16 +324,6 @@ function renderConfigForm(cfg) {
   });
 
   document.getElementById('settingsForm').innerHTML = html;
-  var sendSelect = document.getElementById('cfg_send_method');
-  if (sendSelect && !sendSelect.querySelector('option[value="uia_fixed"]')) {
-    var fixedOption = document.createElement('option');
-    fixedOption.value = 'uia_fixed';
-    fixedOption.textContent = 'UIA 固定前台';
-    sendSelect.insertBefore(fixedOption, sendSelect.children[1] || null);
-  }
-  if (sendSelect && cfg.send_method === 'uia_fixed') {
-    sendSelect.value = 'uia_fixed';
-  }
 }
 
 // ===== 保存配置 =====
@@ -375,6 +363,33 @@ setInterval(refreshDashboard, 3000);
 </html>"""
 
 
+def _is_calibrated() -> bool:
+    try:
+        validate_calibration(config.UIA_FIXED_CALIBRATION)
+        return True
+    except CalibrationError:
+        return False
+
+
+def _sender_status() -> dict[str, object]:
+    return {"sender_mode": "uia_fixed", "calibrated": _is_calibrated()}
+
+
+def _public_config(value: dict[str, object]) -> dict[str, object]:
+    return {
+        key: field_value
+        for key, field_value in value.items()
+        if key != "uia_fixed_calibration"
+    }
+
+
+def _merge_public_config(
+    current: dict[str, object], submitted: dict[str, object]
+) -> dict[str, object]:
+    current.update(_public_config(submitted))
+    return current
+
+
 class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
@@ -386,21 +401,21 @@ class WebHandler(BaseHTTPRequestHandler):
                     log_lines = f.read().splitlines()[-200:]
             except Exception:
                 pass
-            self.send_json({
+            status = {
                 "running": state.running,
                 "paused": state.paused.is_set(),
-                "send_method": config.SEND_METHOD,
-                "ob_url": config.ASTRBOT_OB_URL,
                 "ob_connected": ob_connected,
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
                 "log": "\n".join(log_lines),
-            })
+            }
+            status.update(_sender_status())
+            self.send_json(status)
         elif self.path == "/api/config":
             try:
                 with open(config.CONFIG_FILE, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
-                self.send_json(cfg)
+                self.send_json(_public_config(cfg))
             except Exception as e:
                 self.send_json({"error": str(e)}, 500)
         else:
@@ -452,7 +467,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 # 读取当前配置，仅覆盖前端传来的字段
                 with open(config.CONFIG_FILE, "r", encoding="utf-8") as f:
                     current = json.load(f)
-                current.update(new_cfg)
+                _merge_public_config(current, new_cfg)
                 # 保留 _comment 字段
                 if "_comment" not in current:
                     current["_comment"] = "微信 ↔ AstrBot 桥接 - OneBot v11 版配置"

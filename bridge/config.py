@@ -43,43 +43,7 @@ ACCESS_TOKEN = config["access_token"]
 ASTRBOT_ATTACHMENTS = config.get("astrbot_attachments", "")
 BOT_NICKNAMES = config["bot_nicknames"]
 BOT_WXID = config.get("bot_wxid", "")
-SEND_METHOD = config.get("send_method", "weflow_api")
-
-
-def _cfg_float(name, default):
-    try:
-        return float(config.get(name, default))
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _cfg_bool(name, default):
-    value = config.get(name, default)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
-# Fixed foreground WeChat UI mode. Coordinates are ratios inside the WeChat
-# main window, so they survive resolution changes as long as the layout is stable.
-UIA_FIXED_CONFIG = {
-    "search_x": _cfg_float("uia_fixed_search_x", 0.115),
-    "search_y": _cfg_float("uia_fixed_search_y", 0.055),
-    "first_result_x": _cfg_float("uia_fixed_first_result_x", 0.145),
-    "first_result_y": _cfg_float("uia_fixed_first_result_y", 0.165),
-    "input_x": _cfg_float("uia_fixed_input_x", 0.62),
-    "input_y": _cfg_float("uia_fixed_input_y", 0.88),
-    "send_x": _cfg_float("uia_fixed_send_x", 0.945),
-    "send_y": _cfg_float("uia_fixed_send_y", 0.955),
-    "search_delay": _cfg_float("uia_fixed_search_delay", 0.45),
-    "switch_delay": _cfg_float("uia_fixed_switch_delay", 0.75),
-    "paste_delay": _cfg_float("uia_fixed_paste_delay", 0.15),
-    "clear_input": _cfg_bool("uia_fixed_clear_input", True),
-    "use_enter_to_send": _cfg_bool("uia_fixed_use_enter_to_send", False),
-}
-WE_FLOW_SEND_API = config["weflow_send_api"]
+UIA_FIXED_CALIBRATION = config.get("uia_fixed_calibration")
 BUFFER_SECONDS = config.get("buffer_seconds", 5)
 WEB_PORT = config.get("web_port", 8766)
 GROUP_REPLY_MODE = config.get("group_reply_mode", "mention")  # "mention" / "all"
@@ -127,7 +91,7 @@ class _SensitiveValueFilter(logging.Filter):
 
 _privacy_filter = _SensitiveValueFilter([
     ACCESS_TOKEN, ASTRBOT_ATTACHMENTS, BOT_NICKNAMES, BOT_WXID,
-    WE_FLOW_BASE_URL, WE_FLOW_SEND_API, ASTRBOT_OB_URL,
+    WE_FLOW_BASE_URL, ASTRBOT_OB_URL,
     IMAGE_CAPTION_API_KEY, IMAGE_CAPTION_API_BASE, IMAGE_CAPTION_PROMPT,
     OLLAMA_BASE_URL, CONFIG_FILE, LOG_DIR,
 ])

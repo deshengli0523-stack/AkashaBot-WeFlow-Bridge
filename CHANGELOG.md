@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0 - 2026-07-17
+
+- Keep one fixed-point UIA sending path and remove the two superseded sender modules.
+- Add strict four-point calibration schema validation, Windows input capture, atomic calibration persistence, and start-time calibration gates.
+- Add the installed `校准.bat` entry while keeping desktop shortcuts limited to start, stop, and health check.
+- Allow a clean uncalibrated install to finish without starting services; preserve an existing valid calibration during update.
+- Expose only calibration readiness and the fixed sender mode in bridge status, without exposing stored calibration details.
+- Update release hygiene checks for the exact 50-file public snapshot and the four direct bridge dependencies.
+
+### Automated verification
+
+- Calibration schema, capture ordering, cancellation, atomic persistence, sender behavior, start gating, installer rollback, public payload layout, dependency allowlist, and secret/path hygiene are covered by the repository test suite.
+- Live WeChat interaction and real multi-monitor DPI behavior are not claimed by automated tests.
+
 ## 0.1.0 - 2026-07-17
 
 - Prepare the first clean public bridge installer release.

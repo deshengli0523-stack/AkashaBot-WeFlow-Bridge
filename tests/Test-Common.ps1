@@ -54,7 +54,9 @@ $expectedExports = @(
   'Backup-AkashaFile',
   'Resolve-Python312',
   'Invoke-AkashaNative',
-  'Get-WeFlowExecutable'
+  'Get-WeFlowExecutable',
+  'Get-AkashaUiaCalibrationStatus',
+  'Assert-AkashaUiaCalibrationReady'
 )
 foreach ($name in $expectedExports) {
   $command = Get-Command $name -CommandType Function -ErrorAction SilentlyContinue
@@ -64,6 +66,20 @@ $actualExports = @((Get-Command -Module AkashaBot.Common -CommandType Function).
 $sortedExpectedExports = @($expectedExports | Sort-Object)
 Assert-Equal $actualExports.Count $sortedExpectedExports.Count 'Common module export count changed.'
 Assert-Equal ($actualExports -join '|') ($sortedExpectedExports -join '|') 'Common module export surface changed.'
+
+$calibrationStatusRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('akasha-common-calibration-' + [guid]::NewGuid().ToString('N'))
+$calibrationStatusPath = Join-Path $calibrationStatusRoot 'config.json'
+New-Item -ItemType Directory -Force -Path $calibrationStatusRoot | Out-Null
+try {
+  Assert-Equal (Get-AkashaUiaCalibrationStatus -ConfigPath $calibrationStatusPath) 'required' 'Common calibration missing-file status changed.'
+  [System.IO.File]::WriteAllText($calibrationStatusPath, '{bad', (New-Object System.Text.UTF8Encoding($false)))
+  Assert-Equal (Get-AkashaUiaCalibrationStatus -ConfigPath $calibrationStatusPath) 'invalid' 'Common calibration invalid-JSON status changed.'
+  $readyCalibrationJson = '{"uia_fixed_calibration":{"schema_version":1,"completed":true,"coordinate_space":"client_area_ratio","points":{"search_box":{"x":0.1,"y":0.1},"first_result":{"x":0.2,"y":0.2},"message_input":{"x":0.6,"y":0.8},"send_button":{"x":0.9,"y":0.9}},"reference":{"client_width":1200,"client_height":800,"aspect_ratio":1.5,"dpi":96}}}'
+  [System.IO.File]::WriteAllText($calibrationStatusPath, $readyCalibrationJson, (New-Object System.Text.UTF8Encoding($false)))
+  Assert-Equal (Get-AkashaUiaCalibrationStatus -ConfigPath $calibrationStatusPath) 'ready' 'Common calibration ready status changed.'
+} finally {
+  Remove-Item -LiteralPath $calibrationStatusRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $pythonProbeParser = & $moduleInfo {
   Get-Command ConvertFrom-AkashaPythonProbeOutput -CommandType Function -ErrorAction SilentlyContinue
@@ -243,6 +259,12 @@ try {
   }
   Assert-Equal $prerequisiteResult.Paths.Root ([System.IO.Path]::GetFullPath($prerequisiteRoot)) 'Prerequisite validator returned the wrong root.'
   Assert-True ($null -ne $prerequisiteResult.Python) 'Prerequisite validator omitted Python.'
+  $prerequisiteLogText = Get-Content -LiteralPath $prerequisitePaths.InstallLog -Raw -Encoding UTF8
+  Assert-TextExcludes $prerequisiteLogText @(
+    [System.IO.Path]::GetFullPath($prerequisiteRoot),
+    [System.IO.Path]::GetFileName($prerequisiteRoot)
+  ) 'Prerequisite success log exposed the local installation path.'
+  Assert-True ($prerequisiteLogText -match '\[INFO\] Prerequisites passed\.') 'Prerequisite success log is missing fixed status metadata.'
 
   $secretCases = @(
     @{ Key='api_key'; Text={ param($value) '{"api_key":"' + $value + '"}' } },

@@ -211,6 +211,172 @@ function Backup-AkashaFile {
   Copy-Item -LiteralPath $Path -Destination $destination -Force
   return $destination
 }
+function Test-AkashaJsonInteger {
+  param($Value)
+
+  return $Value -is [sbyte] -or
+    $Value -is [byte] -or
+    $Value -is [int16] -or
+    $Value -is [uint16] -or
+    $Value -is [int32] -or
+    $Value -is [uint32] -or
+    $Value -is [int64] -or
+    $Value -is [uint64]
+}
+function Test-AkashaJsonNumber {
+  param($Value)
+
+  return (Test-AkashaJsonInteger -Value $Value) -or
+    $Value -is [single] -or
+    $Value -is [double] -or
+    $Value -is [decimal]
+}
+function Test-AkashaFiniteJsonNumber {
+  param($Value)
+
+  if (-not (Test-AkashaJsonNumber -Value $Value)) { return $false }
+  try {
+    $number = [double]$Value
+    return -not [double]::IsNaN($number) -and -not [double]::IsInfinity($number)
+  } catch {
+    return $false
+  }
+}
+function Test-AkashaJsonObject {
+  param($Value)
+
+  return $null -ne $Value -and
+    $Value -isnot [System.Array] -and
+    $Value -is [pscustomobject]
+}
+function Get-AkashaExactJsonProperty {
+  param(
+    $Value,
+    [Parameter(Mandatory)][string]$Name
+  )
+
+  if (-not (Test-AkashaJsonObject -Value $Value)) {
+    return [pscustomobject]@{ Status = 'invalid'; Property = $null }
+  }
+  $caseInsensitive = @(
+    $Value.PSObject.Properties |
+      Where-Object { $_.Name -ieq $Name }
+  )
+  $exact = @(
+    $Value.PSObject.Properties |
+      Where-Object { $_.Name -ceq $Name }
+  )
+  if ($exact.Count -eq 0 -and $caseInsensitive.Count -eq 0) {
+    return [pscustomobject]@{ Status = 'missing'; Property = $null }
+  }
+  if ($exact.Count -ne 1 -or $caseInsensitive.Count -ne 1) {
+    return [pscustomobject]@{ Status = 'invalid'; Property = $null }
+  }
+  return [pscustomobject]@{ Status = 'found'; Property = $exact[0] }
+}
+function Test-AkashaExactJsonProperties {
+  param(
+    $Value,
+    [Parameter(Mandatory)][string[]]$Names
+  )
+
+  if (-not (Test-AkashaJsonObject -Value $Value)) { return $false }
+  $actual = @($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+  return $actual.Count -eq $Names.Count -and
+    @($actual | Where-Object { $Names -cnotcontains $_ }).Count -eq 0
+}
+function Get-AkashaUiaCalibrationStatus {
+  param([Parameter(Mandatory)][string]$ConfigPath)
+
+  if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return 'required' }
+  try {
+    $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
+    if (-not $raw.TrimStart().StartsWith('{')) { return 'invalid' }
+    $config = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+  } catch {
+    return 'invalid'
+  }
+  if (-not (Test-AkashaJsonObject -Value $config)) { return 'invalid' }
+
+  $calibrationLookup = Get-AkashaExactJsonProperty -Value $config -Name 'uia_fixed_calibration'
+  if ($calibrationLookup.Status -ceq 'missing') { return 'required' }
+  if ($calibrationLookup.Status -cne 'found') { return 'invalid' }
+  $calibration = $calibrationLookup.Property.Value
+  if (-not (Test-AkashaJsonObject -Value $calibration) -or @($calibration.PSObject.Properties).Count -eq 0) {
+    return 'required'
+  }
+
+  $schemaLookup = Get-AkashaExactJsonProperty -Value $calibration -Name 'schema_version'
+  if ($schemaLookup.Status -ceq 'missing') { return 'required' }
+  if ($schemaLookup.Status -cne 'found') { return 'invalid' }
+  if (-not (Test-AkashaExactJsonProperties -Value $calibration -Names @('schema_version', 'completed', 'coordinate_space', 'points', 'reference'))) {
+    return 'invalid'
+  }
+  $schema = $schemaLookup.Property.Value
+  if ($schema -is [bool]) { return 'invalid' }
+  if (-not (Test-AkashaJsonInteger -Value $schema)) {
+    if ((Test-AkashaFiniteJsonNumber -Value $schema) -and [double]$schema -eq 1) { return 'invalid' }
+    return 'required'
+  }
+  if ([decimal]$schema -ne 1) { return 'required' }
+
+  $completedLookup = Get-AkashaExactJsonProperty -Value $calibration -Name 'completed'
+  if ($completedLookup.Status -cne 'found' -or $completedLookup.Property.Value -isnot [bool]) { return 'invalid' }
+  if (-not [bool]$completedLookup.Property.Value) { return 'required' }
+
+  $coordinateLookup = Get-AkashaExactJsonProperty -Value $calibration -Name 'coordinate_space'
+  if ($coordinateLookup.Status -cne 'found' -or
+      $coordinateLookup.Property.Value -isnot [string] -or
+      $coordinateLookup.Property.Value -cne 'client_area_ratio') {
+    return 'invalid'
+  }
+
+  $pointsLookup = Get-AkashaExactJsonProperty -Value $calibration -Name 'points'
+  $referenceLookup = Get-AkashaExactJsonProperty -Value $calibration -Name 'reference'
+  if ($pointsLookup.Status -cne 'found' -or $referenceLookup.Status -cne 'found') { return 'invalid' }
+  $pointNames = @('search_box', 'first_result', 'message_input', 'send_button')
+  if (-not (Test-AkashaExactJsonProperties -Value $pointsLookup.Property.Value -Names $pointNames)) { return 'invalid' }
+  foreach ($pointName in $pointNames) {
+    $pointLookup = Get-AkashaExactJsonProperty -Value $pointsLookup.Property.Value -Name $pointName
+    if ($pointLookup.Status -cne 'found') { return 'invalid' }
+    $point = $pointLookup.Property.Value
+    if (-not (Test-AkashaExactJsonProperties -Value $point -Names @('x', 'y'))) { return 'invalid' }
+    foreach ($axis in @('x', 'y')) {
+      $axisLookup = Get-AkashaExactJsonProperty -Value $point -Name $axis
+      if ($axisLookup.Status -cne 'found') { return 'invalid' }
+      $coordinate = $axisLookup.Property.Value
+      if (-not (Test-AkashaFiniteJsonNumber -Value $coordinate)) { return 'invalid' }
+      $ratio = [double]$coordinate
+      if ($ratio -le 0 -or $ratio -ge 1) { return 'invalid' }
+    }
+  }
+
+  $reference = $referenceLookup.Property.Value
+  $referenceNames = @('client_width', 'client_height', 'aspect_ratio', 'dpi')
+  if (-not (Test-AkashaExactJsonProperties -Value $reference -Names $referenceNames)) { return 'invalid' }
+  foreach ($name in @('client_width', 'client_height', 'dpi')) {
+    $propertyLookup = Get-AkashaExactJsonProperty -Value $reference -Name $name
+    if ($propertyLookup.Status -cne 'found' -or
+        -not (Test-AkashaJsonInteger -Value $propertyLookup.Property.Value) -or
+        [decimal]$propertyLookup.Property.Value -le 0) {
+      return 'invalid'
+    }
+  }
+  $aspectLookup = Get-AkashaExactJsonProperty -Value $reference -Name 'aspect_ratio'
+  if ($aspectLookup.Status -cne 'found' -or
+      -not (Test-AkashaFiniteJsonNumber -Value $aspectLookup.Property.Value) -or
+      [double]$aspectLookup.Property.Value -le 0) {
+    return 'invalid'
+  }
+  return 'ready'
+}
+function Assert-AkashaUiaCalibrationReady {
+  param([Parameter(Mandatory)][string]$ConfigPath)
+
+  $status = Get-AkashaUiaCalibrationStatus -ConfigPath $ConfigPath
+  if ($status -ceq 'required') { throw 'E_UIA_CALIBRATION_REQUIRED: Run the calibration launcher before starting services.' }
+  if ($status -ceq 'invalid') { throw 'E_UIA_CALIBRATION_INVALID: Run the calibration launcher to replace the invalid calibration.' }
+}
 function ConvertFrom-AkashaPythonProbeOutput {
   param([object[]]$OutputRecords = @())
 
@@ -331,7 +497,7 @@ function Invoke-AkashaPrerequisiteValidation {
       Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
     }
   }
-  Write-AkashaLog -Path $paths.InstallLog -Level 'info' -Message "Prerequisites passed for $($paths.Root)"
+  Write-AkashaLog -Path $paths.InstallLog -Level 'info' -Message 'Prerequisites passed.'
   return [pscustomobject]@{
     Paths = $paths
     Python = $python
@@ -496,4 +662,4 @@ function Get-WeFlowExecutable {
     Select-Object -First 1
 }
 
-Export-ModuleMember -Function Get-AkashaBotPaths, Protect-AkashaLogText, Write-AkashaLog, Write-JsonAtomic, Backup-AkashaFile, Resolve-Python312, Invoke-AkashaNative, Get-WeFlowExecutable
+Export-ModuleMember -Function Get-AkashaBotPaths, Protect-AkashaLogText, Write-AkashaLog, Write-JsonAtomic, Backup-AkashaFile, Resolve-Python312, Invoke-AkashaNative, Get-WeFlowExecutable, Get-AkashaUiaCalibrationStatus, Assert-AkashaUiaCalibrationReady

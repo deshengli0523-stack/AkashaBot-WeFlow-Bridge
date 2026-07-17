@@ -12,6 +12,7 @@ function Join-Chars {
 function Get-TestLauncherNames {
   [pscustomobject]@{
     Install = (Join-Chars @(0x5B89, 0x88C5)) + '.bat'
+    Calibrate = (Join-Chars @(0x6821, 0x51C6)) + '.bat'
     Start = (Join-Chars @(0x542F, 0x52A8)) + '.bat'
     Stop = (Join-Chars @(0x505C, 0x6B62)) + '.bat'
     Health = (Join-Chars @(0x5065, 0x5EB7, 0x68C0, 0x67E5)) + '.bat'
@@ -55,12 +56,24 @@ function Get-RelativeFiles {
   )
 }
 
+function Get-FileFingerprint {
+  param([string]$Path)
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return [Convert]::ToBase64String($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path)))
+  } finally {
+    $sha.Dispose()
+  }
+}
+
 function New-TestBoundaries {
   param(
     [object[]]$Discoveries,
     [int]$PackageExitCode = 0,
     [int]$HealthExitCode = 0,
-    [AllowNull()][string]$SelectedInstaller = $null
+    [AllowNull()][string]$SelectedInstaller = $null,
+    [AllowNull()][object]$CalibrationStatus = 'required'
   )
 
   $state = [pscustomobject]@{
@@ -70,6 +83,7 @@ function New-TestBoundaries {
     PackageExitCode = $PackageExitCode
     HealthExitCode = $HealthExitCode
     SelectedInstaller = $SelectedInstaller
+    CalibrationStatus = $CalibrationStatus
     LockSeenByStarter = $true
   }
   foreach ($value in @($Discoveries)) { $state.Discoveries.Enqueue($value) }
@@ -117,6 +131,11 @@ function New-TestBoundaries {
     $state.Calls.Add('health')
     return $state.HealthExitCode
   }.GetNewClosure()
+  $calibrationStatusReader = {
+    param($configPath)
+    $state.Calls.Add('calibration')
+    return $state.CalibrationStatus
+  }.GetNewClosure()
   return [pscustomobject]@{
     State = $state
     Prerequisite = $prerequisite
@@ -128,6 +147,7 @@ function New-TestBoundaries {
     Shortcuts = $shortcuts
     Starter = $starter
     Health = $health
+    CalibrationStatusReader = $calibrationStatusReader
   }
 }
 
@@ -139,7 +159,8 @@ function Invoke-TestInstall {
     [string]$InstallerPath = '',
     [switch]$SkipStart,
     [scriptblock]$ReplacementHook,
-    [string]$SourceRoot = $root
+    [string]$SourceRoot = $root,
+    [scriptblock]$CalibrationStatusReader
   )
   $arguments = @{
     InstallRoot = $InstallRoot
@@ -155,6 +176,7 @@ function Invoke-TestInstall {
     ShortcutCreator = $Boundaries.Shortcuts
     ServiceStarter = $Boundaries.Starter
     HealthChecker = $Boundaries.Health
+    CalibrationStatusReader = if ($null -ne $CalibrationStatusReader) { $CalibrationStatusReader } else { $Boundaries.CalibrationStatusReader }
     SkipStart = $SkipStart
   }
   if ($null -ne $ReplacementHook) { $arguments.ReplacementHook = $ReplacementHook }
@@ -181,7 +203,7 @@ function New-TestSourceFixture {
 }
 
 $launchers = Get-TestLauncherNames
-$entrypoints = @('scripts\Install.ps1', $launchers.Install, $launchers.Start, $launchers.Stop, $launchers.Health)
+$entrypoints = @('scripts\Install.ps1', $launchers.Install, $launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health)
 foreach ($relative in $entrypoints) {
   if (-not (Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf)) { throw "Installer entrypoint missing: $relative" }
 }
@@ -193,6 +215,8 @@ Assert-True ($installSource -notmatch '(?i)Invoke-WebRequest[\s\S]{0,200}WeFlow|
 Assert-True ($installSource -match 'Start-Process' -and $installSource -match '-Wait' -and $installSource -match '-PassThru') 'Default package runner is not synchronous and exit-code aware.'
 Assert-True ($installSource -match "Start-Process -FilePath 'msiexec\.exe'" -and $installSource -match 'ArgumentList @\(''/i'', \$quotedPath\)' -and $installSource -match '\[int\]\$process\.ExitCode') 'Default MSI runner does not quote a spaced path or inspect ExitCode.'
 Assert-True ($installSource -notmatch '[^\x00-\x7F]') 'Install.ps1 must remain ASCII-only for Windows PowerShell 5.1.'
+Assert-True ($installSource -match '\$installResult\s*=\s*Invoke-AkashaInstall' -and $installSource -match '\$installResult\.CalibrationRequired') 'Direct installer entrypoint does not retain the install result for calibration guidance.'
+Assert-True ($installSource -match '\$launchers\.Calibrate') 'Direct installer entrypoint does not construct the calibration launcher from codepoints.'
 
 foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop, $launchers.Health)) {
   $path = Join-Path $root $name
@@ -204,6 +228,12 @@ foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop, $laun
   Assert-True ($text -match 'set "CODE=%ERRORLEVEL%"') "$name does not capture ERRORLEVEL immediately."
   Assert-True ($text -match 'exit /b %CODE%') "$name does not preserve ERRORLEVEL."
 }
+$calibrateBat = [System.IO.File]::ReadAllText((Join-Path $root $launchers.Calibrate))
+Assert-True (@([System.IO.File]::ReadAllBytes((Join-Path $root $launchers.Calibrate)) | Where-Object { $_ -gt 127 }).Count -eq 0) "$($launchers.Calibrate) is not ASCII-only."
+Assert-True ($calibrateBat -match '%~dp0scripts\\Calibrate-Uia\.ps1') "$($launchers.Calibrate) does not use the source-relative calibration script."
+Assert-True ($calibrateBat -match 'set "code=%ERRORLEVEL%"') "$($launchers.Calibrate) does not capture ERRORLEVEL immediately."
+Assert-True ($calibrateBat -match 'exit /b %code%') "$($launchers.Calibrate) does not preserve ERRORLEVEL."
+Assert-True ($calibrateBat -match '(?m)^pause\s*$') "$($launchers.Calibrate) must pause for interactive calibration."
 $healthBat = [System.IO.File]::ReadAllText((Join-Path $root $launchers.Health))
 Assert-True ($healthBat -match '(?m)^pause\s*$') 'Health launcher must always pause.'
 foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop)) {
@@ -213,19 +243,20 @@ foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop)) {
 . (Join-Path $root 'scripts\Install.ps1')
 Assert-True ($null -ne (Get-Command Invoke-AkashaInstall -ErrorAction SilentlyContinue)) 'Dot-sourcing did not expose Invoke-AkashaInstall.'
 $payload = @(Get-AkashaInstallPayload)
-Assert-Equal $payload.Count 28 'Installed payload count changed.'
+Assert-Equal $payload.Count 30 'Installed payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 14 'Bridge payload count changed.'
-Assert-Equal @($payload | Where-Object { $_.Source -like 'scripts\*' }).Count 8 'Script payload count changed.'
+Assert-Equal @($payload | Where-Object { $_.Source -like 'scripts\*' }).Count 9 'Script payload count changed.'
+Assert-Equal @($payload | Where-Object { $_.Source -notlike 'bridge\*' -and $_.Source -notlike 'scripts\*' }).Count 7 'Root payload count changed.'
 Assert-True (@($payload | Where-Object { $_.Source -ceq $launchers.Install }).Count -eq 0) 'Install launcher must not be installed.'
 $expectedPayloadSources = @(
   'bridge\bridge_core.py', 'bridge\config.py', 'bridge\main.py', 'bridge\ob_client.py',
-  'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\senders.py', 'bridge\state.py',
-  'bridge\uia_fixed_sender.py', 'bridge\uia_sender.py', 'bridge\web_panel.py',
+  'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\state.py',
+  'bridge\uia_fixed_sender.py', 'bridge\uia_support.py', 'bridge\calibrate_uia_fixed.py', 'bridge\web_panel.py',
   'bridge\config.example.json', 'bridge\requirements.txt', 'bridge\requirements.lock',
   'scripts\AkashaBot.Common.psm1', 'scripts\Test-Prerequisites.ps1',
   'scripts\Initialize-Environments.ps1', 'scripts\Initialize-Configuration.ps1',
   'scripts\Start-Services.ps1', 'scripts\Stop-Services.ps1', 'scripts\Test-Health.ps1',
-  'scripts\Install.ps1', $launchers.Start, $launchers.Stop, $launchers.Health,
+  'scripts\Install.ps1', 'scripts\Calibrate-Uia.ps1', $launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health,
   'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md'
 )
 Assert-SequenceEqual @($payload.Source | Sort-Object) @($expectedPayloadSources | Sort-Object) 'Installed payload manifest is not the frozen exact allowlist.'
@@ -240,16 +271,18 @@ $weFlowConfig = Join-Path $externalRoot 'WeFlow-config.json'
 
 try {
   $successRoot = Join-Path $fixtureRoot 'successful install root with spaces'
-  $success = New-TestBoundaries -Discoveries @($weFlowExe)
+  $success = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus 'ready'
   $result = Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $success -SkipStart
   Assert-Equal $result.Status 'installed' 'SkipStart install did not succeed.'
+  Assert-Equal $result.Started $false 'SkipStart install unexpectedly started services.'
+  Assert-Equal $result.CalibrationRequired $false 'Ready SkipStart install reported calibration required.'
   $expectedBridge = @($payload | Where-Object { $_.Destination -like 'app\bridge\*' } | ForEach-Object { [System.IO.Path]::GetFileName([string]$_.Destination) } | Sort-Object)
   $actualBridge = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'app\bridge') -File | Select-Object -ExpandProperty Name | Sort-Object)
   Assert-SequenceEqual $actualBridge $expectedBridge 'Installed bridge payload is not exact.'
   $expectedScripts = @($payload | Where-Object { $_.Destination -like 'scripts\*' } | ForEach-Object { [System.IO.Path]::GetFileName([string]$_.Destination) } | Sort-Object)
   $actualScripts = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'scripts') -File | Select-Object -ExpandProperty Name | Sort-Object)
   Assert-SequenceEqual $actualScripts $expectedScripts 'Installed script payload is not exact.'
-  foreach ($name in @($launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
+  foreach ($name in @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $successRoot $name) -PathType Leaf) "Installed root payload is missing $name."
   }
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $successRoot $launchers.Install))) 'Install launcher was copied into the product.'
@@ -262,8 +295,10 @@ try {
   $pathBytes = [System.IO.File]::ReadAllBytes((Join-Path $successRoot 'data\state\weflow-path.txt'))
   Assert-True (-not ($pathBytes.Length -ge 3 -and $pathBytes[0] -eq 0xEF -and $pathBytes[1] -eq 0xBB -and $pathBytes[2] -eq 0xBF)) 'weflow-path.txt contains a UTF-8 BOM.'
   Assert-Equal ([System.Text.Encoding]::UTF8.GetString($pathBytes)) ([System.IO.Path]::GetFullPath($weFlowExe)) 'weflow-path.txt changed the canonical path.'
-  Assert-SequenceEqual $success.State.Calls @('prerequisite', 'discovery', 'environment', 'configuration', 'shortcuts') 'SkipStart call order changed.'
+  Assert-SequenceEqual $success.State.Calls @('prerequisite', 'discovery', 'environment', 'configuration', 'shortcuts', 'calibration') 'SkipStart call order changed.'
+  Assert-True ($success.State.Calls -cnotcontains 'start' -and $success.State.Calls -cnotcontains 'health') 'SkipStart crossed start/health boundaries.'
   Assert-Equal $success.State.ShortcutEntries.Count 3 'Shortcut count changed.'
+  Assert-True (@($success.State.ShortcutEntries | Where-Object { [string]$_.Target -ceq (Join-Path $successRoot $launchers.Calibrate) }).Count -eq 0) 'Calibration launcher unexpectedly received a desktop shortcut.'
   foreach ($entry in $success.State.ShortcutEntries) {
     Assert-Equal $entry.WorkingDirectory $successRoot 'Shortcut working directory is not the install root.'
     Assert-True ([System.IO.Path]::GetFullPath([string]$entry.Target).StartsWith($successRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) 'Shortcut target escaped the install root.'
@@ -348,16 +383,32 @@ try {
   [System.IO.File]::WriteAllText((Join-Path $successRoot 'app\bridge\main.py'), $oldBridge, (New-Object System.Text.UTF8Encoding($false)))
   New-Item -ItemType Directory -Force -Path (Join-Path $successRoot 'data\bridge') | Out-Null
   $seededSecret = 'seeded-secret-value-1234567890'
-  [System.IO.File]::WriteAllText((Join-Path $successRoot 'data\bridge\config.json'), ('{"access_token":"' + $seededSecret + '"}'), (New-Object System.Text.UTF8Encoding($false)))
+  $readyConfig = '{"access_token":"' + $seededSecret + '","uia_fixed_calibration":{"schema_version":1,"completed":true,"coordinate_space":"client_area_ratio","points":{"search_box":{"x":0.1,"y":0.1},"first_result":{"x":0.2,"y":0.2},"message_input":{"x":0.6,"y":0.8},"send_button":{"x":0.9,"y":0.9}},"reference":{"client_width":1200,"client_height":800,"aspect_ratio":1.5,"dpi":96}}}'
+  $installedBridgeConfig = Join-Path $successRoot 'data\bridge\config.json'
+  [System.IO.File]::WriteAllText($installedBridgeConfig, $readyConfig, (New-Object System.Text.UTF8Encoding($false)))
+  $readyConfigFingerprint = Get-FileFingerprint $installedBridgeConfig
   [System.IO.File]::WriteAllText((Join-Path $successRoot 'runtime\runtime-sentinel.txt'), 'runtime-preserved', (New-Object System.Text.UTF8Encoding($false)))
-  $rerun = New-TestBoundaries -Discoveries @($weFlowExe)
-  Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $rerun -SkipStart | Out-Null
+  $rerun = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus 'ready'
+  $rerunResult = Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $rerun
+  Assert-Equal $rerunResult.Started $true 'Ready schema 1 update did not start services by default.'
+  Assert-Equal $rerunResult.CalibrationRequired $false 'Ready schema 1 update requested calibration.'
+  Assert-SequenceEqual @($rerun.State.Calls | Select-Object -Last 3) @('calibration', 'start', 'health') 'Ready schema 1 update changed calibration/start/health order.'
   Assert-Equal (Get-Content -LiteralPath (Join-Path $successRoot 'runtime\runtime-sentinel.txt') -Raw -Encoding UTF8) 'runtime-preserved' 'Rerun changed runtime data.'
-  Assert-True ((Get-Content -LiteralPath (Join-Path $successRoot 'data\bridge\config.json') -Raw -Encoding UTF8).Contains($seededSecret)) 'Rerun changed bridge user data.'
+  Assert-Equal (Get-FileFingerprint $installedBridgeConfig) $readyConfigFingerprint 'Ready schema 1 update changed bridge config bytes.'
   $bridgeBackups = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'data\backups') -Directory -Filter 'bridge-*')
   Assert-True (@($bridgeBackups | Where-Object { (Get-Content -LiteralPath (Join-Path $_.FullName 'main.py') -Raw -Encoding UTF8) -ceq $oldBridge }).Count -ge 1) 'Rerun did not back up the previous bridge.'
   $safeArtifacts = (Get-Content -LiteralPath (Join-Path $successRoot 'data\state\install.json') -Raw -Encoding UTF8) + (Get-Content -LiteralPath (Join-Path $successRoot 'data\logs\install.log') -Raw -Encoding UTF8)
   Assert-True (-not $safeArtifacts.Contains($seededSecret) -and -not $safeArtifacts.Contains($weFlowExe)) 'A seeded secret or WeFlow executable path leaked into installer metadata.'
+
+  [System.IO.File]::WriteAllText($installedBridgeConfig, ('{"access_token":"' + $seededSecret + '"}'), (New-Object System.Text.UTF8Encoding($false)))
+  $legacyConfigFingerprint = Get-FileFingerprint $installedBridgeConfig
+  $legacyUpdate = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus 'required'
+  $legacyUpdateResult = Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $legacyUpdate
+  Assert-Equal $legacyUpdateResult.Status 'installed' 'v0.1 update without nested calibration did not succeed.'
+  Assert-Equal $legacyUpdateResult.Started $false 'v0.1 update without nested calibration unexpectedly started services.'
+  Assert-Equal $legacyUpdateResult.CalibrationRequired $true 'v0.1 update without nested calibration omitted the calibration flag.'
+  Assert-True ($legacyUpdate.State.Calls -cnotcontains 'start' -and $legacyUpdate.State.Calls -cnotcontains 'health') 'v0.1 update without nested calibration crossed start/health boundaries.'
+  Assert-Equal (Get-FileFingerprint $installedBridgeConfig) $legacyConfigFingerprint 'v0.1 update changed bridge config bytes.'
 
   $rollbackOld = 'rollback old bridge sentinel'
   [System.IO.File]::WriteAllText((Join-Path $successRoot 'app\bridge\main.py'), $rollbackOld, (New-Object System.Text.UTF8Encoding($false)))
@@ -365,7 +416,7 @@ try {
   $failAfterMove = { param($phase) if ($phase -ceq 'AfterExistingMoved') { throw 'E_FIXTURE_REPLACEMENT_FAILURE' } }
   Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $rollback -SkipStart -ReplacementHook $failAfterMove } 'E_FIXTURE_REPLACEMENT_FAILURE*' 'Injected replacement failure was not preserved.' | Out-Null
   Assert-Equal (Get-Content -LiteralPath (Join-Path $successRoot 'app\bridge\main.py') -Raw -Encoding UTF8) $rollbackOld 'Failed replacement did not restore previous bridge.'
-  Assert-True (Test-Path -LiteralPath (Join-Path $successRoot 'data\bridge\config.json')) 'Failed replacement removed user data.'
+  Assert-Equal (Get-FileFingerprint $installedBridgeConfig) $legacyConfigFingerprint 'Failed replacement changed user config bytes.'
   Assert-NoTransactionResidue -InstallRoot $successRoot
 
   $partialOldBridge = 'partial rollback bridge sentinel'
@@ -377,6 +428,7 @@ try {
   Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $partialRollback -SkipStart -ReplacementHook $failAfterFirstCommit } 'E_FIXTURE_PARTIAL_COMMIT*' 'Partial commit failure was not preserved.' | Out-Null
   Assert-Equal (Get-Content -LiteralPath (Join-Path $successRoot 'app\bridge\main.py') -Raw -Encoding UTF8) $partialOldBridge 'Partial commit did not restore bridge.'
   Assert-Equal (Get-Content -LiteralPath (Join-Path $successRoot 'scripts\Install.ps1') -Raw -Encoding UTF8) $partialOldScript 'Partial commit did not restore scripts.'
+  Assert-Equal (Get-FileFingerprint $installedBridgeConfig) $legacyConfigFingerprint 'Partial commit rollback changed user config bytes.'
   Assert-NoTransactionResidue -InstallRoot $successRoot
 
   $outsidePrivateBridge = Join-Path $fixtureRoot 'outside private bridge data'
@@ -501,15 +553,57 @@ try {
   Assert-Equal $shortcutFailureState.error_code 'E_SHORTCUT_CREATE' 'Shortcut failure state has the wrong fixed code.'
   Assert-True ($shortcutFailure.State.Calls -notcontains 'start' -and $shortcutFailure.State.Calls -notcontains 'health') 'Shortcut failure crossed start/health boundaries.'
 
-  $defaultRoot = Join-Path $fixtureRoot 'default start success'
-  $default = New-TestBoundaries -Discoveries @($weFlowExe)
+  $uncalibratedRoot = Join-Path $fixtureRoot 'uncalibrated default install'
+  $uncalibrated = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus 'required'
+  $uncalibratedResult = Invoke-TestInstall -InstallRoot $uncalibratedRoot -WeFlowConfigPath $weFlowConfig -Boundaries $uncalibrated
+  Assert-Equal $uncalibratedResult.Status 'installed' 'Uncalibrated install did not succeed.'
+  Assert-Equal $uncalibratedResult.Started $false 'Uncalibrated install unexpectedly started services.'
+  Assert-Equal $uncalibratedResult.CalibrationRequired $true 'Uncalibrated install omitted the calibration flag.'
+  Assert-True ($uncalibrated.State.Calls -cnotcontains 'start') 'Uncalibrated install called start.'
+  Assert-True ($uncalibrated.State.Calls -cnotcontains 'health') 'Uncalibrated install called health.'
+  $uncalibratedState = Get-Content -LiteralPath (Join-Path $uncalibratedRoot 'data\state\install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-SequenceEqual @($uncalibratedState.PSObject.Properties.Name | Sort-Object) @('status', 'updated_at', 'version') 'Uncalibrated install wrote failure metadata.'
+  Assert-Equal $uncalibratedState.status 'installed' 'Uncalibrated install state is not installed.'
+  $uncalibratedLog = Get-Content -LiteralPath (Join-Path $uncalibratedRoot 'data\logs\install.log') -Raw -Encoding UTF8
+  Assert-True ($uncalibratedLog -match 'calibration_required=true') 'Uncalibrated install log omitted the boolean calibration state.'
+  Assert-True (-not $uncalibratedLog.Contains('data\bridge\config.json')) 'Uncalibrated install log leaked the calibration config path.'
+
+  $invalidCalibrationRoot = Join-Path $fixtureRoot 'invalid calibration install'
+  $invalidCalibration = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus 'invalid'
+  $invalidCalibrationResult = Invoke-TestInstall -InstallRoot $invalidCalibrationRoot -WeFlowConfigPath $weFlowConfig -Boundaries $invalidCalibration
+  Assert-Equal $invalidCalibrationResult.Status 'installed' 'Invalid calibration install did not succeed.'
+  Assert-Equal $invalidCalibrationResult.Started $false 'Invalid calibration install unexpectedly started services.'
+  Assert-Equal $invalidCalibrationResult.CalibrationRequired $true 'Invalid calibration install omitted the calibration flag.'
+  Assert-True ($invalidCalibration.State.Calls -cnotcontains 'start' -and $invalidCalibration.State.Calls -cnotcontains 'health') 'Invalid calibration install crossed start/health boundaries.'
+
+  $defaultRoot = Join-Path $fixtureRoot 'ready default start success'
+  $default = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus 'ready'
   $defaultResult = Invoke-TestInstall -InstallRoot $defaultRoot -WeFlowConfigPath $weFlowConfig -Boundaries $default
-  Assert-True $defaultResult.Started 'Default install did not report service start.'
-  Assert-SequenceEqual @($default.State.Calls | Select-Object -Last 2) @('start', 'health') 'Default start/health order changed.'
+  Assert-True $defaultResult.Started 'Ready default install did not report service start.'
+  Assert-Equal $defaultResult.CalibrationRequired $false 'Ready default install reported calibration required.'
+  Assert-SequenceEqual @($default.State.Calls | Select-Object -Last 3) @('calibration', 'start', 'health') 'Ready default calibration/start/health order changed.'
   Assert-True (-not $default.State.LockSeenByStarter) 'Service start ran before lifecycle lock release.'
+  $readyLog = Get-Content -LiteralPath (Join-Path $defaultRoot 'data\logs\install.log') -Raw -Encoding UTF8
+  Assert-True ($readyLog -match 'calibration_required=false') 'Ready install log omitted the boolean calibration state.'
+
+  foreach ($unsupportedCase in @(
+      [pscustomobject]@{ Name = 'unknown'; Value = 'unsupported' },
+      [pscustomobject]@{ Name = 'wrong-case'; Value = 'READY' },
+      [pscustomobject]@{ Name = 'non-string'; Value = 42 },
+      [pscustomobject]@{ Name = 'multiple'; Value = [object[]]@('ready', 'required') },
+      [pscustomobject]@{ Name = 'null'; Value = $null }
+    )) {
+    $unsupportedRoot = Join-Path $fixtureRoot ('unsupported calibration status ' + $unsupportedCase.Name)
+    $unsupported = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus $unsupportedCase.Value
+    Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $unsupportedRoot -WeFlowConfigPath $weFlowConfig -Boundaries $unsupported } 'E_INSTALL_FAILED:*' "Unsupported calibration reader output was accepted: $($unsupportedCase.Name)." | Out-Null
+    $unsupportedState = Get-Content -LiteralPath (Join-Path $unsupportedRoot 'data\state\install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Equal $unsupportedState.status 'failed' "Unsupported calibration reader output left installed state: $($unsupportedCase.Name)."
+    Assert-Equal $unsupportedState.error_code 'E_INSTALL_FAILED' "Unsupported calibration reader output used the wrong fixed error code: $($unsupportedCase.Name)."
+    Assert-True ($unsupported.State.Calls -cnotcontains 'start' -and $unsupported.State.Calls -cnotcontains 'health') "Unsupported calibration reader output crossed start/health boundaries: $($unsupportedCase.Name)."
+  }
 
   $healthFailRoot = Join-Path $fixtureRoot 'aggregate health failure'
-  $healthFail = New-TestBoundaries -Discoveries @($weFlowExe) -HealthExitCode 1
+  $healthFail = New-TestBoundaries -Discoveries @($weFlowExe) -HealthExitCode 1 -CalibrationStatus 'ready'
   Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $healthFailRoot -WeFlowConfigPath $weFlowConfig -Boundaries $healthFail } 'E_HEALTH_FAILED:*' 'Aggregate health failure was accepted.' | Out-Null
   Assert-SequenceEqual @($healthFail.State.Calls | Select-Object -Last 2) @('start', 'health') 'Health failure skipped start or health.'
   Assert-Equal (Get-Content -LiteralPath (Join-Path $healthFailRoot 'data\state\install.json') -Raw -Encoding UTF8 | ConvertFrom-Json).status 'installed' 'Health failure falsified completed installation state.'

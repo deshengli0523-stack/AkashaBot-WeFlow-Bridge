@@ -1,4 +1,7 @@
 import ast
+import asyncio
+import io
+import importlib.util
 import json
 import os
 import pathlib
@@ -8,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -17,9 +21,24 @@ BRIDGE = ROOT / "bridge"
 LOG_SOURCE_FILES = (
     "bridge_core.py",
     "ob_protocol.py",
-    "senders.py",
-    "uia_sender.py",
     "uia_fixed_sender.py",
+)
+TASK4_RUNTIME_SOURCE_FILES = (
+    "main.py",
+    "config.py",
+    "uia_fixed_sender.py",
+    "ob_protocol.py",
+)
+TASK4_REMOVED_SOURCE_FILES = ("senders.py", "uia_sender.py")
+TASK4_LEGACY_MARKERS = (
+    "senders",
+    "uia_sender",
+    "create_sender",
+    "WeFlowApiSender",
+    "UiaSender",
+    "SEND_METHOD",
+    "WE_FLOW_SEND_API",
+    "use_enter_to_send",
 )
 
 SENSITIVE_EXACT_NAMES = {
@@ -296,6 +315,527 @@ class BridgeRuntimeTests(unittest.TestCase):
         source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
         self.assertIn("open(config.BRIDGE_LOG_FILE", source)
         self.assertNotIn('open("bridge.log"', source)
+
+    def _load_web_panel(self, calibration, config_path, log_path):
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = None
+        state_module._ob_ws_ready = types.SimpleNamespace(is_set=lambda: False)
+        state_module.bridge_instance = None
+        state_module.running = False
+        state_module.paused = types.SimpleNamespace(is_set=lambda: False)
+        state_module.group_reply_mode = "mention"
+
+        config_module = types.ModuleType("config")
+        config_module.CONFIG_FILE = str(config_path)
+        config_module.BRIDGE_LOG_FILE = str(log_path)
+        config_module.UIA_FIXED_CALIBRATION = calibration
+
+        spec = importlib.util.spec_from_file_location(
+            "task5_web_panel_under_test",
+            BRIDGE / "web_panel.py",
+        )
+        panel = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {"state": state_module, "config": config_module},
+        ):
+            sys.path.insert(0, str(BRIDGE))
+            try:
+                spec.loader.exec_module(panel)
+            finally:
+                sys.path.remove(str(BRIDGE))
+        return panel, state_module, config_module
+
+    def _invoke_web_handler(self, panel, method, path, body=None):
+        handler = object.__new__(panel.WebHandler)
+        handler.path = path
+        captured = {}
+
+        def capture(_handler, data, code=200):
+            captured["data"] = data
+            captured["code"] = code
+
+        handler.send_json = types.MethodType(capture, handler)
+        if body is not None:
+            payload = json.dumps(body).encode("utf-8")
+            handler.headers = {"Content-Length": str(len(payload))}
+            handler.rfile = io.BytesIO(payload)
+        getattr(handler, method)()
+        return captured
+
+    def test_task5_config_template_uses_only_uncompleted_nested_calibration(self):
+        template = json.loads(
+            (BRIDGE / "config.example.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            template.get("uia_fixed_calibration"),
+            {
+                "schema_version": 1,
+                "completed": False,
+                "coordinate_space": "client_area_ratio",
+                "points": {
+                    "search_box": None,
+                    "first_result": None,
+                    "message_input": None,
+                    "send_button": None,
+                },
+                "reference": None,
+            },
+        )
+        legacy_keys = {
+            "send_method",
+            "weflow_send_api",
+            "uia_fixed_search_x",
+            "uia_fixed_search_y",
+            "uia_fixed_first_result_x",
+            "uia_fixed_first_result_y",
+            "uia_fixed_input_x",
+            "uia_fixed_input_y",
+            "uia_fixed_send_x",
+            "uia_fixed_send_y",
+            "uia_fixed_search_delay",
+            "uia_fixed_switch_delay",
+            "uia_fixed_paste_delay",
+            "uia_fixed_clear_input",
+            "uia_fixed_use_enter_to_send",
+        }
+        self.assertTrue(legacy_keys.isdisjoint(template))
+
+    def test_task5_sender_status_uses_full_calibration_validation(self):
+        valid = {
+            "schema_version": 1,
+            "completed": True,
+            "coordinate_space": "client_area_ratio",
+            "points": {
+                "search_box": {"x": 0.1, "y": 0.1},
+                "first_result": {"x": 0.2, "y": 0.2},
+                "message_input": {"x": 0.6, "y": 0.8},
+                "send_button": {"x": 0.9, "y": 0.9},
+            },
+            "reference": {
+                "client_width": 1200,
+                "client_height": 800,
+                "aspect_ratio": 1.5,
+                "dpi": 96,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, _, config_module = self._load_web_panel(
+                valid, config_path, log_path
+            )
+
+            self.assertEqual(
+                panel._sender_status(),
+                {"sender_mode": "uia_fixed", "calibrated": True},
+            )
+
+            config_module.UIA_FIXED_CALIBRATION = {
+                "schema_version": 1,
+                "completed": True,
+                "coordinate_space": "client_area_ratio",
+                "points": {},
+                "reference": None,
+            }
+            self.assertEqual(
+                panel._sender_status(),
+                {"sender_mode": "uia_fixed", "calibrated": False},
+            )
+
+    def test_task5_status_keeps_operations_but_exposes_only_safe_sender_metadata(self):
+        invalid = {"schema_version": 1, "completed": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("status=ready", encoding="utf-8")
+            panel, _, _ = self._load_web_panel(invalid, config_path, log_path)
+
+            response = self._invoke_web_handler(panel, "do_GET", "/status")
+
+        self.assertEqual(response["code"], 200)
+        status = response["data"]
+        self.assertEqual(status["sender_mode"], "uia_fixed")
+        self.assertIs(status["calibrated"], False)
+        self.assertIn("running", status)
+        self.assertIn("paused", status)
+        self.assertIn("ob_connected", status)
+        self.assertIn("weflow_connected", status)
+        self.assertIn("log", status)
+        self.assertNotIn("send_method", status)
+        self.assertNotIn("ob_url", status)
+        serialized = json.dumps(status).lower()
+        for private_name in (
+            "uia_fixed_calibration",
+            "points",
+            "reference",
+            "dpi",
+            "client_width",
+            "client_height",
+            "aspect_ratio",
+        ):
+            self.assertNotIn(private_name, serialized)
+
+    def test_task5_config_get_and_post_never_expose_or_overwrite_calibration(self):
+        calibration = {
+            "schema_version": 1,
+            "completed": False,
+            "coordinate_space": "client_area_ratio",
+            "points": {
+                "search_box": None,
+                "first_result": None,
+                "message_input": None,
+                "send_button": None,
+            },
+            "reference": None,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "private-token",
+                        "buffer_seconds": 5,
+                        "uia_fixed_calibration": calibration,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, _, _ = self._load_web_panel(
+                calibration, config_path, log_path
+            )
+
+            get_response = self._invoke_web_handler(
+                panel, "do_GET", "/api/config"
+            )
+            self.assertNotIn("uia_fixed_calibration", get_response["data"])
+
+            post_response = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/api/config",
+                {
+                    "buffer_seconds": 7,
+                    "uia_fixed_calibration": {
+                        "completed": True,
+                        "points": {"private": "overwrite-attempt"},
+                    },
+                },
+            )
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(post_response, {"data": {"ok": True}, "code": 200})
+        self.assertEqual(saved["buffer_seconds"], 7)
+        self.assertEqual(saved["uia_fixed_calibration"], calibration)
+
+    def test_task5_web_ui_has_no_sender_selector_or_send_api_field(self):
+        source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
+        self.assertNotIn("{key:'send_method'", source)
+        self.assertNotIn("{key:'weflow_send_api'", source)
+        self.assertNotIn("cfg_send_method", source)
+        self.assertNotIn("s.send_method", source)
+        self.assertIn("s.sender_mode", source)
+
+    def test_task4_runtime_scope_uses_only_direct_uia_fixed_sender(self):
+        main_source = (BRIDGE / "main.py").read_text(encoding="utf-8")
+        config_source = (BRIDGE / "config.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "from uia_fixed_sender import UiaFixedSender",
+            main_source,
+        )
+        self.assertIn(
+            "state.sender_instance = UiaFixedSender(config.UIA_FIXED_CALIBRATION)",
+            main_source,
+        )
+        self.assertIn("sender_mode=uia_fixed", main_source)
+        self.assertIn(
+            'UIA_FIXED_CALIBRATION = config.get("uia_fixed_calibration")',
+            config_source,
+        )
+        config_tree = ast.parse(config_source, filename="config.py")
+        privacy_filter_assignment = next(
+            node
+            for node in config_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_privacy_filter"
+                for target in node.targets
+            )
+        )
+        self.assertNotIn(
+            "UIA_FIXED_CALIBRATION",
+            ast.unparse(privacy_filter_assignment.value),
+        )
+
+        for name in TASK4_RUNTIME_SOURCE_FILES:
+            source = (BRIDGE / name).read_text(encoding="utf-8")
+            for marker in TASK4_LEGACY_MARKERS:
+                with self.subTest(file=name, marker=marker):
+                    self.assertNotIn(marker, source)
+
+        for name in TASK4_REMOVED_SOURCE_FILES:
+            with self.subTest(file=name):
+                self.assertFalse((BRIDGE / name).exists())
+
+    def test_task4_dependencies_keep_only_supported_sender_runtime_packages(self):
+        expected_requirements = {
+            "requests>=2.31.0",
+            "pyperclip>=1.8.2",
+            "Pillow>=10.0.0",
+            "websockets>=12.0",
+        }
+        expected_lock = {
+            "requests==2.34.2",
+            "pyperclip==1.11.0",
+            "Pillow==12.2.0",
+            "websockets==16.0",
+        }
+
+        requirements = set(
+            (BRIDGE / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        )
+        lock = set(
+            (BRIDGE / "requirements.lock").read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(requirements, expected_requirements)
+        self.assertEqual(lock, expected_lock)
+
+    def test_ob_sender_success_logs_require_literal_true_for_text_image_and_face(self):
+        class FakeWebSocket:
+            async def send(self, _payload):
+                return None
+
+        class FakeSender:
+            def __init__(self, result):
+                self.result = result
+
+            def send_text(self, _contact, _text):
+                return self.result
+
+            def send_image(self, _contact, _image_path):
+                return self.result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            image_path = root / "task4-image.png"
+            image_path.write_bytes(b"not-opened-by-fake-sender")
+
+            state_module = types.ModuleType("state")
+            state_module._ob_ws = FakeWebSocket()
+            state_module._ob_id_to_contact = {7: "private-contact"}
+            config_module = types.ModuleType("config")
+            config_module.ASTRBOT_ATTACHMENTS = str(root)
+            requests_module = types.ModuleType("requests")
+
+            spec = importlib.util.spec_from_file_location(
+                "task4_ob_protocol_under_test",
+                BRIDGE / "ob_protocol.py",
+            )
+            protocol = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "state": state_module,
+                    "config": config_module,
+                    "requests": requests_module,
+                },
+            ):
+                spec.loader.exec_module(protocol)
+
+            messages = {
+                "文字": [{"type": "text", "data": {"text": "private-body"}}],
+                "图片": [{"type": "image", "data": {"file": image_path.name}}],
+                "表情": [{"type": "face", "data": {"id": 1}}],
+            }
+            private_values = (
+                "private-contact",
+                "private-body",
+                image_path.name,
+            )
+            for result in (False, None, 1):
+                for label, message in messages.items():
+                    with self.subTest(result=result, segment=label):
+                        if label == "图片":
+                            image_path.write_bytes(b"not-opened-by-fake-sender")
+                        state_module.sender_instance = FakeSender(result)
+                        request = {
+                            "action": "send_private_msg",
+                            "params": {"user_id": 7, "message": message},
+                            "echo": "task4",
+                        }
+                        with self.assertLogs("ob11-bridge", level="INFO") as logs:
+                            asyncio.run(protocol._handle_ob_api(request))
+
+                        output = "\n".join(logs.output)
+                        self.assertNotIn(f"{label}已发送", output)
+                        self.assertEqual(output.count("消息发送失败"), 1)
+                        for private_value in private_values:
+                            self.assertNotIn(private_value, output)
+
+            for label, message in messages.items():
+                with self.subTest(result=True, segment=label):
+                    if label == "图片":
+                        image_path.write_bytes(b"not-opened-by-fake-sender")
+                    state_module.sender_instance = FakeSender(True)
+                    request = {
+                        "action": "send_private_msg",
+                        "params": {"user_id": 7, "message": message},
+                        "echo": "task4",
+                    }
+                    with self.assertLogs("ob11-bridge", level="INFO") as logs:
+                        asyncio.run(protocol._handle_ob_api(request))
+
+                    output = "\n".join(logs.output)
+                    self.assertIn(f"{label}已发送", output)
+                    self.assertNotIn("消息发送失败", output)
+
+    def test_ob_non_base64_attachment_with_tmp_in_path_is_not_deleted(self):
+        class FakeWebSocket:
+            async def send(self, _payload):
+                return None
+
+        class FakeSender:
+            def send_image(self, _contact, _image_path):
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            image_path = root / "tmp-user-attachment.png"
+            image_path.write_bytes(b"user-owned-attachment")
+
+            state_module = types.ModuleType("state")
+            state_module._ob_ws = FakeWebSocket()
+            state_module._ob_id_to_contact = {7: "private-contact"}
+            state_module.sender_instance = FakeSender()
+            config_module = types.ModuleType("config")
+            config_module.ASTRBOT_ATTACHMENTS = str(root)
+            requests_module = types.ModuleType("requests")
+
+            spec = importlib.util.spec_from_file_location(
+                "task4_ob_protocol_tmp_path_test",
+                BRIDGE / "ob_protocol.py",
+            )
+            protocol = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "state": state_module,
+                    "config": config_module,
+                    "requests": requests_module,
+                },
+            ):
+                spec.loader.exec_module(protocol)
+
+            request = {
+                "action": "send_private_msg",
+                "params": {
+                    "user_id": 7,
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {"file": image_path.name},
+                        }
+                    ],
+                },
+                "echo": "task4",
+            }
+            asyncio.run(protocol._handle_ob_api(request))
+
+            self.assertTrue(image_path.is_file())
+            self.assertEqual(image_path.read_bytes(), b"user-owned-attachment")
+
+    def _assert_failed_base64_tempfile_stage_is_cleaned(self, stage):
+        state_module = types.ModuleType("state")
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        requests_module = types.ModuleType("requests")
+        spec = importlib.util.spec_from_file_location(
+            f"ob_protocol_{stage}_failure_test",
+            BRIDGE / "ob_protocol.py",
+        )
+        protocol = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(protocol)
+
+        marker = RuntimeError(f"injected {stage} failure")
+        real_temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        temp_path = pathlib.Path(real_temp.name)
+
+        class FailingTempFile:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+                self.name = wrapped.name
+                self.file = wrapped.file
+                self.close_calls = 0
+
+            def write(self, value):
+                if stage == "write":
+                    raise marker
+                return self._wrapped.write(value)
+
+            def flush(self):
+                if stage == "flush":
+                    raise marker
+                return self._wrapped.flush()
+
+            def close(self):
+                self.close_calls += 1
+                if stage == "close":
+                    if self.close_calls == 1:
+                        raise marker
+                    raise RuntimeError("injected cleanup close failure")
+                return self._wrapped.close()
+
+        failing_temp = FailingTempFile(real_temp)
+        try:
+            with mock.patch.object(
+                protocol.tempfile,
+                "NamedTemporaryFile",
+                return_value=failing_temp,
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    protocol._decode_base64_image("aW1hZ2UtYnl0ZXM=")
+
+            self.assertIs(raised.exception, marker)
+            self.assertGreaterEqual(failing_temp.close_calls, 1)
+            if stage == "close":
+                self.assertGreaterEqual(failing_temp.close_calls, 2)
+            self.assertFalse(temp_path.exists())
+        finally:
+            try:
+                real_temp.close()
+            except Exception:
+                pass
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def test_base64_tempfile_write_failure_closes_and_removes_owned_path(self):
+        self._assert_failed_base64_tempfile_stage_is_cleaned("write")
+
+    def test_base64_tempfile_flush_failure_closes_and_removes_owned_path(self):
+        self._assert_failed_base64_tempfile_stage_is_cleaned("flush")
+
+    def test_base64_tempfile_close_failure_retries_and_removes_owned_path(self):
+        self._assert_failed_base64_tempfile_stage_is_cleaned("close")
 
     def test_privacy_helpers_have_exact_metadata_only_output(self):
         privacy_path = BRIDGE / "privacy.py"

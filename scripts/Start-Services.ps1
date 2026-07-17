@@ -6,6 +6,11 @@ Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $PSScriptRoot 'AkashaBot.Common.psm1') -Force
 
+if ($MyInvocation.InvocationName -ne '.') {
+  $bootstrapConfigPath = Join-Path (Join-Path (Join-Path $InstallRoot 'data') 'bridge') 'config.json'
+  Assert-AkashaUiaCalibrationReady -ConfigPath $bootstrapConfigPath
+}
+
 if ($null -eq ('AkashaBotNativePathV1' -as [type])) {
   Add-Type -Language CSharp -TypeDefinition @'
 using System;
@@ -262,10 +267,14 @@ function Get-AkashaLifecyclePreflight {
       $Paths.AstrBotData
     )
 
-  foreach ($requiredFile in @($Paths.BridgePython, $Paths.AstrBotPython, $Paths.BridgeConfig, $bridgeMain)) {
+  foreach ($requiredFile in @($Paths.BridgePython, $Paths.BridgeConfig, $bridgeMain)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
       throw "E_NOT_INSTALLED: Missing required file: $requiredFile"
     }
+  }
+  Assert-AkashaUiaCalibrationReady -ConfigPath $Paths.BridgeConfig
+  if (-not (Test-Path -LiteralPath $Paths.AstrBotPython -PathType Leaf)) {
+    throw "E_NOT_INSTALLED: Missing required file: $($Paths.AstrBotPython)"
   }
   if (-not (Test-Path -LiteralPath $Paths.AstrBotData -PathType Container)) {
     throw "E_NOT_INSTALLED: Missing AstrBot data directory: $($Paths.AstrBotData)"
