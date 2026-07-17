@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local environments and product state
+.venv/
+venv/
+runtime/
+data/
+logs/
+backups/
+*.log
+*.pid
+
+# Secrets and local configuration
+config.json
+.env
+.env.*
+FIRST_LOGIN.txt
+
+# Node/build/package artifacts
+node_modules/
+build/
+dist/
+build-output/
+*.zip
+*.7z
+*.exe
+*.msi
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Development infrastructure
+.worktrees/
+.superpowers/
