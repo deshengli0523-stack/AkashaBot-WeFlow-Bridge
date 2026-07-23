@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 - 2026-07-23
+
+- Preserve the latest structured chat logging and resumable pre-send review queue from `0.2.1`.
+- Fix calibration, start, stop, and health batch launchers so their source-relative install root does not acquire a trailing literal quote during Windows PowerShell native argument parsing.
+- Add an installer-layout regression gate covering all four installed launchers.
+
+### Automated verification
+
+- Launcher argument transport is checked before the full installer, calibration, lifecycle, Python, and release-hygiene suites run.
+
 ## 0.2.1 - 2026-07-23
 
 - Record structured single-line bridge audit entries containing private contacts, group names and members, full inbound message bodies, and full Bot outbound bodies with sent/failed status.
