@@ -6,10 +6,14 @@
 - Keep configured credentials, credential-shaped values, and local filesystem paths redacted from logs.
 - Stop returning raw `bridge.log` content from the unauthenticated Web status endpoint and remove its cross-origin response header.
 - Document that `bridge.log` contains sensitive local chat data and must be manually redacted before sharing.
+- Enable punctuation-first AstrBot segmented replies with a 45-character fallback and human-like random intervals.
+- Add a FIFO text review queue with a one-second pre-paste preview, a ten-second post-paste hold, exact per-item cancellation, and pause/resume that preserves the remaining timer.
+- Preserve existing nested UIA calibration data while adding safe defaults for the new review delays.
 
 ### Automated verification
 
 - Private and group inbound records, text/image/face outbound records, multiline Unicode bodies, failed sends, secret/path redaction, and Web status log isolation are covered by the bridge runtime tests.
+- Preview visibility, exact cancellation, pause/resume, FIFO isolation, stop/restart generation safety, clipboard ownership, and segmented configuration upgrades are covered by regression tests.
 
 ## 0.2.0 - 2026-07-17
 

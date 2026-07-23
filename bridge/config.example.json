@@ -21,6 +21,8 @@
     },
     "reference": null
   },
+  "uia_fixed_pre_paste_preview_delay": 1.0,
+  "uia_fixed_pre_send_delay": 10.0,
   "ollama_base_url": "http://127.0.0.1:11434",
   "ollama_model": "llava:7b",
   "ollama_timeout": 60,

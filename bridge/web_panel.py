@@ -8,6 +8,7 @@ Web 控制面板模块。
 
 import json
 import logging
+import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import state
@@ -86,6 +87,12 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
 .mode-row{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);flex-wrap:wrap}
 .mode-row .mode-value{font-weight:600;color:var(--text)}
 
+/* ===== 发送预览 ===== */
+.send-preview{display:none;border:1px solid #fde68a;background:#fffbeb;border-radius:6px;padding:12px 14px}
+.send-preview.active{display:block}
+.send-preview-title{font-size:12px;font-weight:650;color:#92400e;margin-bottom:7px}
+.send-preview-content{font-size:14px;line-height:1.6;color:#111827;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow-y:auto}
+
 /* ===== 日志 ===== */
 .log-box{flex:1;min-height:100px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;font-size:12px;font-family:'Cascadia Code','Fira Code',monospace;color:#374151;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
 .log-box:empty::before{content:'等待连接...';color:#9ca3af}
@@ -152,11 +159,17 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
       <div class="status-card"><div class="label">发送模式</div><div class="value" id="sendMethod" style="font-size:13px">-</div></div>
     </div>
 
+    <div class="send-preview" id="sendPreview">
+      <div class="send-preview-title" id="sendPreviewTitle">即将粘贴</div>
+      <div class="send-preview-content" id="sendPreviewContent"></div>
+    </div>
+
     <div class="btn-row">
       <button class="btn btn-pink" id="btnStart" onclick="action('start')">启动</button>
       <button class="btn btn-red" id="btnStop" onclick="action('stop')" disabled>停止</button>
       <button class="btn btn-amber" id="btnPause" onclick="action('pause')" disabled>暂停</button>
       <button class="btn btn-green" id="btnResume" onclick="action('resume')" style="display:none" disabled>恢复</button>
+      <button class="btn btn-red" id="btnCancelCurrent" onclick="cancelCurrentSend()" disabled>取消此条</button>
     </div>
 
     <div class="mode-row">
@@ -215,6 +228,7 @@ function switchTab(name) {
 
 // ===== 面板刷新 =====
 var modeMap = {'mention':'仅@回复','all':'全部回复','batch':'批处理'};
+var visiblePreviewId = null;
 
 function refreshDashboard() {
   fetch('/status').then(function(r){return r.json()}).then(function(s){
@@ -229,6 +243,30 @@ function refreshDashboard() {
     document.getElementById('weflowStatus').textContent = s.weflow_connected ? '已连接' : '未连接';
     document.getElementById('weflowStatus').style.color = s.weflow_connected ? '#4caf50' : '#bdbdbd';
     document.getElementById('sendMethod').textContent = s.sender_mode + (s.calibrated ? '（已标定）' : '（待标定）');
+
+    var preview = s.send_preview;
+    var previewPanel = document.getElementById('sendPreview');
+    if (preview && typeof preview.content === 'string') {
+      visiblePreviewId =
+        preview.stage !== 'submitting' && Number.isInteger(preview.preview_id)
+          ? preview.preview_id
+          : null;
+      previewPanel.classList.add('active');
+      var previewTitle = '即将粘贴';
+      if (preview.stage === 'pasted_waiting') previewTitle = '已粘贴，等待发送';
+      if (preview.stage === 'paused') previewTitle = '已暂停，将从此条继续';
+      if (preview.stage === 'submitting') previewTitle = '正在发送';
+      if (typeof preview.remaining_seconds === 'number' && preview.stage !== 'submitting') {
+        previewTitle += '（约 ' + preview.remaining_seconds.toFixed(1) + ' 秒）';
+      }
+      document.getElementById('sendPreviewTitle').textContent = previewTitle;
+      document.getElementById('sendPreviewContent').textContent = preview.content;
+    } else {
+      visiblePreviewId = null;
+      previewPanel.classList.remove('active');
+      document.getElementById('sendPreviewContent').textContent = '';
+    }
+    document.getElementById('btnCancelCurrent').disabled = visiblePreviewId === null;
 
     document.getElementById('btnStart').disabled = s.running;
     document.getElementById('btnStop').disabled = !s.running;
@@ -253,6 +291,20 @@ function refreshDashboard() {
 
 function action(cmd) {
   fetch('/' + cmd, {method:'POST'}).then(function(){setTimeout(refreshDashboard,500)});
+}
+
+function cancelCurrentSend() {
+  if (!Number.isInteger(visiblePreviewId)) return;
+  var requestedPreviewId = visiblePreviewId;
+  document.getElementById('btnCancelCurrent').disabled = true;
+  fetch('/cancel-current', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({preview_id:requestedPreviewId}),
+  }).then(function(r){return r.json()}).then(function(result){
+    toast(result.cancelled ? '已取消此条，后续消息不受影响' : '此条已变化或已开始发送', result.cancelled ? 'success' : 'info');
+    refreshDashboard();
+  });
 }
 
 document.getElementById('btnToggleMode').onclick = function(){
@@ -287,6 +339,8 @@ function renderConfigForm(cfg) {
       {key:'buffer_seconds', label:'消息缓冲(秒)', type:'number', ph:'5'},
       {key:'group_reply_mode', label:'群聊回复模式', type:'select', opts:[{v:'mention',l:'仅@回复'},{v:'all',l:'全部回复'},{v:'batch',l:'批处理'}]},
       {key:'web_port', label:'Web 面板端口', type:'number', ph:'8766'},
+      {key:'uia_fixed_pre_paste_preview_delay', label:'粘贴前预览(秒)', type:'number', ph:'1'},
+      {key:'uia_fixed_pre_send_delay', label:'粘贴后发送前等待(秒)', type:'number', ph:'10'},
     ]},
     {title:'图片描述', fields:[
       {key:'image_caption_provider', label:'描述服务', type:'select', opts:[{v:'ollama',l:'Ollama 本地'},{v:'openai',l:'OpenAI 兼容'}]},
@@ -358,7 +412,7 @@ function saveConfig() {
 
 // ===== 初始化 =====
 refreshDashboard();
-setInterval(refreshDashboard, 3000);
+setInterval(refreshDashboard, 500);
 </script>
 </body>
 </html>"""
@@ -385,11 +439,20 @@ _SECRET_CONFIG_KEYS = {"access_token", "image_caption_api_key"}
 
 
 def _public_config(value: dict[str, object]) -> dict[str, object]:
-    return {
+    public = {
         key: field_value
         for key, field_value in value.items()
         if key not in _PRIVATE_CONFIG_KEYS
     }
+    public.setdefault(
+        "uia_fixed_pre_paste_preview_delay",
+        config.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY,
+    )
+    public.setdefault(
+        "uia_fixed_pre_send_delay",
+        config.UIA_FIXED_PRE_SEND_DELAY,
+    )
+    return public
 
 
 def _merge_public_config(
@@ -398,6 +461,25 @@ def _merge_public_config(
     for key, field_value in submitted.items():
         if key == "uia_fixed_calibration":
             continue
+        if key in {
+            "uia_fixed_pre_paste_preview_delay",
+            "uia_fixed_pre_send_delay",
+        }:
+            if isinstance(field_value, bool) or not isinstance(
+                field_value, (int, float)
+            ):
+                raise ValueError("invalid UIA review delay")
+            maximum = (
+                10.0
+                if key == "uia_fixed_pre_paste_preview_delay"
+                else 60.0
+            )
+            if (
+                not math.isfinite(float(field_value))
+                or not 0.0 <= float(field_value) <= maximum
+            ):
+                raise ValueError("invalid UIA review delay")
+            field_value = float(field_value)
         if key in _SECRET_CONFIG_KEYS:
             if not isinstance(field_value, str) or not field_value.strip():
                 continue
@@ -416,6 +498,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "ob_connected": ob_connected,
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
+                "send_preview": state.get_send_preview(),
                 "log": (
                     "bridge.log 已记录完整联系人和聊天正文。"
                     "出于安全考虑，不在网页面板显示；"
@@ -455,6 +538,21 @@ class WebHandler(BaseHTTPRequestHandler):
             state.paused.clear()
             log.info("[Web] 已恢复")
             self.send_json({"ok": True})
+        elif self.path == "/cancel-current":
+            try:
+                payload = self.read_json_body(1024)
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != {"preview_id"}
+                    or isinstance(payload["preview_id"], bool)
+                    or not isinstance(payload["preview_id"], int)
+                    or payload["preview_id"] <= 0
+                ):
+                    raise ValueError("invalid preview id")
+                cancelled = state.cancel_current_preview(payload["preview_id"])
+                self.send_json({"ok": True, "cancelled": cancelled})
+            except Exception:
+                self.send_json({"ok": False, "error": "E_CANCEL_REQUEST"}, 400)
         elif self.path == "/mode":
             mode_order = ["mention", "all", "batch"]
             idx = mode_order.index(state.group_reply_mode) if state.group_reply_mode in mode_order else -1
@@ -473,9 +571,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "group_reply_mode": new_mode})
         elif self.path == "/api/config":
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length).decode("utf-8")
-                new_cfg = json.loads(body)
+                new_cfg = self.read_json_body(65536)
 
                 # 读取当前配置，仅覆盖前端传来的字段
                 with open(config.CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -493,6 +589,18 @@ class WebHandler(BaseHTTPRequestHandler):
                 # 运行时同步 group_reply_mode
                 if "group_reply_mode" in new_cfg:
                     state.group_reply_mode = new_cfg["group_reply_mode"]
+                if "uia_fixed_pre_paste_preview_delay" in new_cfg:
+                    delay = float(new_cfg["uia_fixed_pre_paste_preview_delay"])
+                    config.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = delay
+                    sender = state.sender_instance
+                    if sender is not None:
+                        sender.pre_paste_preview_delay = delay
+                if "uia_fixed_pre_send_delay" in new_cfg:
+                    delay = float(new_cfg["uia_fixed_pre_send_delay"])
+                    config.UIA_FIXED_PRE_SEND_DELAY = delay
+                    sender = state.sender_instance
+                    if sender is not None:
+                        sender.pre_send_delay = delay
 
                 self.send_json({"ok": True})
             except Exception:
@@ -504,8 +612,15 @@ class WebHandler(BaseHTTPRequestHandler):
     def send_json(self, data, code=200):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+
+    def read_json_body(self, maximum_bytes):
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > maximum_bytes:
+            raise ValueError("invalid request size")
+        return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def log_message(self, fmt, *args):
         pass

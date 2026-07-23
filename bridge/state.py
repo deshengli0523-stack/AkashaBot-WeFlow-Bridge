@@ -22,6 +22,129 @@ paused = threading.Event()
 paused.clear()
 run_lock = threading.Lock()
 bridge_thread = None
+lifecycle_generation = 0
+
+
+def is_generation_running(generation: int) -> bool:
+    return bool(running and lifecycle_generation == generation)
+
+
+def get_sender_for_generation(generation: int):
+    with run_lock:
+        if not is_generation_running(generation):
+            return None
+        return sender_instance
+
+
+def deactivate_generation(generation: int) -> bool:
+    """Atomically stop only the generation that observed the failure."""
+    global running, lifecycle_generation
+    with run_lock:
+        if not is_generation_running(generation):
+            return False
+        running = False
+        lifecycle_generation += 1
+        sender = sender_instance
+        if sender is not None:
+            sender.stop_pending()
+        return True
+
+# ============ Outbound text review ============
+
+send_preview_lock = threading.Lock()
+current_send_cancel_event: Optional[threading.Event] = None
+current_send_preview: Optional[dict[str, object]] = None
+send_preview_sequence = 0
+
+
+def begin_send_preview(content: str) -> threading.Event:
+    """Publish one text item before any WeChat input is touched."""
+    global current_send_cancel_event, current_send_preview, send_preview_sequence
+    cancel_event = threading.Event()
+    with send_preview_lock:
+        send_preview_sequence += 1
+        current_send_cancel_event = cancel_event
+        current_send_preview = {
+            "preview_id": send_preview_sequence,
+            "content": str(content),
+            "message_type": "text",
+            "stage": "before_paste",
+            "remaining_seconds": None,
+        }
+    return cancel_event
+
+
+def update_send_preview(
+    cancel_event: threading.Event,
+    *,
+    stage: Optional[str] = None,
+    remaining_seconds: Optional[float] = None,
+) -> None:
+    with send_preview_lock:
+        if (
+            current_send_cancel_event is not cancel_event
+            or current_send_preview is None
+        ):
+            return
+        if stage is not None:
+            current_send_preview["stage"] = str(stage)
+        current_send_preview["remaining_seconds"] = (
+            None
+            if remaining_seconds is None
+            else max(0.0, round(float(remaining_seconds), 1))
+        )
+
+
+def get_send_preview() -> Optional[dict[str, object]]:
+    with send_preview_lock:
+        if current_send_preview is None:
+            return None
+        preview = dict(current_send_preview)
+        if paused.is_set() and preview.get("stage") != "submitting":
+            preview["paused_stage"] = preview.get("stage")
+            preview["stage"] = "paused"
+        return preview
+
+
+def try_commit_send(cancel_event: threading.Event) -> bool:
+    """Atomically close cancellation before the OS-level submit action."""
+    with send_preview_lock:
+        if (
+            current_send_cancel_event is not cancel_event
+            or current_send_preview is None
+            or cancel_event.is_set()
+            or not running
+            or paused.is_set()
+        ):
+            return False
+        current_send_preview["stage"] = "submitting"
+        current_send_preview["remaining_seconds"] = 0.0
+        return True
+
+
+def cancel_current_preview(expected_preview_id: int) -> bool:
+    """Cancel exactly the preview the operator saw, never a later item."""
+    with send_preview_lock:
+        cancel_event = current_send_cancel_event
+        preview = current_send_preview
+        if (
+            cancel_event is None
+            or preview is None
+            or preview.get("preview_id") != expected_preview_id
+            or preview.get("stage") == "submitting"
+            or cancel_event.is_set()
+        ):
+            return False
+        cancel_event.set()
+        return True
+
+
+def end_send_preview(cancel_event: threading.Event) -> None:
+    global current_send_cancel_event, current_send_preview
+    with send_preview_lock:
+        if current_send_cancel_event is cancel_event:
+            current_send_cancel_event = None
+            current_send_preview = None
 
 # ============ OneBot WebSocket 客户端管理 ============
 

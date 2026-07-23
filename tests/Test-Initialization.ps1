@@ -332,6 +332,14 @@ function New-AstrBotFixtureValue {
       port = 6000
       preserve_fixture = 'dashboard-keep'
     }
+    platform_settings = [ordered]@{
+      forward_threshold = 123
+      preserve_fixture = 'settings-keep'
+      segmented_reply = [ordered]@{
+        enable = $false
+        preserve_fixture = 'segment-keep'
+      }
+    }
     platform = $platforms
   }
 }
@@ -956,6 +964,15 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-True ([bool]$freshAstr.dashboard.enable) 'AstrBot dashboard was not enabled.'
   Assert-Equal ([string]$freshAstr.dashboard.host) '127.0.0.1' 'AstrBot dashboard host is wrong.'
   Assert-Equal ([int]$freshAstr.dashboard.port) 6185 'AstrBot dashboard port is wrong.'
+  Assert-Equal ([int]$freshAstr.platform_settings.forward_threshold) 5000 'AstrBot forward threshold is wrong.'
+  Assert-True ([bool]$freshAstr.platform_settings.segmented_reply.enable) 'AstrBot segmented reply was not enabled.'
+  Assert-True ([bool]$freshAstr.platform_settings.segmented_reply.only_llm_result) 'AstrBot segmented reply is not limited to LLM results.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval_method) 'random' 'AstrBot segmented interval method is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval) '0.8,1.8' 'AstrBot segmented interval is wrong.'
+  Assert-Equal ([int]$freshAstr.platform_settings.segmented_reply.words_count_threshold) 5000 'AstrBot segmented threshold is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.split_mode) 'regex' 'AstrBot segmented split mode is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,44}?(?:[\u3002\uff1f\uff01~\u2026\uff1b]+|[!?;]+|(?<!\d)\.(?!\d)|\r?\n+)|.{1,45}' 'AstrBot segmented regex is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '[\r\n\t\u3000]+|(?<=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001]) +| +(?=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001])' 'AstrBot content cleanup rule is wrong.'
   Assert-Equal @($freshAstr.platform).Count 1 'AstrBot platform count is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].id) 'akasha_ob11' 'AstrBot platform id is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].type) 'aiocqhttp' 'AstrBot platform type is wrong.'
@@ -1031,6 +1048,8 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   $existingAstr = Get-Content -LiteralPath (Join-Path $existing.Paths.AstrBotData 'data\cmd_config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-Equal ([string]$existingAstr.preserve_fixture) 'astr-keep' 'Existing AstrBot root field was lost.'
   Assert-Equal ([string]$existingAstr.dashboard.preserve_fixture) 'dashboard-keep' 'Existing AstrBot dashboard field was lost.'
+  Assert-Equal ([string]$existingAstr.platform_settings.preserve_fixture) 'settings-keep' 'Existing AstrBot platform settings field was lost.'
+  Assert-Equal ([string]$existingAstr.platform_settings.segmented_reply.preserve_fixture) 'segment-keep' 'Existing AstrBot segmented reply field was lost.'
   Assert-Equal @($existingAstr.platform).Count 2 'Akasha platform upsert removed or duplicated an existing platform.'
   $preservedPlatform = @($existingAstr.platform | Where-Object { $_.id -ceq 'fixture-platform' })
   $akashaPlatform = @($existingAstr.platform | Where-Object { $_.id -ceq 'akasha_ob11' })

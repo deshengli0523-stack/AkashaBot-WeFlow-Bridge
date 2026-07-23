@@ -39,8 +39,20 @@ def _write_outbound_log(scope: str, contact: object, body: object, sent: object)
         log.error("CHAT %s", entry)
 
 
-async def _handle_ob_api(data: dict):
+async def _handle_ob_api(data: dict, generation=None):
     """处理 AstrBot 发来的 API 请求。"""
+    if (
+        generation is not None
+        and not state.is_generation_running(generation)
+    ):
+        return
+    sender_instance = (
+        state.sender_instance
+        if generation is None
+        else state.get_sender_for_generation(generation)
+    )
+    if sender_instance is None:
+        return
     action = data.get("action", "")
     submitted_params = data.get("params", {})
     params_valid = isinstance(submitted_params, dict)
@@ -122,7 +134,7 @@ async def _handle_ob_api(data: dict):
                 if text:
                     try:
                         sent = await asyncio.to_thread(
-                            state.sender_instance.send_text,
+                            sender_instance.send_text,
                             contact,
                             text,
                         )
@@ -176,7 +188,7 @@ async def _handle_ob_api(data: dict):
                     # 使用线程池执行同步的 UIA 发送，避免阻塞事件循环
                     try:
                         sent = await asyncio.to_thread(
-                            state.sender_instance.send_image,
+                            sender_instance.send_image,
                             contact,
                             img_path,
                         )
@@ -195,7 +207,7 @@ async def _handle_ob_api(data: dict):
             elif seg_type == "face":
                 try:
                     sent = await asyncio.to_thread(
-                        state.sender_instance.send_text,
+                        sender_instance.send_text,
                         contact,
                         "[表情]",
                     )

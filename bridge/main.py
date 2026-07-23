@@ -31,16 +31,33 @@ def _start_bridge():
     with state.run_lock:
         if state.running:
             return
+        sender = UiaFixedSender(
+            config.UIA_FIXED_CALIBRATION,
+            pre_paste_preview_delay=config.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY,
+            pre_send_delay=config.UIA_FIXED_PRE_SEND_DELAY,
+        )
+        state.lifecycle_generation += 1
+        generation = state.lifecycle_generation
         state.running = True
+        state.sender_instance = sender
     state.paused.clear()
-    state.sender_instance = UiaFixedSender(config.UIA_FIXED_CALIBRATION)
 
     if not state.ob_client_started:
-        t = threading.Thread(target=_run_ob_client, daemon=True, name="ob11-client")
+        t = threading.Thread(
+            target=_run_ob_client,
+            args=(generation,),
+            daemon=True,
+            name="ob11-client",
+        )
         t.start()
         state.ob_client_started = True
 
-    state.bridge_thread = threading.Thread(target=_bridge_loop, daemon=True, name="bridge")
+    state.bridge_thread = threading.Thread(
+        target=_bridge_loop,
+        args=(generation,),
+        daemon=True,
+        name="bridge",
+    )
     state.bridge_thread.start()
     log.info("[Web] 已启动")
 
@@ -48,6 +65,10 @@ def _start_bridge():
 def _stop_bridge():
     with state.run_lock:
         state.running = False
+        state.lifecycle_generation += 1
+        sender = state.sender_instance
+        if sender is not None:
+            sender.stop_pending()
 
     # 切断 SSE 长连接，让 _bridge_loop 的 listen_sse() 从阻塞中退出
     with state.bridge_lock:
@@ -81,50 +102,65 @@ def _stop_bridge():
     log.info("[Web] 已停止")
 
 
-def _bridge_loop():
+def _bridge_loop(generation: int):
+    if not state.is_generation_running(generation):
+        return
     if not config.ACCESS_TOKEN:
         log.error("❌ 未配置 access_token")
-        state.running = False
+        state.deactivate_generation(generation)
         return
 
     log.info("Bridge | endpoints=WeFlow,OB11 | sender_mode=uia_fixed")
 
-    bridge = WeFlowBridge(state.sender_instance)
-    with state.bridge_lock:
-        state.bridge_instance = bridge
+    with state.run_lock:
+        if not state.is_generation_running(generation):
+            return
+        bridge = WeFlowBridge(
+            state.sender_instance,
+            generation=generation,
+        )
+        with state.bridge_lock:
+            state.bridge_instance = bridge
 
     try:
         r = requests.get(f"{config.WE_FLOW_BASE_URL}/api/v1/messages?limit=1&access_token={config.ACCESS_TOKEN}", timeout=5)
+        if not state.is_generation_running(generation):
+            return
         if r.status_code == 200:
             log.info("✅ WeFlow API 正常")
         elif r.status_code == 401:
             log.error("❌ Access Token 无效")
-            state.running = False
+            state.deactivate_generation(generation)
             return
     except requests.exceptions.ConnectionError:
+        if not state.is_generation_running(generation):
+            return
         log.error("❌ 无法连接 WeFlow")
-        state.running = False
+        state.deactivate_generation(generation)
         return
     except Exception:
+        if not state.is_generation_running(generation):
+            return
         log.error("❌ WeFlow API 请求异常")
-        state.running = False
+        state.deactivate_generation(generation)
         return
 
-    while state.running:
+    while state.is_generation_running(generation):
         try:
             bridge.listen_sse()
         except Exception:
             log.error("SSE 连接异常")
-        if not state.running:
+        if not state.is_generation_running(generation):
             break
         log.warning("⚠️ SSE 断开，10s 后重连")
         for _ in range(10):
-            if not state.running:
+            if not state.is_generation_running(generation):
                 break
             time.sleep(1)
 
     with state.bridge_lock:
-        state.bridge_instance = None
+        if state.bridge_instance is bridge:
+            state.bridge_instance = None
 
 
 def start_web():
