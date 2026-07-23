@@ -5,6 +5,7 @@
 import json
 import os
 import logging
+import math
 import threading
 from privacy import redact_log_text
 
@@ -39,12 +40,32 @@ def load_config():
 
 config = load_config()
 
+
+def _bounded_float(name: str, default: float, maximum: float) -> float:
+    raw_value = config.get(name, default)
+    if isinstance(raw_value, bool):
+        return default
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or not 0.0 <= value <= maximum:
+        return default
+    return value
+
+
 WE_FLOW_BASE_URL = config["weflow_base_url"]
 ACCESS_TOKEN = config["access_token"]
 ASTRBOT_ATTACHMENTS = config.get("astrbot_attachments", "")
 BOT_NICKNAMES = config["bot_nicknames"]
 BOT_WXID = config.get("bot_wxid", "")
 UIA_FIXED_CALIBRATION = config.get("uia_fixed_calibration")
+UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = _bounded_float(
+    "uia_fixed_pre_paste_preview_delay", 1.0, 10.0
+)
+UIA_FIXED_PRE_SEND_DELAY = _bounded_float(
+    "uia_fixed_pre_send_delay", 10.0, 60.0
+)
 BUFFER_SECONDS = config.get("buffer_seconds", 5)
 WEB_PORT = config.get("web_port", 8766)
 GROUP_REPLY_MODE = config.get("group_reply_mode", "mention")  # "mention" / "all"

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -335,13 +336,36 @@ class BridgeRuntimeTests(unittest.TestCase):
         state_module._ob_ws_ready = types.SimpleNamespace(is_set=lambda: False)
         state_module.bridge_instance = None
         state_module.running = False
-        state_module.paused = types.SimpleNamespace(is_set=lambda: False)
+        state_module.paused = threading.Event()
         state_module.group_reply_mode = "mention"
+        state_module.sender_instance = None
+        state_module.send_preview = None
+
+        def get_send_preview():
+            if state_module.send_preview is None:
+                return None
+            return dict(state_module.send_preview)
+
+        def cancel_current_preview(preview_id):
+            preview = state_module.send_preview
+            if (
+                preview is None
+                or preview.get("preview_id") != preview_id
+                or preview.get("stage") == "submitting"
+            ):
+                return False
+            state_module.send_preview = None
+            return True
+
+        state_module.get_send_preview = get_send_preview
+        state_module.cancel_current_preview = cancel_current_preview
 
         config_module = types.ModuleType("config")
         config_module.CONFIG_FILE = str(config_path)
         config_module.BRIDGE_LOG_FILE = str(log_path)
         config_module.UIA_FIXED_CALIBRATION = calibration
+        config_module.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = 1.0
+        config_module.UIA_FIXED_PRE_SEND_DELAY = 10.0
 
         spec = importlib.util.spec_from_file_location(
             "task5_web_panel_under_test",
@@ -395,6 +419,8 @@ class BridgeRuntimeTests(unittest.TestCase):
                 "reference": None,
             },
         )
+        self.assertEqual(template.get("uia_fixed_pre_paste_preview_delay"), 1.0)
+        self.assertEqual(template.get("uia_fixed_pre_send_delay"), 10.0)
         legacy_keys = {
             "send_method",
             "weflow_send_api",
@@ -500,6 +526,51 @@ class BridgeRuntimeTests(unittest.TestCase):
         ):
             self.assertNotIn(private_name, serialized)
 
+    def test_text_preview_and_exact_cancel_are_exposed_in_control_panel(self):
+        invalid = {"schema_version": 1, "completed": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, state_module, _ = self._load_web_panel(
+                invalid, config_path, log_path
+            )
+            state_module.send_preview = {
+                "preview_id": 41,
+                "content": "待审核正文",
+                "message_type": "text",
+                "stage": "before_paste",
+                "remaining_seconds": 1.0,
+            }
+
+            status = self._invoke_web_handler(panel, "do_GET", "/status")
+            stale = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/cancel-current",
+                {"preview_id": 40},
+            )
+            cancelled = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/cancel-current",
+                {"preview_id": 41},
+            )
+
+        self.assertEqual(status["data"]["send_preview"]["content"], "待审核正文")
+        self.assertEqual(
+            stale, {"data": {"ok": True, "cancelled": False}, "code": 200}
+        )
+        self.assertEqual(
+            cancelled,
+            {"data": {"ok": True, "cancelled": True}, "code": 200},
+        )
+        source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
+        self.assertIn("textContent = preview.content", source)
+        self.assertIn("setInterval(refreshDashboard, 500)", source)
+
     def test_task5_config_get_and_post_protect_calibration_and_secrets(self):
         calibration = {
             "schema_version": 1,
@@ -545,6 +616,14 @@ class BridgeRuntimeTests(unittest.TestCase):
             self.assertNotIn("uia_fixed_calibration", get_response["data"])
             self.assertNotIn(access_key, get_response["data"])
             self.assertNotIn(image_key, get_response["data"])
+            self.assertEqual(
+                get_response["data"]["uia_fixed_pre_paste_preview_delay"],
+                1.0,
+            )
+            self.assertEqual(
+                get_response["data"]["uia_fixed_pre_send_delay"],
+                10.0,
+            )
 
             post_response = self._invoke_web_handler(
                 panel,
@@ -642,7 +721,16 @@ class BridgeRuntimeTests(unittest.TestCase):
             main_source,
         )
         self.assertIn(
-            "state.sender_instance = UiaFixedSender(config.UIA_FIXED_CALIBRATION)",
+            "sender = UiaFixedSender(",
+            main_source,
+        )
+        self.assertIn("state.sender_instance = sender", main_source)
+        self.assertIn(
+            "pre_paste_preview_delay=config.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY",
+            main_source,
+        )
+        self.assertIn(
+            "pre_send_delay=config.UIA_FIXED_PRE_SEND_DELAY",
             main_source,
         )
         self.assertIn("sender_mode=uia_fixed", main_source)

@@ -527,6 +527,39 @@ function Initialize-AkashaConfiguration {
       Set-JsonProperty -Object $astr.dashboard -Name 'host' -Value '127.0.0.1'
       Set-JsonProperty -Object $astr.dashboard -Name 'port' -Value 6185
 
+      $platformSettingsProperty = $astr.PSObject.Properties['platform_settings']
+      if ($null -eq $platformSettingsProperty) {
+        $platformSettings = [pscustomobject][ordered]@{}
+        Set-JsonProperty -Object $astr -Name 'platform_settings' -Value $platformSettings
+      } elseif ($null -eq $platformSettingsProperty.Value -or
+          $platformSettingsProperty.Value.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+        throw 'E_ASTRBOT_SCHEMA: AstrBot platform settings must be a JSON object.'
+      } else {
+        $platformSettings = $platformSettingsProperty.Value
+      }
+      Set-JsonProperty -Object $platformSettings -Name 'forward_threshold' -Value 5000
+
+      $segmentedReplyProperty = $platformSettings.PSObject.Properties['segmented_reply']
+      if ($null -eq $segmentedReplyProperty) {
+        $segmentedReply = [pscustomobject][ordered]@{}
+        Set-JsonProperty -Object $platformSettings -Name 'segmented_reply' -Value $segmentedReply
+      } elseif ($null -eq $segmentedReplyProperty.Value -or
+          $segmentedReplyProperty.Value.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+        throw 'E_ASTRBOT_SCHEMA: AstrBot segmented reply settings must be a JSON object.'
+      } else {
+        $segmentedReply = $segmentedReplyProperty.Value
+      }
+      Set-JsonProperty -Object $segmentedReply -Name 'enable' -Value $true
+      Set-JsonProperty -Object $segmentedReply -Name 'only_llm_result' -Value $true
+      Set-JsonProperty -Object $segmentedReply -Name 'interval_method' -Value 'random'
+      Set-JsonProperty -Object $segmentedReply -Name 'interval' -Value '0.8,1.8'
+      Set-JsonProperty -Object $segmentedReply -Name 'log_base' -Value 2.6
+      Set-JsonProperty -Object $segmentedReply -Name 'words_count_threshold' -Value 5000
+      Set-JsonProperty -Object $segmentedReply -Name 'split_mode' -Value 'regex'
+      Set-JsonProperty -Object $segmentedReply -Name 'regex' -Value '.{0,44}?(?:[。？！~…；]+|[!?;]+|(?<!\d)\.(?!\d)|\r?\n+)|.{1,45}'
+      Set-JsonProperty -Object $segmentedReply -Name 'split_words' -Value @('。', '？', '！', '~', '…')
+      Set-JsonProperty -Object $segmentedReply -Name 'content_cleanup_rule' -Value '[\r\n\t\u3000]+|(?<=[\u3400-\u9fff，。！？；：、]) +| +(?=[\u3400-\u9fff，。！？；：、])'
+
       $akashaPlatform = [pscustomobject][ordered]@{
         id = 'akasha_ob11'
         type = 'aiocqhttp'

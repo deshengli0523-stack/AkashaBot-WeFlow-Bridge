@@ -34,8 +34,9 @@ log = logging.getLogger("ob11-bridge")
 class WeFlowBridge:
     """WeFlow ↔ AstrBot 桥接器（OneBot v11 版）。"""
 
-    def __init__(self, sender):
+    def __init__(self, sender, generation=None):
         self.sender = sender
+        self.generation = generation
         self.processed_ids = set()
         self.start_timestamp = int(time.time())
         self.pending_buffers = {}
@@ -47,6 +48,13 @@ class WeFlowBridge:
         self._sent_recently = {}
         self._sse_event_keys = {}
         self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
+
+    def _active(self):
+        return (
+            True
+            if self.generation is None
+            else state.is_generation_running(self.generation)
+        )
 
     def should_ignore(self, data):
         content = data.get("content", "")
@@ -65,6 +73,8 @@ class WeFlowBridge:
 
     def add_to_buffer(self, data):
         """将消息加入缓冲区，等待合并后统一推送给 AstrBot。"""
+        if not self._active():
+            return
         content = data.get("content", "")
         source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
         session_id_data = data.get("sessionId", "") or source_name
@@ -165,6 +175,8 @@ class WeFlowBridge:
 
     def process_sender(self, sender_id, version=None):
         """缓冲到期：通过 OneBot 事件推送给 AstrBot。"""
+        if not self._active():
+            return
         with self.buffer_lock:
             if sender_id not in self.pending_buffers:
                 return
@@ -229,6 +241,9 @@ class WeFlowBridge:
                                        [{"type": "text", "data": {"text": combined}}],
                                        nickname=sender_name)
 
+        if not self._active():
+            return
+
         # 记录 user_id → contact 映射，供 API 回复时查找
         if is_group:
             group_id = state._wxid_to_int(entry.get("group_name", contact))
@@ -251,6 +266,8 @@ class WeFlowBridge:
 
     def _schedule_buffer_locked(self, buffer_key: str, delay: float | None = None):
         """Start or restart a buffer timer. Caller must hold buffer_lock."""
+        if not self._active():
+            return
         entry = self.pending_buffers.get(buffer_key)
         if not entry or entry.get("processing"):
             return
@@ -269,6 +286,8 @@ class WeFlowBridge:
 
     def listen_sse(self):
         """连接 WeFlow SSE 推送。"""
+        if not self._active():
+            return
         sse_url = f"{config.WE_FLOW_BASE_URL}/api/v1/push/messages?access_token={config.ACCESS_TOKEN}"
         log.info("连接 WeFlow 推送服务: /api/v1/push/messages")
         headers = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
@@ -281,7 +300,7 @@ class WeFlowBridge:
             log.info("✅ 已连接到 WeFlow 推送")
 
             for line in self._sse_session.iter_lines(decode_unicode=True):
-                if not state.running:
+                if not self._active():
                     break
                 if not line:
                     continue
@@ -370,6 +389,8 @@ class WeFlowBridge:
 
     def process_image_message(self, data):
         """处理图片消息：从 WeFlow 取图 → ollama 描述 → 注入缓冲区"""
+        if not self._active():
+            return
         session_id = data.get("sessionId", "")
         source_name = data.get("sourceName", "") or "未知"
         group_name = data.get("groupName", "")
@@ -397,6 +418,9 @@ class WeFlowBridge:
             else:
                 log.info("⚠️ 图片描述失败")
                 caption_text = "（图片内容无法描述）"
+
+            if not self._active():
+                return
 
             # 注入图片描述到缓冲区
             with self.buffer_lock:
