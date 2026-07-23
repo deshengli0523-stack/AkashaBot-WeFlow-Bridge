@@ -102,7 +102,9 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 
 ## 10. 日志、检测与安全排障
 
-安装日志位于 `data\logs\install.log`；`data\state` 只用于安装结果与进程诊断，不包含用于定位界面的校准细节。当前 `data\bridge\config.json` 与 `data\backups` 中的配置备份都可能包含敏感校准数据，诊断系统不会收集这些数据，用户也不得收集、复制或分享它们。求助时可以提供 `data\logs` 与 `data\state` 中经过人工检查、确认不含秘密的诊断文件，同时提供固定错误码、失败阶段、组件版本和四项健康检查结果。
+安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`；`data\state` 只用于安装结果与进程诊断，不包含用于定位界面的校准细节。`bridge.log` 默认记录私聊联系人、群名与群成员、收到的完整正文、Bot 尝试发送的完整正文及 `sent`/`failed` 状态；令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。Web 控制面板不会返回 `bridge.log` 原文。
+
+当前 `data\bridge\config.json` 与 `data\backups` 中的配置备份都可能包含敏感校准数据，诊断系统不会收集这些数据。`bridge.log` 也属于本机高敏数据。求助时只能提供经过人工逐行检查、删除联系人、正文、路径和凭据后的少量日志摘录，同时提供固定错误码、失败阶段、组件版本和四项健康检查结果。
 
 绝不要发送 `data\bridge\config.json`。不要发送整个 `data` 目录、原始未检查日志、`FIRST_LOGIN.txt`、WeFlow/AstrBot 配置、API Key、令牌、数据库、聊天内容或附件。
 
