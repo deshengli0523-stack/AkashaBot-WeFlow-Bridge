@@ -972,10 +972,35 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-True ([bool]$freshAstr.platform_settings.segmented_reply.only_llm_result) 'AstrBot segmented reply is not limited to LLM results.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval_method) 'random' 'AstrBot segmented interval method is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval) '0.8,1.8' 'AstrBot segmented interval is wrong.'
-  Assert-Equal ([int]$freshAstr.platform_settings.segmented_reply.words_count_threshold) 5000 'AstrBot segmented threshold is wrong.'
+  Assert-Equal ([int]$freshAstr.platform_settings.segmented_reply.words_count_threshold) 2147483647 'AstrBot segmented threshold is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.split_mode) 'regex' 'AstrBot segmented split mode is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,44}?(?:[\u3002\uff1f\uff01~\u2026\uff1b]+|[!?;]+|(?<!\d)\.(?!\d)|\r?\n+)|.{1,45}' 'AstrBot segmented regex is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '[\r\n\t\u3000]+|(?<=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001]) +| +(?=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001])' 'AstrBot content cleanup rule is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,14}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,15}' 'AstrBot segmented regex is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '\s+' 'AstrBot content cleanup rule is wrong.'
+  $segmentPattern = [string]$freshAstr.platform_settings.segmented_reply.regex
+  $segmentCleanupPattern = [string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule
+  $segmentOptions = [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::Multiline
+  $segmentCases = @(
+    [pscustomobject]@{ Name = 'ordinary spaces'; Input = '甲乙 丙丁'; Expected = @('甲乙', '丙丁') },
+    [pscustomobject]@{ Name = 'tabs'; Input = "甲乙`t丙丁"; Expected = @('甲乙', '丙丁') },
+    [pscustomobject]@{ Name = 'blank lines'; Input = "甲乙`r`n`r`n丙丁"; Expected = @('甲乙', '丙丁') },
+    [pscustomobject]@{ Name = 'punctuation runs'; Input = '你好？！ 后续'; Expected = @('你好？！', '后续') },
+    [pscustomobject]@{ Name = 'decimal points'; Input = '版本3.14稳定'; Expected = @('版本3.14稳定') },
+    [pscustomobject]@{ Name = 'strict fifteen character cap'; Input = '一二三四五六七八九十甲乙丙丁戊己'; Expected = @('一二三四五六七八九十甲乙丙丁戊', '己') }
+  )
+  foreach ($segmentCase in $segmentCases) {
+    $actualSegments = @(
+      [regex]::Matches($segmentCase.Input, $segmentPattern, $segmentOptions) | ForEach-Object {
+        $segment = [regex]::Replace($_.Value, $segmentCleanupPattern, '').Trim()
+        if ($segment.Length -gt 0) {
+          $segment
+        }
+      }
+    )
+    Assert-Equal ($actualSegments -join '|') ($segmentCase.Expected -join '|') "AstrBot segmented reply failed the $($segmentCase.Name) case."
+    foreach ($actualSegment in $actualSegments) {
+      Assert-True ($actualSegment.Length -le 15) "AstrBot segmented reply exceeded 15 characters in the $($segmentCase.Name) case."
+    }
+  }
   Assert-Equal @($freshAstr.platform).Count 1 'AstrBot platform count is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].id) 'akasha_ob11' 'AstrBot platform id is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].type) 'aiocqhttp' 'AstrBot platform type is wrong.'

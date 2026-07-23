@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.7 - 2026-07-23
+
+- Split AstrBot LLM replies at ordinary and full-width spaces, tabs, line breaks, blank lines, and existing sentence-ending punctuation.
+- Enforce a strict maximum of 15 characters per emitted text segment while preserving punctuation runs and decimal points.
+- Remove whitespace boundaries after splitting so consecutive whitespace and blank lines cannot create empty outgoing messages.
+
+### Automated verification
+
+- Ordinary spaces, tabs, blank lines, punctuation runs, decimal points, and the strict 15-character cap are covered by initialization regression tests.
+
 ## 0.2.6 - 2026-07-23
 
 - Keep the Bridge lifecycle active while WeFlow is still starting and retry the local API every two seconds instead of deactivating after the first connection refusal.
