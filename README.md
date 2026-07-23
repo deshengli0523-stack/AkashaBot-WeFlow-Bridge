@@ -57,9 +57,9 @@
 
 ## 日志、安全与排障
 
-安装日志位于 `data\logs\install.log`，运行状态记录位于 `data\state`。求助时可以提供 `data\logs` 和 `data\state` 中经人工检查、确认不含秘密的诊断文件，并说明固定错误码、失败阶段和组件版本。
+安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`，运行状态记录位于 `data\state`。`bridge.log` 默认记录私聊联系人、群名与群成员，以及收到的完整正文和 Bot 尝试发送的完整正文；发送记录同时标注 `sent` 或 `failed`。令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。为避免浏览器接口泄露聊天记录，Web 控制面板不显示 `bridge.log` 原文。
 
-绝不要发送 `data\bridge\config.json`。也不要发送 `FIRST_LOGIN.txt`、API Key、令牌、数据库、聊天内容、附件、整个 `data` 目录或未经检查的原始日志。详细规则见 [SECURITY.md](SECURITY.md)。
+`bridge.log` 属于本机高敏数据。求助时只能提供经过人工逐行检查并删除联系人、正文、路径和凭据后的少量摘录，同时说明固定错误码、失败阶段和组件版本。绝不要发送 `data\bridge\config.json`、`FIRST_LOGIN.txt`、API Key、令牌、数据库、聊天内容、附件、整个 `data` 目录或未经检查的原始日志。详细规则见 [SECURITY.md](SECURITY.md)。
 
 ## 本地开发验证
 

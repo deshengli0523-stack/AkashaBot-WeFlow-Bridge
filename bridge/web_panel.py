@@ -334,6 +334,7 @@ function saveConfig() {
   fields.forEach(function(el){
     var key = el.id.replace('cfg_','');
     var val = el.value.trim();
+    if ((key === 'access_token' || key === 'image_caption_api_key') && !val) return;
     if (el.type === 'number') val = Number(val) || 0;
     // bot_nicknames: 逗号分隔转数组
     if (key === 'bot_nicknames') val = val ? val.split(/[,，]\\s*/).filter(Boolean) : [];
@@ -375,18 +376,32 @@ def _sender_status() -> dict[str, object]:
     return {"sender_mode": "uia_fixed", "calibrated": _is_calibrated()}
 
 
+_PRIVATE_CONFIG_KEYS = {
+    "uia_fixed_calibration",
+    "access_token",
+    "image_caption_api_key",
+}
+_SECRET_CONFIG_KEYS = {"access_token", "image_caption_api_key"}
+
+
 def _public_config(value: dict[str, object]) -> dict[str, object]:
     return {
         key: field_value
         for key, field_value in value.items()
-        if key != "uia_fixed_calibration"
+        if key not in _PRIVATE_CONFIG_KEYS
     }
 
 
 def _merge_public_config(
     current: dict[str, object], submitted: dict[str, object]
 ) -> dict[str, object]:
-    current.update(_public_config(submitted))
+    for key, field_value in submitted.items():
+        if key == "uia_fixed_calibration":
+            continue
+        if key in _SECRET_CONFIG_KEYS:
+            if not isinstance(field_value, str) or not field_value.strip():
+                continue
+        current[key] = field_value
     return current
 
 
@@ -395,19 +410,17 @@ class WebHandler(BaseHTTPRequestHandler):
         if self.path == "/status":
             ob_connected = state._ob_ws is not None and state._ob_ws_ready.is_set()
             weflow_connected = state.bridge_instance is not None and state.bridge_instance._sse_session is not None
-            log_lines = []
-            try:
-                with open(config.BRIDGE_LOG_FILE, encoding="utf-8", errors="replace") as f:
-                    log_lines = f.read().splitlines()[-200:]
-            except Exception:
-                pass
             status = {
                 "running": state.running,
                 "paused": state.paused.is_set(),
                 "ob_connected": ob_connected,
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
-                "log": "\n".join(log_lines),
+                "log": (
+                    "bridge.log 已记录完整联系人和聊天正文。"
+                    "出于安全考虑，不在网页面板显示；"
+                    "请仅在本机 data\\logs\\bridge.log 中查看。"
+                ),
             }
             status.update(_sender_status())
             self.send_json(status)
@@ -416,8 +429,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 with open(config.CONFIG_FILE, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                 self.send_json(_public_config(cfg))
-            except Exception as e:
-                self.send_json({"error": str(e)}, 500)
+            except Exception:
+                self.send_json({"error": "E_CONFIG_READ"}, 500)
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -482,16 +495,15 @@ class WebHandler(BaseHTTPRequestHandler):
                     state.group_reply_mode = new_cfg["group_reply_mode"]
 
                 self.send_json({"ok": True})
-            except Exception as e:
+            except Exception:
                 log.error("[Web] 保存配置异常")
-                self.send_json({"ok": False, "error": str(e)}, 500)
+                self.send_json({"ok": False, "error": "E_CONFIG_SAVE"}, 500)
         else:
             self.send_json({"ok": False}, 404)
 
     def send_json(self, data, code=200):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
 

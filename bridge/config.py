@@ -6,6 +6,7 @@ import json
 import os
 import logging
 import threading
+from privacy import redact_log_text
 
 # ============ 配置 ============
 
@@ -83,6 +84,7 @@ class _SensitiveValueFilter(logging.Filter):
         redacted = message
         for value in self._values:
             redacted = redacted.replace(value, "[REDACTED]")
+        redacted = redact_log_text(redacted, redact_paths=False)
         if redacted != message:
             record.msg = redacted
             record.args = ()
@@ -90,10 +92,8 @@ class _SensitiveValueFilter(logging.Filter):
 
 
 _privacy_filter = _SensitiveValueFilter([
-    ACCESS_TOKEN, ASTRBOT_ATTACHMENTS, BOT_NICKNAMES, BOT_WXID,
-    WE_FLOW_BASE_URL, ASTRBOT_OB_URL,
-    IMAGE_CAPTION_API_KEY, IMAGE_CAPTION_API_BASE, IMAGE_CAPTION_PROMPT,
-    OLLAMA_BASE_URL, CONFIG_FILE, LOG_DIR,
+    ACCESS_TOKEN, IMAGE_CAPTION_API_KEY,
+    ASTRBOT_ATTACHMENTS, CONFIG_FILE, LOG_DIR,
 ])
 _file_handler = logging.FileHandler(BRIDGE_LOG_FILE, encoding="utf-8")
 _stream_handler = logging.StreamHandler()

@@ -15,9 +15,13 @@ import types
 import unittest
 from unittest import mock
 
+sys.dont_write_bytecode = True
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "bridge"
+if str(BRIDGE) not in sys.path:
+    sys.path.insert(0, str(BRIDGE))
 LOG_SOURCE_FILES = (
     "bridge_core.py",
     "ob_protocol.py",
@@ -129,7 +133,14 @@ SAFE_METADATA_SUFFIXES = {
     "width",
 }
 SAFE_METADATA_TERMINALS = {"control_type_name"}
-SAFE_LOG_WRAPPERS = {"bool", "len", "message_meta", "pseudonym", "type"}
+SAFE_LOG_WRAPPERS = {
+    "bool",
+    "chat_record",
+    "len",
+    "message_meta",
+    "pseudonym",
+    "type",
+}
 LOG_METHODS = {"critical", "debug", "error", "exception", "info", "warning"}
 LOG_RECEIVERS = {"log", "logger", "logging"}
 
@@ -311,10 +322,12 @@ class BridgeRuntimeTests(unittest.TestCase):
                 pathlib.Path(namespace["PID_FILE"]), state_dir / "bridge.pid"
             )
 
-    def test_web_panel_uses_configured_log_file(self):
+    def test_web_panel_does_not_return_chat_log_file(self):
         source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
-        self.assertIn("open(config.BRIDGE_LOG_FILE", source)
+        self.assertNotIn("open(config.BRIDGE_LOG_FILE", source)
         self.assertNotIn('open("bridge.log"', source)
+        self.assertNotIn("Access-Control-Allow-Origin", source)
+        self.assertIn("不在网页面板显示", source)
 
     def _load_web_panel(self, calibration, config_path, log_path):
         state_module = types.ModuleType("state")
@@ -453,7 +466,10 @@ class BridgeRuntimeTests(unittest.TestCase):
             config_path = root / "config.json"
             config_path.write_text("{}", encoding="utf-8")
             log_path = root / "bridge.log"
-            log_path.write_text("status=ready", encoding="utf-8")
+            log_path.write_text(
+                'CHAT {"contact":"联系人甲","body":"不得出现在面板中的正文"}',
+                encoding="utf-8",
+            )
             panel, _, _ = self._load_web_panel(invalid, config_path, log_path)
 
             response = self._invoke_web_handler(panel, "do_GET", "/status")
@@ -467,6 +483,9 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertIn("ob_connected", status)
         self.assertIn("weflow_connected", status)
         self.assertIn("log", status)
+        self.assertIn("不在网页面板显示", status["log"])
+        self.assertNotIn("联系人甲", status["log"])
+        self.assertNotIn("不得出现在面板中的正文", status["log"])
         self.assertNotIn("send_method", status)
         self.assertNotIn("ob_url", status)
         serialized = json.dumps(status).lower()
@@ -481,7 +500,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         ):
             self.assertNotIn(private_name, serialized)
 
-    def test_task5_config_get_and_post_never_expose_or_overwrite_calibration(self):
+    def test_task5_config_get_and_post_protect_calibration_and_secrets(self):
         calibration = {
             "schema_version": 1,
             "completed": False,
@@ -497,10 +516,17 @@ class BridgeRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             config_path = root / "config.json"
+            access_key = "access_" + "token"
+            image_key = "image_caption_" + "api_key"
+            original_access_value = "private-" + "token"
+            original_image_value = "private-" + "image-key"
+            replacement_access_value = "replacement-" + "token"
+            replacement_image_value = "replacement-" + "image-key"
             config_path.write_text(
                 json.dumps(
                     {
-                        "access_token": "private-token",
+                        access_key: original_access_value,
+                        image_key: original_image_value,
                         "buffer_seconds": 5,
                         "uia_fixed_calibration": calibration,
                     }
@@ -517,6 +543,8 @@ class BridgeRuntimeTests(unittest.TestCase):
                 panel, "do_GET", "/api/config"
             )
             self.assertNotIn("uia_fixed_calibration", get_response["data"])
+            self.assertNotIn(access_key, get_response["data"])
+            self.assertNotIn(image_key, get_response["data"])
 
             post_response = self._invoke_web_handler(
                 panel,
@@ -524,6 +552,8 @@ class BridgeRuntimeTests(unittest.TestCase):
                 "/api/config",
                 {
                     "buffer_seconds": 7,
+                    access_key: "   ",
+                    image_key: {"invalid": "value"},
                     "uia_fixed_calibration": {
                         "completed": True,
                         "points": {"private": "overwrite-attempt"},
@@ -531,10 +561,65 @@ class BridgeRuntimeTests(unittest.TestCase):
                 },
             )
             saved = json.loads(config_path.read_text(encoding="utf-8"))
+            replacement_response = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/api/config",
+                {
+                    access_key: replacement_access_value,
+                    image_key: replacement_image_value,
+                },
+            )
+            replaced = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertEqual(post_response, {"data": {"ok": True}, "code": 200})
+        self.assertEqual(
+            replacement_response, {"data": {"ok": True}, "code": 200}
+        )
         self.assertEqual(saved["buffer_seconds"], 7)
         self.assertEqual(saved["uia_fixed_calibration"], calibration)
+        self.assertEqual(saved[access_key], original_access_value)
+        self.assertEqual(saved[image_key], original_image_value)
+        self.assertEqual(replaced[access_key], replacement_access_value)
+        self.assertEqual(replaced[image_key], replacement_image_value)
+        self.assertEqual(replaced["uia_fixed_calibration"], calibration)
+
+    def test_task5_config_errors_return_fixed_codes_without_local_paths(self):
+        calibration = {"schema_version": 1, "completed": False}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            missing_config = root / "private-directory" / "config.json"
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, _, _ = self._load_web_panel(
+                calibration, missing_config, log_path
+            )
+
+            get_response = self._invoke_web_handler(
+                panel, "do_GET", "/api/config"
+            )
+            post_response = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/api/config",
+                {"buffer_seconds": 7},
+            )
+
+        self.assertEqual(
+            get_response,
+            {"data": {"error": "E_CONFIG_READ"}, "code": 500},
+        )
+        self.assertEqual(
+            post_response,
+            {
+                "data": {"ok": False, "error": "E_CONFIG_SAVE"},
+                "code": 500,
+            },
+        )
+        responses = json.dumps(
+            [get_response, post_response], ensure_ascii=False
+        )
+        self.assertNotIn(str(missing_config), responses)
 
     def test_task5_web_ui_has_no_sender_selector_or_send_api_field(self):
         source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
@@ -543,6 +628,10 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertNotIn("cfg_send_method", source)
         self.assertNotIn("s.send_method", source)
         self.assertIn("s.sender_mode", source)
+        self.assertIn(
+            "key === 'access_token' || key === 'image_caption_api_key'",
+            source,
+        )
 
     def test_task4_runtime_scope_uses_only_direct_uia_fixed_sender(self):
         main_source = (BRIDGE / "main.py").read_text(encoding="utf-8")
@@ -657,11 +746,6 @@ class BridgeRuntimeTests(unittest.TestCase):
                 "图片": [{"type": "image", "data": {"file": image_path.name}}],
                 "表情": [{"type": "face", "data": {"id": 1}}],
             }
-            private_values = (
-                "private-contact",
-                "private-body",
-                image_path.name,
-            )
             for result in (False, None, 1):
                 for label, message in messages.items():
                     with self.subTest(result=result, segment=label):
@@ -677,10 +761,16 @@ class BridgeRuntimeTests(unittest.TestCase):
                             asyncio.run(protocol._handle_ob_api(request))
 
                         output = "\n".join(logs.output)
-                        self.assertNotIn(f"{label}已发送", output)
-                        self.assertEqual(output.count("消息发送失败"), 1)
-                        for private_value in private_values:
-                            self.assertNotIn(private_value, output)
+                        self.assertIn('"event":"outbound"', output)
+                        self.assertIn('"status":"failed"', output)
+                        self.assertIn('"contact":"private-contact"', output)
+                        if label == "文字":
+                            self.assertIn('"body":"private-body"', output)
+                        elif label == "图片":
+                            self.assertIn('"body":"[图片]"', output)
+                        else:
+                            self.assertIn('"body":"[表情]"', output)
+                        self.assertNotIn(image_path.name, output)
 
             for label, message in messages.items():
                 with self.subTest(result=True, segment=label):
@@ -696,8 +786,300 @@ class BridgeRuntimeTests(unittest.TestCase):
                         asyncio.run(protocol._handle_ob_api(request))
 
                     output = "\n".join(logs.output)
-                    self.assertIn(f"{label}已发送", output)
-                    self.assertNotIn("消息发送失败", output)
+                    self.assertIn('"event":"outbound"', output)
+                    self.assertIn('"status":"sent"', output)
+                    self.assertIn('"contact":"private-contact"', output)
+                    if label == "文字":
+                        self.assertIn('"body":"private-body"', output)
+                    elif label == "图片":
+                        self.assertIn('"body":"[图片]"', output)
+                    else:
+                        self.assertIn('"body":"[表情]"', output)
+                    self.assertNotIn(image_path.name, output)
+
+    def test_ob_sender_exceptions_log_one_failed_chat_record_without_details(self):
+        class FakeWebSocket:
+            async def send(self, _payload):
+                return None
+
+        class RaisingSender:
+            def send_text(self, _contact, _text):
+                raise RuntimeError("private sender detail")
+
+            def send_image(self, _contact, _image_path):
+                raise RuntimeError("private image sender detail")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            image_path = root / "task4-exception-image.png"
+            image_path.write_bytes(b"not-opened-by-raising-sender")
+
+            state_module = types.ModuleType("state")
+            state_module._ob_ws = FakeWebSocket()
+            state_module._ob_id_to_contact = {7: "private-contact"}
+            state_module.sender_instance = RaisingSender()
+            config_module = types.ModuleType("config")
+            config_module.ASTRBOT_ATTACHMENTS = str(root)
+            requests_module = types.ModuleType("requests")
+
+            spec = importlib.util.spec_from_file_location(
+                "task4_ob_protocol_exception_test",
+                BRIDGE / "ob_protocol.py",
+            )
+            protocol = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "state": state_module,
+                    "config": config_module,
+                    "requests": requests_module,
+                },
+            ):
+                spec.loader.exec_module(protocol)
+
+            messages = {
+                "文字": [{"type": "text", "data": {"text": "private-body"}}],
+                "图片": [{"type": "image", "data": {"file": image_path.name}}],
+                "表情": [{"type": "face", "data": {"id": 1}}],
+            }
+            for label, message in messages.items():
+                with self.subTest(segment=label):
+                    request = {
+                        "action": "send_private_msg",
+                        "params": {"user_id": 7, "message": message},
+                        "echo": "task4",
+                    }
+                    with self.assertLogs("ob11-bridge", level="INFO") as logs:
+                        asyncio.run(protocol._handle_ob_api(request))
+
+                    chat_lines = [line for line in logs.output if "CHAT " in line]
+                    self.assertEqual(len(chat_lines), 1)
+                    output = "\n".join(logs.output)
+                    self.assertIn('"event":"outbound"', output)
+                    self.assertIn('"status":"failed"', output)
+                    self.assertNotIn("private sender detail", output)
+                    self.assertNotIn("private image sender detail", output)
+                    self.assertNotIn(image_path.name, output)
+
+    def test_ob_image_precondition_failures_log_one_failed_chat_record(self):
+        class FakeWebSocket:
+            async def send(self, _payload):
+                return None
+
+        class UnexpectedSender:
+            def send_image(self, _contact, _image_path):
+                raise AssertionError("send_image must not run")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            state_module = types.ModuleType("state")
+            state_module._ob_ws = FakeWebSocket()
+            state_module._ob_id_to_contact = {7: "private-contact"}
+            state_module.sender_instance = UnexpectedSender()
+            config_module = types.ModuleType("config")
+            config_module.ASTRBOT_ATTACHMENTS = str(root)
+            requests_module = types.ModuleType("requests")
+
+            spec = importlib.util.spec_from_file_location(
+                "task4_ob_protocol_image_precondition_test",
+                BRIDGE / "ob_protocol.py",
+            )
+            protocol = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "state": state_module,
+                    "config": config_module,
+                    "requests": requests_module,
+                },
+            ):
+                spec.loader.exec_module(protocol)
+
+            file_values = ("", "base64://a", "missing-private-image.png")
+            for file_value in file_values:
+                with self.subTest(file_value=bool(file_value)):
+                    request = {
+                        "action": "send_private_msg",
+                        "params": {
+                            "user_id": 7,
+                            "message": [
+                                {"type": "image", "data": {"file": file_value}}
+                            ],
+                        },
+                        "echo": "task4",
+                    }
+                    with self.assertLogs("ob11-bridge", level="INFO") as logs:
+                        asyncio.run(protocol._handle_ob_api(request))
+
+                    chat_lines = [line for line in logs.output if "CHAT " in line]
+                    self.assertEqual(len(chat_lines), 1)
+                    output = "\n".join(logs.output)
+                    self.assertIn('"status":"failed"', output)
+                    self.assertIn('"body":"[图片]"', output)
+                    if file_value:
+                        self.assertNotIn(file_value, output)
+
+    def test_ob_malformed_supported_segments_log_failed_without_escaping(self):
+        class FakeWebSocket:
+            async def send(self, _payload):
+                return None
+
+        class UnexpectedSender:
+            def send_text(self, _contact, _text):
+                raise AssertionError("send_text must not run")
+
+            def send_image(self, _contact, _image_path):
+                raise AssertionError("send_image must not run")
+
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = FakeWebSocket()
+        state_module._ob_id_to_contact = {7: "private-contact"}
+        state_module.sender_instance = UnexpectedSender()
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        requests_module = types.ModuleType("requests")
+        spec = importlib.util.spec_from_file_location(
+            "task4_ob_protocol_malformed_segment_test",
+            BRIDGE / "ob_protocol.py",
+        )
+        protocol = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(protocol)
+
+        malformed_messages = (
+            "not-a-segment-list",
+            ["not-a-segment-object"],
+            [{"type": [], "data": "not-an-object"}],
+            [{"type": "text", "data": "not-an-object"}],
+            [{"type": "text", "data": {"text": 7}}],
+            [{"type": "image", "data": {"file": 7}}],
+        )
+        malformed_params = (
+            [],
+            {"user_id": [], "message": []},
+            {
+                "user_id": True,
+                "message": [{"type": "text", "data": {"text": "private-body"}}],
+            },
+        )
+        for params in malformed_params:
+            with self.subTest(params_type=type(params).__name__):
+                request = {
+                    "action": "send_private_msg",
+                    "params": params,
+                    "echo": "task4",
+                }
+                with self.assertLogs("ob11-bridge", level="INFO") as logs:
+                    asyncio.run(protocol._handle_ob_api(request))
+
+                chat_lines = [line for line in logs.output if "CHAT " in line]
+                self.assertEqual(len(chat_lines), 1)
+                self.assertIn('"status":"failed"', chat_lines[0])
+
+        for message in malformed_messages:
+            with self.subTest(message_type=type(message).__name__):
+                request = {
+                    "action": "send_private_msg",
+                    "params": {"user_id": 7, "message": message},
+                    "echo": "task4",
+                }
+                with self.assertLogs("ob11-bridge", level="INFO") as logs:
+                    asyncio.run(protocol._handle_ob_api(request))
+
+                chat_lines = [line for line in logs.output if "CHAT " in line]
+                self.assertEqual(len(chat_lines), 1)
+                self.assertIn('"status":"failed"', chat_lines[0])
+                self.assertNotIn("must not run", "\n".join(logs.output))
+
+    def test_inbound_chat_logs_include_private_contact_group_sender_and_full_body(self):
+        class FakeTimer:
+            def __init__(self, *_args, **_kwargs):
+                self.daemon = False
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "mention"
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = ["测试机器人"]
+        config_module.BUFFER_SECONDS = 5
+        ob_protocol_module = types.ModuleType("ob_protocol")
+        ob_protocol_module.push_event = lambda _event: True
+        ob_protocol_module.make_message_event = lambda *_args, **_kwargs: {}
+        requests_module = types.ModuleType("requests")
+
+        spec = importlib.util.spec_from_file_location(
+            "bridge_core_chat_log_test",
+            BRIDGE / "bridge_core.py",
+        )
+        bridge_core = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "ob_protocol": ob_protocol_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(bridge_core)
+
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        private_message = {
+            "content": "私聊第一行\n私聊第二行🙂",
+            "sourceName": "联系人甲",
+            "sessionId": "private-session",
+        }
+        group_message = {
+            "content": "群消息正文",
+            "sourceName": "项目群(12)",
+            "senderName": "群成员乙",
+            "groupName": "项目群(12)",
+            "sessionId": "group-session@chatroom",
+            "sessionType": "group",
+        }
+
+        with mock.patch.object(bridge_core.threading, "Timer", FakeTimer):
+            with self.assertLogs("ob11-bridge", level="INFO") as logs:
+                bridge.add_to_buffer(private_message)
+                bridge.add_to_buffer(group_message)
+
+        records = [
+            json.loads(line.split("CHAT ", 1)[1])
+            for line in logs.output
+            if "CHAT " in line
+        ]
+        self.assertEqual(
+            records,
+            [
+                {
+                    "event": "inbound",
+                    "scope": "private",
+                    "contact": "联系人甲",
+                    "status": "received",
+                    "body": "私聊第一行\n私聊第二行🙂",
+                },
+                {
+                    "event": "inbound",
+                    "scope": "group",
+                    "contact": "项目群",
+                    "sender": "群成员乙",
+                    "status": "received",
+                    "body": "群消息正文",
+                },
+            ],
+        )
 
     def test_ob_non_base64_attachment_with_tmp_in_path_is_not_deleted(self):
         class FakeWebSocket:
@@ -837,12 +1219,14 @@ class BridgeRuntimeTests(unittest.TestCase):
     def test_base64_tempfile_close_failure_retries_and_removes_owned_path(self):
         self._assert_failed_base64_tempfile_stage_is_cleaned("close")
 
-    def test_privacy_helpers_have_exact_metadata_only_output(self):
+    def test_chat_log_helpers_preserve_names_and_bodies_but_redact_secrets_and_paths(self):
         privacy_path = BRIDGE / "privacy.py"
         self.assertTrue(privacy_path.is_file(), "bridge/privacy.py is missing")
         privacy = runpy.run_path(str(privacy_path))
         pseudonym = privacy["pseudonym"]
         message_meta = privacy["message_meta"]
+        chat_record = privacy["chat_record"]
+        redact_log_text = privacy["redact_log_text"]
 
         self.assertEqual(pseudonym("Alice"), "id:3bc51062973c")
         self.assertNotIn("Alice", pseudonym("Alice"))
@@ -850,7 +1234,226 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual(message_meta(""), "type=empty length=0")
         self.assertEqual(message_meta(None), "type=empty length=0")
 
-    def test_source_logs_exclude_raw_messages_identities_paths_and_exceptions(self):
+        encoded = chat_record(
+            event="inbound",
+            scope="group",
+            contact="项目群",
+            sender="联系人甲",
+            body="第一行\n第二行🙂",
+            status="received",
+        )
+        self.assertNotIn("\n", encoded)
+        record = json.loads(encoded)
+        self.assertEqual(
+            record,
+            {
+                "event": "inbound",
+                "scope": "group",
+                "contact": "项目群",
+                "sender": "联系人甲",
+                "status": "received",
+                "body": "第一行\n第二行🙂",
+            },
+        )
+
+        private_path = (
+            "C:"
+            + chr(92)
+            + chr(92).join(("Users", "Example", "private.txt"))
+        )
+        redacted = redact_log_text(
+            'body="普通正文" api_key=sk-1234567890 '
+            'Authorization: Bearer abc.def.ghi '
+            f"path={private_path}"
+        )
+        self.assertIn('body="普通正文"', redacted)
+        self.assertNotIn("sk-1234567890", redacted)
+        self.assertNotIn("abc.def.ghi", redacted)
+        self.assertNotIn(private_path, redacted)
+        self.assertGreaterEqual(redacted.count("[REDACTED]"), 3)
+
+        forward_path = "C:" + "/" + "/".join(
+            ("Users", "Example", "private.txt")
+        )
+        unc_path = chr(92) * 2 + chr(92).join(
+            ("server", "share", "private.txt")
+        )
+        slash_unc_path = "//" + "/".join(
+            ("server", "share", "private.txt")
+        )
+        unquoted_space_path = (
+            "C:"
+            + chr(92)
+            + "Program Files"
+            + chr(92)
+            + chr(92).join(("Example", "private.exe"))
+        )
+        unquoted_unc_space_path = (
+            chr(92) * 2
+            + "server"
+            + chr(92)
+            + "Shared Folder"
+            + chr(92)
+            + "private.txt"
+        )
+        terminal_space_paths = (
+            "C:" + chr(92) + "Program Files",
+            chr(92) * 2 + "server" + chr(92) + "Shared Folder",
+            (
+                "C:"
+                + chr(92)
+                + chr(92).join(("Users", "Example", "My Documents"))
+            ),
+        )
+        quoted_path = (
+            '"C:'
+            + chr(92)
+            + chr(92).join(("Program Files", "Example", "private.exe"))
+            + '"'
+        )
+        ordinary_backslash = "普通文本 A" + chr(92) + "B 保留"
+        for local_path in (
+            private_path,
+            forward_path,
+            unc_path,
+            slash_unc_path,
+            unquoted_space_path,
+            unquoted_unc_space_path,
+            *terminal_space_paths,
+            quoted_path,
+        ):
+            with self.subTest(path_style=local_path[:2]):
+                value = f"请打开 {local_path} 然后回复我"
+                filtered = redact_log_text(value)
+                self.assertNotIn(local_path, filtered)
+                self.assertIn("[REDACTED]", filtered)
+                self.assertTrue(filtered.endswith("然后回复我"))
+        self.assertEqual(redact_log_text(ordinary_backslash), ordinary_backslash)
+        for url in (
+            "https://example.com/path?q=1",
+            "http://example.com/path",
+            "ws://127.0.0.1:11229/ws",
+        ):
+            with self.subTest(url=url.split(":", 1)[0]):
+                value = f"请访问 {url} 然后回复我"
+                self.assertEqual(redact_log_text(value), value)
+        path_with_following_text = (
+            "error "
+            + "C:"
+            + chr(92)
+            + chr(92).join(("Temp", "private.txt"))
+            + " user handles later"
+        )
+        self.assertEqual(
+            redact_log_text(path_with_following_text),
+            "error [REDACTED] user handles later",
+        )
+        lower_case_folder_path = (
+            "open "
+            + "C:"
+            + chr(92)
+            + "some private folder then reply"
+        )
+        self.assertEqual(
+            redact_log_text(lower_case_folder_path),
+            "open [REDACTED] then reply",
+        )
+
+        credential_text = "API " + "Key: private-value 正文保留"
+        api_key_filtered = redact_log_text(credential_text)
+        self.assertNotIn("private-value", api_key_filtered)
+        self.assertTrue(api_key_filtered.endswith("正文保留"))
+
+        separator_body = "甲\u0085乙\u2028丙\u2029丁"
+        separator_encoded = chat_record(
+            event="inbound",
+            scope="private",
+            contact="联系人甲",
+            body=separator_body,
+            status="received",
+        )
+        self.assertNotIn("\u0085", separator_encoded)
+        self.assertNotIn("\u2028", separator_encoded)
+        self.assertNotIn("\u2029", separator_encoded)
+        self.assertEqual(json.loads(separator_encoded)["body"], separator_body)
+
+    def test_chat_log_file_end_to_end_preserves_chat_and_filters_private_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "data" / "config.json"
+            log_dir = root / "logs"
+            config_path.parent.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+
+            template = json.loads(
+                (BRIDGE / "config.example.json").read_text(encoding="utf-8")
+            )
+            configured_credential = "configured-private-" + "token"
+            configured_image_credential = "configured-private-" + "image-key"
+            template["access_" + "token"] = configured_credential
+            template["image_caption_" + "api_key"] = configured_image_credential
+            config_path.write_text(
+                json.dumps(template, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            ordinary_backslash = "A" + chr(92) + "B"
+            local_path = (
+                "C:"
+                + chr(92)
+                + chr(92).join(("Users", "Example", "private.txt"))
+            )
+            chat_body = (
+                f"正文 {ordinary_backslash}；请打开 {local_path} 然后回复；"
+                f"令牌 {configured_credential}；分隔甲\u2028乙"
+            )
+            script = "\n".join(
+                (
+                    "import logging",
+                    "import config",
+                    "from privacy import chat_record",
+                    (
+                        "entry = chat_record(event='inbound', scope='private', "
+                        "contact='联系人甲', body="
+                        + repr(chat_body)
+                        + ", status='received')"
+                    ),
+                    "config.log.info('CHAT %s', entry)",
+                    "[handler.flush() for handler in logging.getLogger().handlers]",
+                )
+            )
+            environment = os.environ.copy()
+            environment["AKASHABOT_CONFIG_PATH"] = str(config_path)
+            environment["AKASHABOT_LOG_DIR"] = str(log_dir)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", script],
+                cwd=BRIDGE,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            log_lines = (log_dir / "bridge.log").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            chat_lines = [line for line in log_lines if "CHAT " in line]
+            self.assertEqual(len(chat_lines), 1)
+            raw_line = chat_lines[0]
+            self.assertNotIn(configured_credential, raw_line)
+            self.assertNotIn(configured_image_credential, raw_line)
+            self.assertNotIn(local_path, raw_line)
+            record = json.loads(raw_line.split("CHAT ", 1)[1])
+            self.assertEqual(record["contact"], "联系人甲")
+            self.assertIn(f"正文 {ordinary_backslash}", record["body"])
+            self.assertIn("然后回复", record["body"])
+            self.assertIn("[REDACTED]", record["body"])
+            self.assertIn("分隔甲\u2028乙", record["body"])
+
+    def test_source_logs_use_chat_records_and_exclude_raw_paths_and_exceptions(self):
         legacy_markers = (
             "data.get('content','')[:50]",
             "text[:50]",
@@ -870,6 +1473,11 @@ class BridgeRuntimeTests(unittest.TestCase):
                     findings,
                     f"{name} logs raw sensitive value(s): {findings}",
                 )
+
+        bridge_source = (BRIDGE / "bridge_core.py").read_text(encoding="utf-8")
+        protocol_source = (BRIDGE / "ob_protocol.py").read_text(encoding="utf-8")
+        self.assertIn('event="inbound"', bridge_source)
+        self.assertIn('event="outbound"', protocol_source)
 
     def test_sensitive_log_scanner_rejects_representative_mutations(self):
         mutations = {
@@ -895,6 +1503,10 @@ class BridgeRuntimeTests(unittest.TestCase):
             "exception type": 'log.info("%s", type(error).__name__)',
             "message metadata": 'log.info("%s", message_meta(text))',
             "contact pseudonym": 'log.info("%s", pseudonym(contact))',
+            "structured chat record": (
+                'log.info("%s", chat_record(event="inbound", scope="private", '
+                'contact=contact, body=body, status="received"))'
+            ),
             "object logger boolean": 'self.log.info("%s", bool(event["message"]))',
             "status constant": 'logger.info("status=connected")',
         }

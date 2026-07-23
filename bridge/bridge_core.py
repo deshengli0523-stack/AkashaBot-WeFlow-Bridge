@@ -23,6 +23,7 @@ import requests
 import state
 import config
 from ob_protocol import push_event, make_message_event
+from privacy import chat_record
 
 log = logging.getLogger("ob11-bridge")
 
@@ -66,13 +67,6 @@ class WeFlowBridge:
         """将消息加入缓冲区，等待合并后统一推送给 AstrBot。"""
         content = data.get("content", "")
         source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
-
-        if content == "[图片]":
-            # 图片消息：下载 → ollama 描述 → 注入缓冲区
-            threading.Thread(target=self.process_image_message,
-                           args=(data,), daemon=True).start()
-            return
-
         session_id_data = data.get("sessionId", "") or source_name
         group_name_raw = data.get("groupName", "")
         is_group = (data.get("sessionType", "") == "group") or bool(group_name_raw) or "@chatroom" in session_id_data
@@ -85,13 +79,48 @@ class WeFlowBridge:
         sender_in_group = data.get("senderName", "") or data.get("sender", "") or data.get("sourceName", "")
 
         if is_group:
-            if state.group_reply_mode == "mention" and not any(f"@{n}" in content for n in config.BOT_NICKNAMES):
-                return
             group_raw = group_name_raw or source_name
             base_name = re.sub(r'\s*\(\d+\)\s*$', '', group_raw).strip()
             contact = base_name
+            log.info(
+                "CHAT %s",
+                chat_record(
+                    event="inbound",
+                    scope="group",
+                    contact=contact,
+                    sender=sender_in_group or source_name,
+                    status="received",
+                    body=content,
+                ),
+            )
         else:
             contact = source_name
+            log.info(
+                "CHAT %s",
+                chat_record(
+                    event="inbound",
+                    scope="private",
+                    contact=contact,
+                    status="received",
+                    body=content,
+                ),
+            )
+
+        if content == "[图片]":
+            # 图片消息：下载 → ollama 描述 → 注入缓冲区
+            threading.Thread(
+                target=self.process_image_message,
+                args=(data,),
+                daemon=True,
+            ).start()
+            return
+
+        if (
+            is_group
+            and state.group_reply_mode == "mention"
+            and not any(f"@{n}" in content for n in config.BOT_NICKNAMES)
+        ):
+            return
 
         if is_group and state.group_reply_mode == "batch":
             buffer_key = f"__batch__{base_name}"

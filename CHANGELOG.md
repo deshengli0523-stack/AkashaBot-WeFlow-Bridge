@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 - 2026-07-23
+
+- Record structured single-line bridge audit entries containing private contacts, group names and members, full inbound message bodies, and full Bot outbound bodies with sent/failed status.
+- Keep configured credentials, credential-shaped values, and local filesystem paths redacted from logs.
+- Stop returning raw `bridge.log` content from the unauthenticated Web status endpoint and remove its cross-origin response header.
+- Document that `bridge.log` contains sensitive local chat data and must be manually redacted before sharing.
+
+### Automated verification
+
+- Private and group inbound records, text/image/face outbound records, multiline Unicode bodies, failed sends, secret/path redaction, and Web status log isolation are covered by the bridge runtime tests.
+
 ## 0.2.0 - 2026-07-17
 
 - Keep one fixed-point UIA sending path and remove the two superseded sender modules.

@@ -20,14 +20,31 @@ import requests
 
 import state
 import config
+from privacy import chat_record
 
 log = logging.getLogger("ob11-bridge")
+
+
+def _write_outbound_log(scope: str, contact: object, body: object, sent: object) -> None:
+    entry = chat_record(
+        event="outbound",
+        scope=scope,
+        contact=contact,
+        status="sent" if sent is True else "failed",
+        body=body,
+    )
+    if sent is True:
+        log.info("CHAT %s", entry)
+    else:
+        log.error("CHAT %s", entry)
 
 
 async def _handle_ob_api(data: dict):
     """处理 AstrBot 发来的 API 请求。"""
     action = data.get("action", "")
-    params = data.get("params", {})
+    submitted_params = data.get("params", {})
+    params_valid = isinstance(submitted_params, dict)
+    params = submitted_params if params_valid else {}
     echo = data.get("echo", "")
     log.info("[OB11] 收到 API 请求: has_echo=%s", bool(echo))
 
@@ -54,34 +71,73 @@ async def _handle_ob_api(data: dict):
         log.warning("[OB11] WS 未连接，API 响应未发送；继续尝试本地处理")
 
     if action in ("send_msg", "send_private_msg", "send_group_msg"):
-        is_group = action == "send_group_msg"
+        is_group = action == "send_group_msg" or (
+            action == "send_msg"
+            and (
+                str(params.get("message_type", "")).lower() == "group"
+                or params.get("group_id") not in (None, "", 0, "0")
+            )
+        )
         target_id = params.get("group_id" if is_group else "user_id", 0)
         message = params.get("message", [])
-        contact = state._ob_id_to_contact.get(target_id, str(target_id))
+        target_valid = (
+            isinstance(target_id, (int, str))
+            and not isinstance(target_id, bool)
+        )
+        contact = (
+            state._ob_id_to_contact.get(target_id, str(target_id))
+            if target_valid
+            else "未知"
+        )
+        scope = "group" if is_group else "private"
+        if not params_valid or not target_valid or not isinstance(message, list):
+            _write_outbound_log(scope, contact, "[无效消息]", False)
+            return
 
         # 逐段处理：文字和图片分别发送
         for seg in message:
             if not isinstance(seg, dict):
+                _write_outbound_log(scope, contact, "[无效消息]", False)
                 continue
             seg_type = seg.get("type", "")
             seg_data = seg.get("data", {})
+            if not isinstance(seg_type, str):
+                _write_outbound_log(scope, contact, "[无效消息]", False)
+                continue
+            if not isinstance(seg_data, dict):
+                invalid_body = {
+                    "text": "[无效文本]",
+                    "image": "[图片]",
+                    "face": "[表情]",
+                }.get(seg_type)
+                if invalid_body:
+                    _write_outbound_log(scope, contact, invalid_body, False)
+                continue
 
             if seg_type == "text":
                 text = seg_data.get("text", "")
+                if not isinstance(text, str):
+                    _write_outbound_log(scope, contact, "[无效文本]", False)
+                    continue
                 if text:
-                    sent = await asyncio.to_thread(
-                        state.sender_instance.send_text,
-                        contact,
-                        text,
-                    )
-                    if sent is True:
-                        log.info("[OB11] 文字已发送: characters=%s", len(text))
-                    else:
-                        log.error("[OB11] 消息发送失败")
+                    try:
+                        sent = await asyncio.to_thread(
+                            state.sender_instance.send_text,
+                            contact,
+                            text,
+                        )
+                    except Exception:
+                        _write_outbound_log(scope, contact, text, False)
+                        continue
+                    _write_outbound_log(scope, contact, text, sent)
 
             elif seg_type == "image":
                 file_val = seg_data.get("file", "")
+                if not isinstance(file_val, str):
+                    _write_outbound_log(scope, contact, "[图片]", False)
+                    continue
                 if not file_val:
+                    _write_outbound_log(scope, contact, "[图片]", False)
                     continue
 
                 img_path = None
@@ -112,36 +168,41 @@ async def _handle_ob_api(data: dict):
                         if not img_path:
                             log.warning("[OB11] 图片文件未找到")
 
-                if img_path:
+                if not img_path:
+                    _write_outbound_log(scope, contact, "[图片]", False)
+                    continue
+
+                try:
+                    # 使用线程池执行同步的 UIA 发送，避免阻塞事件循环
                     try:
-                        # 使用线程池执行同步的 UIA 发送，避免阻塞事件循环
                         sent = await asyncio.to_thread(
                             state.sender_instance.send_image,
                             contact,
                             img_path,
                         )
-                        if sent is True:
-                            log.info("[OB11] 图片已发送")
-                        else:
-                            log.error("[OB11] 消息发送失败")
-                    finally:
-                        # 临时文件用完删除
-                        if temporary_image:
-                            try:
-                                os.unlink(img_path)
-                            except Exception:
-                                pass
+                    except Exception:
+                        _write_outbound_log(scope, contact, "[图片]", False)
+                        continue
+                    _write_outbound_log(scope, contact, "[图片]", sent)
+                finally:
+                    # 临时文件用完删除
+                    if temporary_image:
+                        try:
+                            os.unlink(img_path)
+                        except Exception:
+                            pass
 
             elif seg_type == "face":
-                sent = await asyncio.to_thread(
-                    state.sender_instance.send_text,
-                    contact,
-                    "[表情]",
-                )
-                if sent is True:
-                    log.info("[OB11] 表情已发送")
-                else:
-                    log.error("[OB11] 消息发送失败")
+                try:
+                    sent = await asyncio.to_thread(
+                        state.sender_instance.send_text,
+                        contact,
+                        "[表情]",
+                    )
+                except Exception:
+                    _write_outbound_log(scope, contact, "[表情]", False)
+                    continue
+                _write_outbound_log(scope, contact, "[表情]", sent)
 
             # 其他类型（record, video 等）忽略
 
