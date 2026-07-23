@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.8 - 2026-07-23
+
+- Probe the WeFlow sessions endpoint during startup so current WeFlow versions do not reject readiness checks that omit the required message `talker`.
+
+### Automated verification
+
+- The delayed-readiness lifecycle regression now verifies the compatible sessions endpoint while preserving token, retry, and timeout behavior.
+
 ## 0.2.7 - 2026-07-23
 
 - Split AstrBot LLM replies at ordinary and full-width spaces, tabs, line breaks, blank lines, and existing sentence-ending punctuation.

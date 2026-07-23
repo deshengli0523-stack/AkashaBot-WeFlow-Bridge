@@ -123,7 +123,7 @@ def _bridge_loop(generation: int):
         readiness_attempt += 1
         try:
             response = requests.get(
-                f"{config.WE_FLOW_BASE_URL}/api/v1/messages",
+                f"{config.WE_FLOW_BASE_URL}/api/v1/sessions",
                 params={
                     "limit": 1,
                     "access_token": config.ACCESS_TOKEN,
