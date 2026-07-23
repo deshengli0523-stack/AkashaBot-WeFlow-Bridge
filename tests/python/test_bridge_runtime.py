@@ -626,6 +626,226 @@ class BridgeRuntimeTests(unittest.TestCase):
         getattr(handler, method)()
         return captured
 
+    def _load_main_runtime(self, request_get):
+        state_module = types.ModuleType("state")
+        state_module.running = False
+        state_module.lifecycle_generation = 0
+        state_module.run_lock = threading.Lock()
+        state_module.paused = threading.Event()
+        state_module.sender_instance = None
+        state_module.bridge_thread = None
+        state_module.bridge_instance = None
+        state_module.bridge_lock = threading.Lock()
+        state_module._ob_ws = None
+        state_module._ob_ws_loop = None
+        state_module._ob_ws_ready = threading.Event()
+
+        def is_generation_running(generation):
+            return bool(
+                state_module.running
+                and state_module.lifecycle_generation == generation
+            )
+
+        def deactivate_generation(generation):
+            with state_module.run_lock:
+                if not is_generation_running(generation):
+                    return False
+                state_module.running = False
+                state_module.lifecycle_generation += 1
+                return True
+
+        state_module.is_generation_running = is_generation_running
+        state_module.deactivate_generation = deactivate_generation
+
+        config_module = types.ModuleType("config")
+        config_module.UIA_FIXED_CALIBRATION = {}
+        config_module.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = 1.0
+        config_module.UIA_FIXED_PRE_SEND_DELAY = 10.0
+        config_module.ACCESS_TOKEN = "fixture"
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.WEB_PORT = 8766
+
+        class FakeSender:
+            def __init__(self, *_args, **_kwargs):
+                self.stopped = False
+
+            def stop_pending(self):
+                self.stopped = True
+
+        sender_module = types.ModuleType("uia_fixed_sender")
+        sender_module.UiaFixedSender = FakeSender
+
+        ob_module = types.ModuleType("ob_client")
+        ob_module._run_ob_client = lambda _generation: None
+
+        class FakeBridge:
+            instances = []
+
+            def __init__(self, _sender, generation):
+                self.generation = generation
+                self._sse_session = None
+                self.listen_calls = 0
+                self.__class__.instances.append(self)
+
+            def listen_sse(self):
+                self.listen_calls += 1
+                state_module.deactivate_generation(self.generation)
+
+        bridge_module = types.ModuleType("bridge_core")
+        bridge_module.WeFlowBridge = FakeBridge
+
+        panel_module = types.ModuleType("web_panel")
+        panel_module.WebHandler = object
+        panel_module.PAGE = ""
+
+        request_exception = type("RequestException", (Exception,), {})
+        requests_module = types.ModuleType("requests")
+        requests_module.get = request_get
+        requests_module.exceptions = types.SimpleNamespace(
+            RequestException=request_exception
+        )
+
+        spec = importlib.util.spec_from_file_location(
+            "startup_readiness_main_under_test",
+            BRIDGE / "main.py",
+        )
+        main_module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "uia_fixed_sender": sender_module,
+                "ob_client": ob_module,
+                "bridge_core": bridge_module,
+                "web_panel": panel_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(main_module)
+        return (
+            main_module,
+            state_module,
+            config_module,
+            requests_module,
+            FakeBridge,
+        )
+
+    def test_bridge_retries_delayed_weflow_and_keeps_generation_active(self):
+        calls = []
+        responses = [
+            "connection-error",
+            types.SimpleNamespace(status_code=503),
+            types.SimpleNamespace(status_code=200),
+        ]
+
+        def request_get(url, **kwargs):
+            calls.append((url, kwargs))
+            response = responses.pop(0)
+            if response == "connection-error":
+                raise request_exception("not ready")
+            return response
+
+        main_module, state_module, _, requests_module, fake_bridge = (
+            self._load_main_runtime(request_get)
+        )
+        request_exception = requests_module.exceptions.RequestException
+        state_module.running = True
+        state_module.lifecycle_generation = 7
+
+        with mock.patch.object(main_module.time, "sleep", return_value=None):
+            main_module._bridge_loop(7)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            calls[-1],
+            (
+                "http://127.0.0.1:5031/api/v1/messages",
+                {
+                    "params": {
+                        "limit": 1,
+                        "access_token": "fixture",
+                    },
+                    "timeout": 5,
+                },
+            ),
+        )
+        self.assertEqual(fake_bridge.instances[-1].listen_calls, 1)
+
+    def test_bridge_restart_always_creates_a_new_onebot_thread(self):
+        main_module, state_module, _, _, _ = self._load_main_runtime(
+            lambda *_args, **_kwargs: types.SimpleNamespace(status_code=200)
+        )
+        created_threads = []
+
+        class FakeThread:
+            def __init__(self, *, target, args, daemon, name):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+                self.name = name
+                created_threads.append(self)
+
+            def start(self):
+                return None
+
+        with mock.patch.object(main_module.threading, "Thread", FakeThread):
+            main_module._start_bridge()
+            state_module.running = False
+            main_module._start_bridge()
+
+        onebot_threads = [
+            thread for thread in created_threads if thread.name.startswith("ob11-client-")
+        ]
+        self.assertEqual(
+            [thread.name for thread in onebot_threads],
+            ["ob11-client-1", "ob11-client-2"],
+        )
+        self.assertEqual(
+            [thread.args for thread in onebot_threads],
+            [(1,), (2,)],
+        )
+        self.assertFalse(hasattr(state_module, "ob_client_started"))
+
+    def test_bridge_invalid_weflow_token_remains_terminal(self):
+        main_module, state_module, _, _, fake_bridge = self._load_main_runtime(
+            lambda *_args, **_kwargs: types.SimpleNamespace(status_code=401)
+        )
+        state_module.running = True
+        state_module.lifecycle_generation = 3
+
+        main_module._bridge_loop(3)
+
+        self.assertFalse(state_module.running)
+        self.assertEqual(state_module.lifecycle_generation, 4)
+        self.assertEqual(fake_bridge.instances[-1].listen_calls, 0)
+
+    def test_bridge_stop_interrupts_weflow_readiness_retry(self):
+        request_exception = None
+        calls = []
+
+        def request_get(*_args, **_kwargs):
+            calls.append(True)
+            raise request_exception("not ready")
+
+        main_module, state_module, _, requests_module, fake_bridge = (
+            self._load_main_runtime(request_get)
+        )
+        request_exception = requests_module.exceptions.RequestException
+        state_module.running = True
+        state_module.lifecycle_generation = 9
+
+        def stop_generation(_seconds):
+            state_module.running = False
+
+        with mock.patch.object(
+            main_module.time, "sleep", side_effect=stop_generation
+        ):
+            main_module._bridge_loop(9)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(fake_bridge.instances[-1].listen_calls, 0)
+
     def test_task5_config_template_uses_only_uncompleted_nested_calibration(self):
         template = json.loads(
             (BRIDGE / "config.example.json").read_text(encoding="utf-8")
