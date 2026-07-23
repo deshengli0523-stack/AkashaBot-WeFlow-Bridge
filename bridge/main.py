@@ -42,15 +42,13 @@ def _start_bridge():
         state.sender_instance = sender
     state.paused.clear()
 
-    if not state.ob_client_started:
-        t = threading.Thread(
-            target=_run_ob_client,
-            args=(generation,),
-            daemon=True,
-            name="ob11-client",
-        )
-        t.start()
-        state.ob_client_started = True
+    t = threading.Thread(
+        target=_run_ob_client,
+        args=(generation,),
+        daemon=True,
+        name=f"ob11-client-{generation}",
+    )
+    t.start()
 
     state.bridge_thread = threading.Thread(
         target=_bridge_loop,
@@ -95,8 +93,6 @@ def _stop_bridge():
 
     state._ob_ws_ready.clear()
 
-    # 重置启动标记，让下次 start 能重新拉起 WebSocket 客户端线程
-    state.ob_client_started = False
     state._ob_ws_loop = None
 
     log.info("[Web] 已停止")
@@ -122,27 +118,44 @@ def _bridge_loop(generation: int):
         with state.bridge_lock:
             state.bridge_instance = bridge
 
-    try:
-        r = requests.get(f"{config.WE_FLOW_BASE_URL}/api/v1/messages?limit=1&access_token={config.ACCESS_TOKEN}", timeout=5)
-        if not state.is_generation_running(generation):
-            return
-        if r.status_code == 200:
-            log.info("✅ WeFlow API 正常")
-        elif r.status_code == 401:
-            log.error("❌ Access Token 无效")
-            state.deactivate_generation(generation)
-            return
-    except requests.exceptions.ConnectionError:
-        if not state.is_generation_running(generation):
-            return
-        log.error("❌ 无法连接 WeFlow")
-        state.deactivate_generation(generation)
-        return
-    except Exception:
-        if not state.is_generation_running(generation):
-            return
-        log.error("❌ WeFlow API 请求异常")
-        state.deactivate_generation(generation)
+    readiness_attempt = 0
+    while state.is_generation_running(generation):
+        readiness_attempt += 1
+        try:
+            response = requests.get(
+                f"{config.WE_FLOW_BASE_URL}/api/v1/messages",
+                params={
+                    "limit": 1,
+                    "access_token": config.ACCESS_TOKEN,
+                },
+                timeout=5,
+            )
+            if not state.is_generation_running(generation):
+                return
+            if response.status_code == 200:
+                log.info("✅ WeFlow API 正常")
+                break
+            if response.status_code == 401:
+                log.error("❌ Access Token 无效")
+                state.deactivate_generation(generation)
+                return
+            if readiness_attempt == 1 or readiness_attempt % 15 == 0:
+                log.warning(
+                    "WeFlow 尚未就绪，2 秒后重试: status=%s",
+                    response.status_code,
+                )
+        except requests.exceptions.RequestException:
+            if not state.is_generation_running(generation):
+                return
+            if readiness_attempt == 1 or readiness_attempt % 15 == 0:
+                log.warning("WeFlow 尚未就绪，2 秒后重试")
+
+        for _ in range(20):
+            if not state.is_generation_running(generation):
+                return
+            time.sleep(0.1)
+
+    if not state.is_generation_running(generation):
         return
 
     while state.is_generation_running(generation):

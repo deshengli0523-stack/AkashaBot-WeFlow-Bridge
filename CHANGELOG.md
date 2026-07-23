@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.6 - 2026-07-23
+
+- Keep the Bridge lifecycle active while WeFlow is still starting and retry the local API every two seconds instead of deactivating after the first connection refusal.
+- Start a fresh AstrBot OneBot client thread for every Bridge lifecycle generation, removing the stale boolean that prevented reconnection after a failed first generation.
+- Preserve immediate stop behavior, treat an invalid WeFlow token as terminal, and rate-limit readiness warnings.
+
+### Automated verification
+
+- Delayed WeFlow readiness, invalid-token shutdown, stop-during-retry, and OneBot thread recreation after restart are covered by lifecycle regression tests.
+
 ## 0.2.5 - 2026-07-23
 
 - Show recent structured inbound and outbound chat records in the local Web panel with complete contact, group member, direction, status, and message body fields.
