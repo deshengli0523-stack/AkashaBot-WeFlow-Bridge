@@ -760,7 +760,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual(
             calls[-1],
             (
-                "http://127.0.0.1:5031/api/v1/messages",
+                "http://127.0.0.1:5031/api/v1/sessions",
                 {
                     "params": {
                         "limit": 1,
