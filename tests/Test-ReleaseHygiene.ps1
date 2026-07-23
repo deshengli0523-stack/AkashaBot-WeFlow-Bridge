@@ -183,9 +183,9 @@ foreach ($file in $zeroHitFiles) {
 
 $placeholderMarker = 'place' + 'holder'
 $expectedPlaceholderLinesText = @'
-        html += '<textarea id="cfg_' + f.key + '" placeholder="' + (f.ph||'') + '" rows="2">' + val + '</textarea>';
-        html += '<input type="number" id="cfg_' + f.key + '" value="' + val + '" placeholder="' + (f.ph||'') + '">';
-        html += '<input type="' + f.type + '" id="cfg_' + f.key + '" value="' + val.replace(/"/g,'&quot;') + '" placeholder="' + (f.ph||'') + '">';
+        html += '<textarea id="cfg_' + f.key + '" placeholder="' + escapeHtml(f.ph||'') + '" rows="2">' + safeVal + '</textarea>';
+        html += '<input type="number" id="cfg_' + f.key + '" value="' + safeVal + '" placeholder="' + escapeHtml(f.ph||'') + '">';
+        html += '<input type="' + f.type + '" id="cfg_' + f.key + '" value="' + safeVal + '" placeholder="' + escapeHtml(f.ph||'') + '">';
 '@
 $expectedPlaceholderHits = @(
   $expectedPlaceholderLinesText.Replace("`r`n", "`n").TrimEnd("`n").Split("`n") |
@@ -761,8 +761,8 @@ foreach ($file in $textFiles) {
 }
 
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
-if ($version -cne '0.2.4') {
-  throw "VERSION must be 0.2.4, found '$version'."
+if ($version -cne '0.2.5') {
+  throw "VERSION must be 0.2.5, found '$version'."
 }
 
 $template = Get-Content -LiteralPath (Join-Path $root 'bridge\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json

@@ -732,7 +732,9 @@ class UiaFixedSenderTests(unittest.TestCase):
         )
 
     def test_submitting_preview_cannot_report_cancelled(self):
-        cancel_event = sender_module.state.begin_send_preview("committed")
+        cancel_event = sender_module.state.begin_send_preview(
+            "target-contact", "committed"
+        )
         preview_id = sender_module.state.get_send_preview()["preview_id"]
 
         self.assertTrue(sender_module.state.try_commit_send(cancel_event))

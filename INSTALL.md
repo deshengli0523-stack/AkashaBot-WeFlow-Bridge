@@ -53,7 +53,7 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 
 `%LOCALAPPDATA%\AkashaBot-WeFlow-Bridge\data\astrbot\FIRST_LOGIN.txt`
 
-打开 `http://127.0.0.1:6185`，使用文件中的初始信息登录，立即修改 AstrBot 密码，并配置模型提供商与 API Key。确认新密码可以登录后安全删除 `FIRST_LOGIN.txt`。桥接面板位于 `http://127.0.0.1:8766`。
+打开 `http://127.0.0.1:6185`，使用文件中的初始信息登录，立即修改 AstrBot 密码，并配置模型提供商与 API Key。确认新密码可以登录后安全删除 `FIRST_LOGIN.txt`。桥接面板位于 `http://127.0.0.1:8766`，会显示最近的完整联系人名称、群聊成员、收发方向和聊天正文。
 
 ## 7. 日常启动、停止与检查
 
@@ -102,7 +102,9 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 
 ## 10. 日志、检测与安全排障
 
-安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`；`data\state` 只用于安装结果与进程诊断，不包含用于定位界面的校准细节。`bridge.log` 默认记录私聊联系人、群名与群成员、收到的完整正文、Bot 尝试发送的完整正文及 `sent`/`failed` 状态；令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。Web 控制面板不会返回 `bridge.log` 原文。
+安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`；`data\state` 只用于安装结果与进程诊断，不包含用于定位界面的校准细节。`bridge.log` 默认记录私聊联系人、群名与群成员、收到的完整正文、Bot 尝试发送的完整正文及 `sent`/`failed` 状态；令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
+
+Web 控制面板只解析结构化 `CHAT` 记录，不返回其他原始运行日志；聊天区域显示完整联系人、群名、群成员、方向、状态和正文。面板及接口只接受 `127.0.0.1` 或 `localhost` 的同源请求。任何能使用当前 Windows 账户打开该面板的人都可能看到聊天内容。
 
 当前 `data\bridge\config.json` 与 `data\backups` 中的配置备份都可能包含敏感校准数据，诊断系统不会收集这些数据。`bridge.log` 也属于本机高敏数据。求助时只能提供经过人工逐行检查、删除联系人、正文、路径和凭据后的少量日志摘录，同时提供固定错误码、失败阶段、组件版本和四项健康检查结果。
 

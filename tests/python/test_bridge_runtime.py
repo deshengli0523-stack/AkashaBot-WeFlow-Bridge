@@ -323,12 +323,232 @@ class BridgeRuntimeTests(unittest.TestCase):
                 pathlib.Path(namespace["PID_FILE"]), state_dir / "bridge.pid"
             )
 
-    def test_web_panel_does_not_return_chat_log_file(self):
-        source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
-        self.assertNotIn("open(config.BRIDGE_LOG_FILE", source)
-        self.assertNotIn('open("bridge.log"', source)
+    def test_web_panel_reads_complete_structured_chat_records(self):
+        private_body = "第一行\n第二行 <script>不能执行</script> " + ("长正文" * 2048)
+        inbound = {
+            "event": "inbound",
+            "scope": "private",
+            "contact": "完整联系人名称",
+            "status": "received",
+            "body": private_body,
+        }
+        outbound = {
+            "event": "outbound",
+            "scope": "group",
+            "contact": "完整群聊名称",
+            "sender": "完整群成员名称",
+            "status": "sent",
+            "body": "Bot 发出的完整正文",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "12:00:00 [INFO] 普通运行日志",
+                        "12:00:01 [INFO] CHAT "
+                        + json.dumps(inbound, ensure_ascii=False, separators=(",", ":")),
+                        "12:00:02 [ERROR] CHAT {malformed-json",
+                        "12:00:03 [INFO] CHAT "
+                        + json.dumps(outbound, ensure_ascii=False, separators=(",", ":")),
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            panel, _, _ = self._load_web_panel(
+                {"schema_version": 1, "completed": False},
+                config_path,
+                log_path,
+            )
+
+            self.assertTrue(
+                hasattr(panel, "_read_chat_records"),
+                "Web panel has no structured chat history reader.",
+            )
+            records = panel._read_chat_records(log_path, limit=100)
+
+        self.assertEqual(
+            records,
+            [
+                {"time": "12:00:01", **inbound},
+                {"time": "12:00:03", **outbound},
+            ],
+        )
+        self.assertEqual(records[0]["contact"], "完整联系人名称")
+        self.assertEqual(records[0]["body"], private_body)
+        self.assertEqual(records[1]["contact"], "完整群聊名称")
+        self.assertEqual(records[1]["sender"], "完整群成员名称")
+        self.assertEqual(records[1]["body"], "Bot 发出的完整正文")
+
+    def test_web_panel_chat_history_api_is_bounded_and_local_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            lines = []
+            for index in range(205):
+                record = {
+                    "event": "inbound" if index % 2 == 0 else "outbound",
+                    "scope": "private",
+                    "contact": f"联系人-{index}",
+                    "status": "received" if index % 2 == 0 else "sent",
+                    "body": f"完整正文-{index}",
+                }
+                lines.append(
+                    f"12:00:{index % 60:02d} [INFO] CHAT "
+                    + json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                )
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            panel, _, _ = self._load_web_panel(
+                {"schema_version": 1, "completed": False},
+                config_path,
+                log_path,
+            )
+            source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
+            self.assertIn(
+                '"/api/chat-history"',
+                source,
+                "Web panel has no chat history API.",
+            )
+
+            response = self._invoke_web_handler(
+                panel, "do_GET", "/api/chat-history?limit=2"
+            )
+            too_large = self._invoke_web_handler(
+                panel, "do_GET", "/api/chat-history?limit=201"
+            )
+            duplicate = self._invoke_web_handler(
+                panel, "do_GET", "/api/chat-history?limit=2&limit=3"
+            )
+
+        self.assertEqual(response["code"], 200)
+        self.assertEqual(
+            [record["contact"] for record in response["data"]["records"]],
+            ["联系人-203", "联系人-204"],
+        )
+        self.assertEqual(
+            [record["body"] for record in response["data"]["records"]],
+            ["完整正文-203", "完整正文-204"],
+        )
+        self.assertEqual(
+            too_large,
+            {
+                "data": {"error": "E_CHAT_HISTORY_REQUEST"},
+                "code": 400,
+            },
+        )
+        self.assertEqual(
+            duplicate,
+            {
+                "data": {"error": "E_CHAT_HISTORY_REQUEST"},
+                "code": 400,
+            },
+        )
         self.assertNotIn("Access-Control-Allow-Origin", source)
-        self.assertIn("不在网页面板显示", source)
+        main_source = (BRIDGE / "main.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'HTTPServer(("127.0.0.1", config.WEB_PORT), WebHandler)',
+            main_source,
+        )
+
+    def test_web_panel_chat_history_rejects_nonlocal_requests_and_fixed_read_errors(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            missing_log = root / "missing" / "bridge.log"
+            panel, _, _ = self._load_web_panel(
+                {"schema_version": 1, "completed": False},
+                config_path,
+                missing_log,
+            )
+
+            bad_host = self._invoke_web_handler(
+                panel,
+                "do_GET",
+                "/api/chat-history",
+                request_headers={"Host": "attacker.example"},
+            )
+            bad_origin = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/pause",
+                request_headers={
+                    "Origin": "https://attacker.example",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+            )
+            missing = self._invoke_web_handler(
+                panel, "do_GET", "/api/chat-history"
+            )
+
+        self.assertEqual(
+            bad_host, {"data": {"error": "E_LOCAL_ONLY"}, "code": 403}
+        )
+        self.assertEqual(
+            bad_origin, {"data": {"error": "E_LOCAL_ONLY"}, "code": 403}
+        )
+        self.assertEqual(
+            missing,
+            {"data": {"error": "E_CHAT_HISTORY_READ"}, "code": 500},
+        )
+        self.assertNotIn(str(missing_log), json.dumps(missing))
+
+    def test_web_panel_chat_history_scan_is_byte_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, _, _ = self._load_web_panel(
+                {"schema_version": 1, "completed": False},
+                config_path,
+                log_path,
+            )
+
+            class CountingStream(io.BytesIO):
+                def __init__(self, value):
+                    super().__init__(value)
+                    self.bytes_read = 0
+
+                def read(self, size=-1):
+                    value = super().read(size)
+                    self.bytes_read += len(value)
+                    return value
+
+            old_record = (
+                b'00:00:00 [INFO] CHAT {"event":"inbound","scope":"private",'
+                b'"contact":"old","status":"received","body":"old"}\n'
+            )
+            stream = CountingStream(
+                old_record
+                + (b"00:00:01 [INFO] ordinary runtime line\n" * 150000)
+            )
+            with mock.patch("builtins.open", return_value=stream):
+                records = panel._read_chat_records("ignored", limit=100)
+
+        self.assertEqual(records, [])
+        self.assertLessEqual(
+            stream.bytes_read,
+            panel._CHAT_LOG_MAX_SCAN_BYTES,
+        )
+
+    def test_web_panel_chat_dom_uses_text_content_and_escapes_config_values(self):
+        source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
+        self.assertIn("meta.textContent =", source)
+        self.assertIn("body.textContent =", source)
+        self.assertNotIn("body.innerHTML", source)
+        self.assertNotIn("meta.innerHTML", source)
+        self.assertIn("var safeVal = escapeHtml(val);", source)
+        self.assertIn("setInterval(refreshChatHistory, 2000)", source)
 
     def _load_web_panel(self, calibration, config_path, log_path):
         state_module = types.ModuleType("state")
@@ -366,6 +586,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         config_module.UIA_FIXED_CALIBRATION = calibration
         config_module.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = 1.0
         config_module.UIA_FIXED_PRE_SEND_DELAY = 10.0
+        config_module.WEB_PORT = 8766
 
         spec = importlib.util.spec_from_file_location(
             "task5_web_panel_under_test",
@@ -383,10 +604,15 @@ class BridgeRuntimeTests(unittest.TestCase):
                 sys.path.remove(str(BRIDGE))
         return panel, state_module, config_module
 
-    def _invoke_web_handler(self, panel, method, path, body=None):
+    def _invoke_web_handler(
+        self, panel, method, path, body=None, request_headers=None
+    ):
         handler = object.__new__(panel.WebHandler)
         handler.path = path
         captured = {}
+        handler.headers = {"Host": "127.0.0.1:8766"}
+        if request_headers:
+            handler.headers.update(request_headers)
 
         def capture(_handler, data, code=200):
             captured["data"] = data
@@ -395,7 +621,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         handler.send_json = types.MethodType(capture, handler)
         if body is not None:
             payload = json.dumps(body).encode("utf-8")
-            handler.headers = {"Content-Length": str(len(payload))}
+            handler.headers["Content-Length"] = str(len(payload))
             handler.rfile = io.BytesIO(payload)
         getattr(handler, method)()
         return captured
@@ -485,7 +711,7 @@ class BridgeRuntimeTests(unittest.TestCase):
                 {"sender_mode": "uia_fixed", "calibrated": False},
             )
 
-    def test_task5_status_keeps_operations_but_exposes_only_safe_sender_metadata(self):
+    def test_task5_status_keeps_operations_without_embedding_chat_history(self):
         invalid = {"schema_version": 1, "completed": True}
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -508,10 +734,13 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertIn("paused", status)
         self.assertIn("ob_connected", status)
         self.assertIn("weflow_connected", status)
-        self.assertIn("log", status)
-        self.assertIn("不在网页面板显示", status["log"])
-        self.assertNotIn("联系人甲", status["log"])
-        self.assertNotIn("不得出现在面板中的正文", status["log"])
+        self.assertNotIn("log", status)
+        self.assertNotIn("chat_history", status)
+        self.assertNotIn("联系人甲", json.dumps(status, ensure_ascii=False))
+        self.assertNotIn(
+            "不得出现在面板中的正文",
+            json.dumps(status, ensure_ascii=False),
+        )
         self.assertNotIn("send_method", status)
         self.assertNotIn("ob_url", status)
         serialized = json.dumps(status).lower()
@@ -539,6 +768,7 @@ class BridgeRuntimeTests(unittest.TestCase):
             )
             state_module.send_preview = {
                 "preview_id": 41,
+                "contact": "完整目标联系人",
                 "content": "待审核正文",
                 "message_type": "text",
                 "stage": "before_paste",
@@ -561,6 +791,9 @@ class BridgeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(status["data"]["send_preview"]["content"], "待审核正文")
         self.assertEqual(
+            status["data"]["send_preview"]["contact"], "完整目标联系人"
+        )
+        self.assertEqual(
             stale, {"data": {"ok": True, "cancelled": False}, "code": 200}
         )
         self.assertEqual(
@@ -569,6 +802,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         )
         source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
         self.assertIn("textContent = preview.content", source)
+        self.assertIn("preview.contact", source)
         self.assertIn("setInterval(refreshDashboard, 500)", source)
 
     def test_task5_config_get_and_post_protect_calibration_and_secrets(self):

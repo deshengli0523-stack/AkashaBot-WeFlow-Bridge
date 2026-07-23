@@ -10,12 +10,147 @@ import json
 import logging
 import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlsplit
 
 import state
 import config
 from uia_support import CalibrationError, validate_calibration
 
 log = logging.getLogger("ob11-bridge")
+
+_CHAT_HISTORY_DEFAULT_LIMIT = 100
+_CHAT_HISTORY_MAX_LIMIT = 200
+_CHAT_LOG_READ_CHUNK = 65536
+_CHAT_LOG_MAX_SCAN_BYTES = 4 * 1024 * 1024
+_CHAT_REQUIRED_FIELDS = {"event", "scope", "contact", "status", "body"}
+_CHAT_ALLOWED_FIELDS = _CHAT_REQUIRED_FIELDS | {"sender"}
+
+
+def _parse_chat_log_line(line: str):
+    marker = "] CHAT "
+    marker_index = line.find(marker)
+    if marker_index < 8:
+        return None
+    recorded_at = line[:8]
+    if (
+        len(recorded_at) != 8
+        or recorded_at[2] != ":"
+        or recorded_at[5] != ":"
+        or not recorded_at.replace(":", "").isdigit()
+    ):
+        return None
+    try:
+        payload = json.loads(line[marker_index + len(marker) :])
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or not _CHAT_REQUIRED_FIELDS.issubset(payload)
+        or not set(payload).issubset(_CHAT_ALLOWED_FIELDS)
+        or any(not isinstance(value, str) for value in payload.values())
+        or payload["event"] not in {"inbound", "outbound"}
+        or payload["scope"] not in {"private", "group"}
+        or payload["status"] not in {"received", "sent", "failed"}
+    ):
+        return None
+    return {"time": recorded_at, **payload}
+
+
+def _read_chat_records(path, limit: int = _CHAT_HISTORY_DEFAULT_LIMIT):
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= _CHAT_HISTORY_MAX_LIMIT
+    ):
+        raise ValueError("invalid chat history limit")
+
+    newest_first = []
+    scanned = 0
+    with open(path, "rb") as stream:
+        stream.seek(0, 2)
+        remaining = stream.tell()
+        pending = b""
+        while (
+            remaining > 0
+            and len(newest_first) < limit
+            and scanned < _CHAT_LOG_MAX_SCAN_BYTES
+        ):
+            read_size = min(
+                _CHAT_LOG_READ_CHUNK,
+                remaining,
+                _CHAT_LOG_MAX_SCAN_BYTES - scanned,
+            )
+            remaining -= read_size
+            scanned += read_size
+            stream.seek(remaining)
+            pending = stream.read(read_size) + pending
+            lines = pending.split(b"\n")
+            pending = lines[0]
+            for raw_line in reversed(lines[1:]):
+                try:
+                    parsed = _parse_chat_log_line(
+                        raw_line.rstrip(b"\r").decode("utf-8")
+                    )
+                except UnicodeDecodeError:
+                    parsed = None
+                if parsed is not None:
+                    newest_first.append(parsed)
+                    if len(newest_first) == limit:
+                        break
+        if remaining == 0 and len(newest_first) < limit and pending:
+            try:
+                parsed = _parse_chat_log_line(
+                    pending.rstrip(b"\r").decode("utf-8")
+                )
+            except UnicodeDecodeError:
+                parsed = None
+            if parsed is not None:
+                newest_first.append(parsed)
+    newest_first.reverse()
+    return newest_first
+
+
+def _local_endpoint(value: str):
+    try:
+        parsed = urlsplit("//" + value)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if host not in {"127.0.0.1", "localhost"}:
+        return None
+    if port is not None and port != int(config.WEB_PORT):
+        return None
+    return host
+
+
+def _request_is_local(handler, *, write: bool = False) -> bool:
+    headers = handler.headers
+    host = _local_endpoint(headers.get("Host", ""))
+    if host is None:
+        return False
+
+    origin = headers.get("Origin", "")
+    if origin:
+        try:
+            parsed_origin = urlsplit(origin)
+            origin_port = parsed_origin.port
+        except ValueError:
+            return False
+        if (
+            parsed_origin.scheme != "http"
+            or (parsed_origin.hostname or "").lower()
+            not in {"127.0.0.1", "localhost"}
+            or (origin_port if origin_port is not None else 80)
+            != int(config.WEB_PORT)
+        ):
+            return False
+
+    if write:
+        fetch_site = headers.get("Sec-Fetch-Site", "")
+        if fetch_site and fetch_site not in {"same-origin", "none"}:
+            return False
+    return True
 
 
 PAGE = """<!DOCTYPE html>
@@ -95,9 +230,17 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
 
 /* ===== 日志 ===== */
 .log-box{flex:1;min-height:100px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;font-size:12px;font-family:'Cascadia Code','Fira Code',monospace;color:#374151;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
-.log-box:empty::before{content:'等待连接...';color:#9ca3af}
+.log-box:empty::before{content:'暂无聊天记录';color:#9ca3af}
 .log-box::-webkit-scrollbar{width:4px}
 .log-box::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:4px}
+.chat-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:13px;font-weight:650}
+.chat-heading .privacy-note{font-size:11px;font-weight:400;color:var(--muted)}
+.chat-entry{padding:10px 0;border-bottom:1px solid var(--line)}
+.chat-entry:last-child{border-bottom:none}
+.chat-meta{font-family:-apple-system,'Segoe UI',sans-serif;font-size:12px;font-weight:650;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.chat-meta.outbound{color:#047857}
+.chat-meta.failed{color:#b91c1c}
+.chat-body{margin-top:4px;font-family:-apple-system,'Segoe UI',sans-serif;font-size:14px;line-height:1.55;color:#1f2937;white-space:pre-wrap;overflow-wrap:anywhere}
 
 /* ===== 设置页面 ===== */
 .settings-scroll{flex:1;overflow-y:auto;padding-right:4px}
@@ -178,7 +321,11 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
       <button class="btn btn-outline" id="btnToggleMode" style="padding:5px 14px;font-size:12px">切换</button>
     </div>
 
-    <div class="log-box" id="log">等待连接...</div>
+    <div class="chat-heading">
+      <span>完整聊天记录</span>
+      <span class="privacy-note">包含联系人名称和收发正文，仅限本机查看</span>
+    </div>
+    <div class="log-box" id="chatHistory"></div>
   </div>
 
   <!-- ===== 设置页 ===== -->
@@ -215,6 +362,12 @@ function showMsg(text) {
   el.textContent = text;
   el.className = 'save-msg show';
   setTimeout(function(){el.className='save-msg'}, 2500);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, function(character) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character];
+  });
 }
 
 // ===== Tab 切换 =====
@@ -259,6 +412,9 @@ function refreshDashboard() {
       if (typeof preview.remaining_seconds === 'number' && preview.stage !== 'submitting') {
         previewTitle += '（约 ' + preview.remaining_seconds.toFixed(1) + ' 秒）';
       }
+      if (typeof preview.contact === 'string' && preview.contact) {
+        previewTitle += ' → ' + preview.contact;
+      }
       document.getElementById('sendPreviewTitle').textContent = previewTitle;
       document.getElementById('sendPreviewContent').textContent = preview.content;
     } else {
@@ -282,10 +438,45 @@ function refreshDashboard() {
 
     document.getElementById('modeStatus').textContent = modeMap[s.group_reply_mode] || s.group_reply_mode;
 
-    var logEl = document.getElementById('log');
-    var isAtBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
-    logEl.textContent = s.log || '';
-    if (isAtBottom) logEl.scrollTop = logEl.scrollHeight;
+  });
+}
+
+function refreshChatHistory() {
+  fetch('/api/chat-history?limit=100').then(function(r){
+    if (!r.ok) throw new Error('E_CHAT_HISTORY_READ');
+    return r.json();
+  }).then(function(result){
+    var history = document.getElementById('chatHistory');
+    var isAtBottom = history.scrollHeight - history.scrollTop - history.clientHeight < 40;
+    var fragment = document.createDocumentFragment();
+    (Array.isArray(result.records) ? result.records : []).forEach(function(record){
+      var entry = document.createElement('div');
+      entry.className = 'chat-entry';
+
+      var meta = document.createElement('div');
+      meta.className = 'chat-meta ' + (record.event === 'outbound' ? 'outbound' : 'inbound');
+      if (record.status === 'failed') meta.className += ' failed';
+      var direction = record.event === 'outbound' ? 'Bot 发出 → ' : '收到 ← ';
+      var identity = String(record.contact || '未知联系人');
+      if (record.scope === 'group' && record.sender) {
+        identity += ' · ' + String(record.sender);
+      }
+      var status = record.status === 'failed' ? '（失败）' : '';
+      meta.textContent = String(record.time || '') + '  ' + direction + identity + status;
+
+      var body = document.createElement('div');
+      body.className = 'chat-body';
+      body.textContent = String(record.body === undefined ? '' : record.body);
+
+      entry.appendChild(meta);
+      entry.appendChild(body);
+      fragment.appendChild(entry);
+    });
+    history.replaceChildren(fragment);
+    if (isAtBottom) history.scrollTop = history.scrollHeight;
+  }).catch(function(){
+    var history = document.getElementById('chatHistory');
+    if (!history.childNodes.length) history.textContent = '聊天记录读取失败';
   });
 }
 
@@ -360,17 +551,18 @@ function renderConfigForm(cfg) {
     g.fields.forEach(function(f){
       var val = cfg[f.key] !== undefined ? cfg[f.key] : '';
       if (Array.isArray(val)) val = val.join(', ');
+      var safeVal = escapeHtml(val);
       html += '<div class="settings-field"><label>' + f.label + '</label>';
       if (f.type === 'select') {
         html += '<select id="cfg_' + f.key + '">';
         f.opts.forEach(function(o){html += '<option value="' + o.v + '"' + (val==o.v?' selected':'') + '>' + o.l + '</option>'});
         html += '</select>';
       } else if (f.type === 'textarea') {
-        html += '<textarea id="cfg_' + f.key + '" placeholder="' + (f.ph||'') + '" rows="2">' + val + '</textarea>';
+        html += '<textarea id="cfg_' + f.key + '" placeholder="' + escapeHtml(f.ph||'') + '" rows="2">' + safeVal + '</textarea>';
       } else if (f.type === 'number') {
-        html += '<input type="number" id="cfg_' + f.key + '" value="' + val + '" placeholder="' + (f.ph||'') + '">';
+        html += '<input type="number" id="cfg_' + f.key + '" value="' + safeVal + '" placeholder="' + escapeHtml(f.ph||'') + '">';
       } else {
-        html += '<input type="' + f.type + '" id="cfg_' + f.key + '" value="' + val.replace(/"/g,'&quot;') + '" placeholder="' + (f.ph||'') + '">';
+        html += '<input type="' + f.type + '" id="cfg_' + f.key + '" value="' + safeVal + '" placeholder="' + escapeHtml(f.ph||'') + '">';
       }
       html += '</div>';
     });
@@ -412,7 +604,9 @@ function saveConfig() {
 
 // ===== 初始化 =====
 refreshDashboard();
+refreshChatHistory();
 setInterval(refreshDashboard, 500);
+setInterval(refreshChatHistory, 2000);
 </script>
 </body>
 </html>"""
@@ -489,7 +683,11 @@ def _merge_public_config(
 
 class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/status":
+        if not _request_is_local(self):
+            self.send_json({"error": "E_LOCAL_ONLY"}, 403)
+            return
+        request = urlsplit(self.path)
+        if request.path == "/status":
             ob_connected = state._ob_ws is not None and state._ob_ws_ready.is_set()
             weflow_connected = state.bridge_instance is not None and state.bridge_instance._sse_session is not None
             status = {
@@ -499,15 +697,30 @@ class WebHandler(BaseHTTPRequestHandler):
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
                 "send_preview": state.get_send_preview(),
-                "log": (
-                    "bridge.log 已记录完整联系人和聊天正文。"
-                    "出于安全考虑，不在网页面板显示；"
-                    "请仅在本机 data\\logs\\bridge.log 中查看。"
-                ),
             }
             status.update(_sender_status())
             self.send_json(status)
-        elif self.path == "/api/config":
+        elif request.path == "/api/chat-history":
+            try:
+                query = parse_qs(request.query, keep_blank_values=True)
+                if set(query) - {"limit"}:
+                    raise ValueError("unsupported chat history parameter")
+                submitted_limit = query.get(
+                    "limit", [str(_CHAT_HISTORY_DEFAULT_LIMIT)]
+                )
+                if (
+                    len(submitted_limit) != 1
+                    or not submitted_limit[0].isdigit()
+                ):
+                    raise ValueError("invalid chat history limit")
+                limit = int(submitted_limit[0])
+                records = _read_chat_records(config.BRIDGE_LOG_FILE, limit)
+                self.send_json({"records": records})
+            except ValueError:
+                self.send_json({"error": "E_CHAT_HISTORY_REQUEST"}, 400)
+            except OSError:
+                self.send_json({"error": "E_CHAT_HISTORY_READ"}, 500)
+        elif request.path == "/api/config":
             try:
                 with open(config.CONFIG_FILE, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
@@ -522,23 +735,27 @@ class WebHandler(BaseHTTPRequestHandler):
             self.wfile.write(PAGE.encode("utf-8"))
 
     def do_POST(self):
-        if self.path == "/start":
+        if not _request_is_local(self, write=True):
+            self.send_json({"error": "E_LOCAL_ONLY"}, 403)
+            return
+        request_path = urlsplit(self.path).path
+        if request_path == "/start":
             from main import _start_bridge
             _start_bridge()
             self.send_json({"ok": True})
-        elif self.path == "/stop":
+        elif request_path == "/stop":
             from main import _stop_bridge
             _stop_bridge()
             self.send_json({"ok": True})
-        elif self.path == "/pause":
+        elif request_path == "/pause":
             state.paused.set()
             log.info("[Web] 已暂停")
             self.send_json({"ok": True})
-        elif self.path == "/resume":
+        elif request_path == "/resume":
             state.paused.clear()
             log.info("[Web] 已恢复")
             self.send_json({"ok": True})
-        elif self.path == "/cancel-current":
+        elif request_path == "/cancel-current":
             try:
                 payload = self.read_json_body(1024)
                 if (
@@ -553,7 +770,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "cancelled": cancelled})
             except Exception:
                 self.send_json({"ok": False, "error": "E_CANCEL_REQUEST"}, 400)
-        elif self.path == "/mode":
+        elif request_path == "/mode":
             mode_order = ["mention", "all", "batch"]
             idx = mode_order.index(state.group_reply_mode) if state.group_reply_mode in mode_order else -1
             new_mode = mode_order[(idx + 1) % len(mode_order)]
@@ -569,7 +786,7 @@ class WebHandler(BaseHTTPRequestHandler):
             except Exception:
                 log.error("[Web] 保存配置失败")
             self.send_json({"ok": True, "group_reply_mode": new_mode})
-        elif self.path == "/api/config":
+        elif request_path == "/api/config":
             try:
                 new_cfg = self.read_json_body(65536)
 

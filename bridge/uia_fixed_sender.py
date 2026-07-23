@@ -187,7 +187,7 @@ class UiaFixedSender:
             if not state.running or self._stopped.is_set():
                 log.info("[UIA_FIXED] text send skipped while stopped")
                 return False
-            cancel_event = state.begin_send_preview(text)
+            cancel_event = state.begin_send_preview(contact, text)
             hwnd = None
             pasted = False
             committed = False
