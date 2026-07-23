@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.4 - 2026-07-23
+
+- Pre-confirm the installer-owned AstrBot data directory before running `astrbot init`, removing the interactive confirmation that rejected PowerShell's BOM-prefixed standard input on clean computers.
+- Keep native environment output out of the installer return object so a completed calibration-required install exits successfully instead of printing a false `E_INSTALL_FAILED`.
+- Preserve fresh-install ownership checks, rollback cleanup, generated dashboard credentials, and repeat-install behavior.
+
+### Automated verification
+
+- Fresh initialization now verifies that AstrBot's directory marker exists before the initializer runs.
+- Installer regression coverage verifies that native environment output cannot escape into the final structured install result.
+
 ## 0.2.3 - 2026-07-23
 
 - Wait for the aggregate service health check to become ready after installation instead of failing on the first startup probe.

@@ -352,6 +352,7 @@ function New-AstrBotInitializerState {
     WorkingDirectory = ''
     Password = ''
     OwnershipMarkers = 0
+    AstrBotMarkerBeforeCall = $false
     ThrowAfterCreate = $false
     SkipConfig = $false
     InvalidSchema = $false
@@ -373,6 +374,7 @@ function New-AstrBotInitializer {
     $State.WorkingDirectory = (Get-Location).Path
     $State.Password = [string]$env:ASTRBOT_DASHBOARD_INITIAL_PASSWORD
     $State.OwnershipMarkers = @(Get-ChildItem -LiteralPath $astrBotRoot -Force -Filter '.akasha-ownership-*.tmp').Count
+    $State.AstrBotMarkerBeforeCall = Test-Path -LiteralPath (Join-Path $astrBotRoot '.astrbot') -PathType Leaf
     New-Item -ItemType Directory -Force -Path (Join-Path $astrBotRoot 'data') | Out-Null
     New-Item -ItemType File -Force -Path (Join-Path $astrBotRoot '.astrbot') | Out-Null
     if ($State.ThrowAfterCreate) {
@@ -950,6 +952,7 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal $freshState.Root $fresh.Paths.AstrBotData 'AstrBot initializer used the wrong data root.'
   Assert-Equal $freshState.WorkingDirectory $fresh.Paths.AstrBotData 'AstrBot initializer used the wrong working directory.'
   Assert-Equal $freshState.OwnershipMarkers 1 'Fresh AstrBot initialization did not hold exactly one ownership marker.'
+  Assert-True $freshState.AstrBotMarkerBeforeCall 'Fresh AstrBot initialization did not pre-confirm the installer-owned directory before invoking the noninteractive CLI.'
   Assert-True ($freshState.Password.Length -ge 16) 'AstrBot initializer did not receive a generated dashboard password.'
   Assert-True (-not (Test-Path Env:\ASTRBOT_DASHBOARD_INITIAL_PASSWORD)) 'Fresh success left the dashboard password environment variable set.'
   Assert-True (-not $freshConsole.Contains($freshState.Password)) 'Dashboard password appeared in console output.'

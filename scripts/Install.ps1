@@ -719,7 +719,7 @@ function Invoke-AkashaInstall {
     Write-AkashaInstallLog -Paths $paths -Message 'phase=payload status=started'
     Install-AkashaPayload -SourceRoot $sourceContext.RootPath -Paths $paths -Payload $payload -ReplacementHook $ReplacementHook
     Write-AkashaInstallLog -Paths $paths -Message 'phase=payload status=completed'
-    & $EnvironmentInitializer $paths $python
+    & $EnvironmentInitializer $paths $python | Out-Null
     Write-AkashaInstallLog -Paths $paths -Message 'phase=environments status=completed'
 
     if ([string]::IsNullOrWhiteSpace([string]$weFlowExecutable)) {
