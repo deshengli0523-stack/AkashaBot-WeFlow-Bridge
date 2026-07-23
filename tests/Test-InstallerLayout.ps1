@@ -92,6 +92,7 @@ function New-TestBoundaries {
     [object[]]$Discoveries,
     [int]$PackageExitCode = 0,
     [int]$HealthExitCode = 0,
+    [int[]]$HealthExitCodes = @(),
     [AllowNull()][string]$SelectedInstaller = $null,
     [AllowNull()][object]$CalibrationStatus = 'required'
   )
@@ -99,6 +100,8 @@ function New-TestBoundaries {
   $state = [pscustomobject]@{
     Calls = New-Object System.Collections.Generic.List[string]
     Discoveries = New-Object 'System.Collections.Generic.Queue[object]'
+    HealthExitCodes = New-Object 'System.Collections.Generic.Queue[int]'
+    MonotonicMilliseconds = [long]0
     ShortcutEntries = @()
     PackageExitCode = $PackageExitCode
     HealthExitCode = $HealthExitCode
@@ -107,6 +110,7 @@ function New-TestBoundaries {
     LockSeenByStarter = $true
   }
   foreach ($value in @($Discoveries)) { $state.Discoveries.Enqueue($value) }
+  foreach ($value in @($HealthExitCodes)) { $state.HealthExitCodes.Enqueue([int]$value) }
 
   $prerequisite = {
     param($paths)
@@ -149,7 +153,16 @@ function New-TestBoundaries {
   $health = {
     param($installRoot)
     $state.Calls.Add('health')
+    if ($state.HealthExitCodes.Count -gt 0) { return $state.HealthExitCodes.Dequeue() }
     return $state.HealthExitCode
+  }.GetNewClosure()
+  $healthSleeper = {
+    param($milliseconds)
+    $state.Calls.Add('health-delay:' + [int]$milliseconds)
+    $state.MonotonicMilliseconds += [long]$milliseconds
+  }.GetNewClosure()
+  $monotonicMillisecondsReader = {
+    return [long]$state.MonotonicMilliseconds
   }.GetNewClosure()
   $calibrationStatusReader = {
     param($configPath)
@@ -167,6 +180,8 @@ function New-TestBoundaries {
     Shortcuts = $shortcuts
     Starter = $starter
     Health = $health
+    HealthSleeper = $healthSleeper
+    MonotonicMillisecondsReader = $monotonicMillisecondsReader
     CalibrationStatusReader = $calibrationStatusReader
   }
 }
@@ -180,7 +195,9 @@ function Invoke-TestInstall {
     [switch]$SkipStart,
     [scriptblock]$ReplacementHook,
     [string]$SourceRoot = $root,
-    [scriptblock]$CalibrationStatusReader
+    [scriptblock]$CalibrationStatusReader,
+    [int]$HealthReadyTimeoutMilliseconds = 14,
+    [int]$HealthRetryDelayMilliseconds = 7
   )
   $arguments = @{
     InstallRoot = $InstallRoot
@@ -196,6 +213,10 @@ function Invoke-TestInstall {
     ShortcutCreator = $Boundaries.Shortcuts
     ServiceStarter = $Boundaries.Starter
     HealthChecker = $Boundaries.Health
+    HealthReadyTimeoutMilliseconds = $HealthReadyTimeoutMilliseconds
+    HealthRetryDelayMilliseconds = $HealthRetryDelayMilliseconds
+    HealthRetrySleeper = $Boundaries.HealthSleeper
+    HealthMonotonicMillisecondsReader = $Boundaries.MonotonicMillisecondsReader
     CalibrationStatusReader = if ($null -ne $CalibrationStatusReader) { $CalibrationStatusReader } else { $Boundaries.CalibrationStatusReader }
     SkipStart = $SkipStart
   }
@@ -267,6 +288,39 @@ foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop)) {
 
 . (Join-Path $root 'scripts\Install.ps1')
 Assert-True ($null -ne (Get-Command Invoke-AkashaInstall -ErrorAction SilentlyContinue)) 'Dot-sourcing did not expose Invoke-AkashaInstall.'
+Assert-True ($null -ne (Get-Command Wait-AkashaInstallHealth -ErrorAction SilentlyContinue)) 'Installer does not expose bounded service-readiness polling.'
+
+$transientHealth = New-TestBoundaries -Discoveries @() -HealthExitCodes @(1, 1, 0)
+$transientHealthResult = Wait-AkashaInstallHealth -InstallRoot $root -HealthChecker $transientHealth.Health -TimeoutMilliseconds 28 -RetryDelayMilliseconds 7 -Sleeper $transientHealth.HealthSleeper -MonotonicMillisecondsReader $transientHealth.MonotonicMillisecondsReader
+Assert-Equal $transientHealthResult.ExitCode 0 'Readiness polling rejected services that became healthy before the deadline.'
+Assert-Equal $transientHealthResult.Attempts 3 'Readiness polling reported the wrong successful attempt.'
+Assert-SequenceEqual @($transientHealth.State.Calls) @('health', 'health-delay:7', 'health', 'health-delay:7', 'health') 'Readiness polling changed retry order or delay placement.'
+
+$persistentHealth = New-TestBoundaries -Discoveries @() -HealthExitCode 1
+$persistentHealthResult = Wait-AkashaInstallHealth -InstallRoot $root -HealthChecker $persistentHealth.Health -TimeoutMilliseconds 22 -RetryDelayMilliseconds 11 -Sleeper $persistentHealth.HealthSleeper -MonotonicMillisecondsReader $persistentHealth.MonotonicMillisecondsReader
+Assert-Equal $persistentHealthResult.ExitCode 1 'Readiness polling accepted services that never became healthy.'
+Assert-Equal $persistentHealthResult.Attempts 3 'Readiness polling did not stop at the deadline.'
+Assert-SequenceEqual @($persistentHealth.State.Calls) @('health', 'health-delay:11', 'health', 'health-delay:11', 'health') 'Readiness timeout slept after the final failed attempt or skipped a bounded retry.'
+
+$lateHealth = New-TestBoundaries -Discoveries @()
+$lateHealthChecker = {
+  param($installRoot)
+  $lateHealth.State.Calls.Add('health')
+  $lateHealth.State.MonotonicMilliseconds = 29
+  return 0
+}.GetNewClosure()
+$lateHealthResult = Wait-AkashaInstallHealth -InstallRoot $root -HealthChecker $lateHealthChecker -TimeoutMilliseconds 28 -RetryDelayMilliseconds 7 -Sleeper $lateHealth.HealthSleeper -MonotonicMillisecondsReader $lateHealth.MonotonicMillisecondsReader
+Assert-Equal $lateHealthResult.ExitCode 1 'Readiness polling accepted a health probe that completed after the deadline.'
+Assert-Equal $lateHealthResult.Attempts 1 'Late health success triggered an unexpected retry.'
+Assert-SequenceEqual @($lateHealth.State.Calls) @('health') 'Late health success slept or ran more than one probe.'
+
+$stalledClockHealth = New-TestBoundaries -Discoveries @() -HealthExitCode 1
+$stalledClockReader = { return [long]0 }
+$stalledClockResult = Wait-AkashaInstallHealth -InstallRoot $root -HealthChecker $stalledClockHealth.Health -TimeoutMilliseconds 22 -RetryDelayMilliseconds 11 -Sleeper $stalledClockHealth.HealthSleeper -MonotonicMillisecondsReader $stalledClockReader
+Assert-Equal $stalledClockResult.ExitCode 1 'Readiness polling accepted unhealthy services while the monotonic clock was stalled.'
+Assert-Equal $stalledClockResult.Attempts 3 'Readiness polling did not apply its defensive attempt bound while the monotonic clock was stalled.'
+Assert-SequenceEqual @($stalledClockHealth.State.Calls) @('health', 'health-delay:11', 'health', 'health-delay:11', 'health') 'Stalled-clock readiness polling did not stop at its defensive attempt bound.'
+
 $payload = @(Get-AkashaInstallPayload)
 Assert-Equal $payload.Count 30 'Installed payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 14 'Bridge payload count changed.'
@@ -664,6 +718,14 @@ exit 0
   $readyLog = Get-Content -LiteralPath (Join-Path $defaultRoot 'data\logs\install.log') -Raw -Encoding UTF8
   Assert-True ($readyLog -match 'calibration_required=false') 'Ready install log omitted the boolean calibration state.'
 
+  $transientReadyRoot = Join-Path $fixtureRoot 'transient readiness success'
+  $transientReady = New-TestBoundaries -Discoveries @($weFlowExe) -HealthExitCodes @(1, 0) -CalibrationStatus 'ready'
+  $transientReadyResult = Invoke-TestInstall -InstallRoot $transientReadyRoot -WeFlowConfigPath $weFlowConfig -Boundaries $transientReady
+  Assert-True $transientReadyResult.Started 'Transient readiness install did not report service start.'
+  Assert-SequenceEqual @($transientReady.State.Calls | Select-Object -Last 5) @('calibration', 'start', 'health', 'health-delay:7', 'health') 'Installer did not retry a transient aggregate health failure after service start.'
+  $transientReadyLog = Get-Content -LiteralPath (Join-Path $transientReadyRoot 'data\logs\install.log') -Raw -Encoding UTF8
+  Assert-True ($transientReadyLog -match 'phase=health status=completed attempts=2') 'Transient readiness success did not record the successful attempt count.'
+
   foreach ($unsupportedCase in @(
       [pscustomobject]@{ Name = 'unknown'; Value = 'unsupported' },
       [pscustomobject]@{ Name = 'wrong-case'; Value = 'READY' },
@@ -683,8 +745,9 @@ exit 0
   $healthFailRoot = Join-Path $fixtureRoot 'aggregate health failure'
   $healthFail = New-TestBoundaries -Discoveries @($weFlowExe) -HealthExitCode 1 -CalibrationStatus 'ready'
   Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $healthFailRoot -WeFlowConfigPath $weFlowConfig -Boundaries $healthFail } 'E_HEALTH_FAILED:*' 'Aggregate health failure was accepted.' | Out-Null
-  Assert-SequenceEqual @($healthFail.State.Calls | Select-Object -Last 2) @('start', 'health') 'Health failure skipped start or health.'
+  Assert-SequenceEqual @($healthFail.State.Calls | Select-Object -Last 5) @('health', 'health-delay:7', 'health', 'health-delay:7', 'health') 'Persistent health failure did not exhaust the bounded readiness attempts.'
   Assert-Equal (Get-Content -LiteralPath (Join-Path $healthFailRoot 'data\state\install.json') -Raw -Encoding UTF8 | ConvertFrom-Json).status 'installed' 'Health failure falsified completed installation state.'
+  Assert-True ((Get-Content -LiteralPath (Join-Path $healthFailRoot 'data\logs\install.log') -Raw -Encoding UTF8) -match 'phase=health status=failed attempts=3 code=E_HEALTH_FAILED') 'Persistent readiness failure did not record its bounded timeout.'
 
   $directSourceMissing = Join-Path $fixtureRoot 'missing direct source'
   $directRoot = Join-Path $fixtureRoot 'direct install root with spaces'

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 - 2026-07-23
+
+- Wait for the aggregate service health check to become ready after installation instead of failing on the first startup probe.
+- Stop starting new readiness probes after a 90-second monotonic retry deadline, wait for the current probe to finish, and retry at two-second intervals.
+- Record readiness start, completion, failure, and attempt counts in `install.log` while preserving the one-shot behavior of the standalone health launcher.
+
+### Automated verification
+
+- Immediate readiness, delayed readiness, deadline exhaustion, retry order, attempt logging, and the preserved installed state after a health timeout are covered by installer-layout regression tests.
+
 ## 0.2.2 - 2026-07-23
 
 - Preserve the latest structured chat logging and resumable pre-send review queue from `0.2.1`.

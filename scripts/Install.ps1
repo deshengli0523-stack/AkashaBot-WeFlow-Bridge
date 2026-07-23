@@ -566,6 +566,61 @@ function Get-AkashaInstallErrorCode {
   return 'E_INSTALL_FAILED'
 }
 
+function Wait-AkashaInstallHealth {
+  param(
+    [Parameter(Mandatory)][string]$InstallRoot,
+    [Parameter(Mandatory)][scriptblock]$HealthChecker,
+    [ValidateRange(1, 3600000)][int]$TimeoutMilliseconds = 90000,
+    [ValidateRange(1, 60000)][int]$RetryDelayMilliseconds = 2000,
+    [scriptblock]$Sleeper,
+    [scriptblock]$MonotonicMillisecondsReader
+  )
+
+  if ($null -eq $Sleeper) {
+    $Sleeper = { param($milliseconds) Start-Sleep -Milliseconds $milliseconds }
+  }
+  if ($null -eq $MonotonicMillisecondsReader) {
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $MonotonicMillisecondsReader = { return [long]$stopwatch.ElapsedMilliseconds }.GetNewClosure()
+  }
+
+  $attempts = 0
+  try {
+    $startedAt = [long](& $MonotonicMillisecondsReader)
+  } catch {
+    return [pscustomobject]@{ ExitCode = 1; Attempts = $attempts }
+  }
+  $deadline = $startedAt + [long]$TimeoutMilliseconds
+  $maximumAttempts = [int][System.Math]::Ceiling([double]$TimeoutMilliseconds / [double]$RetryDelayMilliseconds) + 1
+
+  while ($attempts -lt $maximumAttempts) {
+    $attempts++
+    try {
+      $healthCode = [int](& $HealthChecker $InstallRoot)
+    } catch {
+      $healthCode = 1
+    }
+    try {
+      $now = [long](& $MonotonicMillisecondsReader)
+    } catch {
+      break
+    }
+    if ($healthCode -eq 0 -and $now -le $deadline) {
+      return [pscustomobject]@{ ExitCode = 0; Attempts = $attempts }
+    }
+    if ($now -ge $deadline -or $attempts -ge $maximumAttempts) { break }
+    $delay = [int][System.Math]::Min([long]$RetryDelayMilliseconds, $deadline - $now)
+    if ($delay -le 0) { break }
+    try {
+      & $Sleeper $delay
+    } catch {
+      break
+    }
+  }
+
+  return [pscustomobject]@{ ExitCode = 1; Attempts = $attempts }
+}
+
 function Invoke-AkashaInstall {
   param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'AkashaBot-WeFlow-Bridge'),
@@ -582,6 +637,10 @@ function Invoke-AkashaInstall {
     [scriptblock]$ShortcutCreator,
     [scriptblock]$ServiceStarter,
     [scriptblock]$HealthChecker,
+    [ValidateRange(1, 3600000)][int]$HealthReadyTimeoutMilliseconds = 90000,
+    [ValidateRange(1, 60000)][int]$HealthRetryDelayMilliseconds = 2000,
+    [scriptblock]$HealthRetrySleeper,
+    [scriptblock]$HealthMonotonicMillisecondsReader,
     [scriptblock]$CalibrationStatusReader,
     [scriptblock]$ReplacementHook
   )
@@ -727,8 +786,13 @@ function Invoke-AkashaInstall {
 
   if ($startAfterUnlock) {
     & $ServiceStarter $paths.Root
-    $healthCode = [int](& $HealthChecker $paths.Root)
-    if ($healthCode -ne 0) { throw 'E_HEALTH_FAILED: One or more services failed the aggregate health check.' }
+    Write-AkashaInstallLog -Paths $paths -Message ('phase=health status=started timeout_ms=' + $HealthReadyTimeoutMilliseconds + ' interval_ms=' + $HealthRetryDelayMilliseconds)
+    $healthResult = Wait-AkashaInstallHealth -InstallRoot $paths.Root -HealthChecker $HealthChecker -TimeoutMilliseconds $HealthReadyTimeoutMilliseconds -RetryDelayMilliseconds $HealthRetryDelayMilliseconds -Sleeper $HealthRetrySleeper -MonotonicMillisecondsReader $HealthMonotonicMillisecondsReader
+    if ([int]$healthResult.ExitCode -ne 0) {
+      Write-AkashaInstallLog -Paths $paths -Level 'error' -Message ('phase=health status=failed attempts=' + [int]$healthResult.Attempts + ' code=E_HEALTH_FAILED')
+      throw 'E_HEALTH_FAILED: One or more services failed the aggregate health check.'
+    }
+    Write-AkashaInstallLog -Paths $paths -Message ('phase=health status=completed attempts=' + [int]$healthResult.Attempts)
   }
   return [pscustomobject]@{
     Status = 'installed'
