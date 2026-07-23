@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.5 - 2026-07-23
+
+- Show recent structured inbound and outbound chat records in the local Web panel with complete contact, group member, direction, status, and message body fields.
+- Include the complete target contact in the live outbound review preview.
+- Keep the chat endpoint separate from the 500 ms status poll, bound backward log scanning, and reject non-loopback Host or cross-origin write requests.
+- Render chat data through DOM text nodes and escape configuration values before inserting the settings form HTML.
+
+### Automated verification
+
+- Chat history parsing, long Unicode and multiline bodies, bounded limits and scanning, fixed read errors, loopback request checks, safe DOM rendering, and contact-aware send previews are covered by regression tests.
+
 ## 0.2.4 - 2026-07-23
 
 - Pre-confirm the installer-owned AstrBot data directory before running `astrbot init`, removing the interactive confirmation that rejected PowerShell's BOM-prefixed standard input on clean computers.

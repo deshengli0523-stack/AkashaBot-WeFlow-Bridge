@@ -57,7 +57,7 @@ current_send_preview: Optional[dict[str, object]] = None
 send_preview_sequence = 0
 
 
-def begin_send_preview(content: str) -> threading.Event:
+def begin_send_preview(contact: str, content: str) -> threading.Event:
     """Publish one text item before any WeChat input is touched."""
     global current_send_cancel_event, current_send_preview, send_preview_sequence
     cancel_event = threading.Event()
@@ -66,6 +66,7 @@ def begin_send_preview(content: str) -> threading.Event:
         current_send_cancel_event = cancel_event
         current_send_preview = {
             "preview_id": send_preview_sequence,
+            "contact": str(contact),
             "content": str(content),
             "message_type": "text",
             "stage": "before_paste",
