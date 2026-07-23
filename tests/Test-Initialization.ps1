@@ -972,10 +972,40 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-True ([bool]$freshAstr.platform_settings.segmented_reply.only_llm_result) 'AstrBot segmented reply is not limited to LLM results.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval_method) 'random' 'AstrBot segmented interval method is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval) '0.8,1.8' 'AstrBot segmented interval is wrong.'
-  Assert-Equal ([int]$freshAstr.platform_settings.segmented_reply.words_count_threshold) 5000 'AstrBot segmented threshold is wrong.'
+  Assert-Equal ([int]$freshAstr.platform_settings.segmented_reply.words_count_threshold) 2147483647 'AstrBot segmented threshold is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.split_mode) 'regex' 'AstrBot segmented split mode is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,44}?(?:[\u3002\uff1f\uff01~\u2026\uff1b]+|[!?;]+|(?<!\d)\.(?!\d)|\r?\n+)|.{1,45}' 'AstrBot segmented regex is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '[\r\n\t\u3000]+|(?<=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001]) +| +(?=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001])' 'AstrBot content cleanup rule is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,14}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,15}' 'AstrBot segmented regex is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '\s+' 'AstrBot content cleanup rule is wrong.'
+  $segmentPattern = [string]$freshAstr.platform_settings.segmented_reply.regex
+  $segmentCleanupPattern = [string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule
+  $segmentOptions = [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::Multiline
+  $fullWidthSpace = [string][char]0x3000
+  $chineseQuestion = [string][char]0xff1f
+  $chineseExclamation = [string][char]0xff01
+  $punctuationRun = $chineseQuestion + $chineseExclamation
+  $segmentCases = @(
+    [pscustomobject]@{ Name = 'ordinary spaces'; Input = 'alpha beta'; Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'full-width spaces'; Input = ('alpha' + $fullWidthSpace + 'beta'); Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'tabs'; Input = "alpha`tbeta"; Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'blank lines'; Input = "alpha`r`n`r`nbeta"; Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'punctuation runs'; Input = ('hello' + $punctuationRun + ' next'); Expected = @(('hello' + $punctuationRun), 'next') },
+    [pscustomobject]@{ Name = 'decimal points'; Input = 'version3.14stable'; Expected = @('version3.14stab', 'le') },
+    [pscustomobject]@{ Name = 'strict fifteen character cap'; Input = 'abcdefghijklmnop'; Expected = @('abcdefghijklmno', 'p') }
+  )
+  foreach ($segmentCase in $segmentCases) {
+    $actualSegments = @(
+      [regex]::Matches($segmentCase.Input, $segmentPattern, $segmentOptions) | ForEach-Object {
+        $segment = [regex]::Replace($_.Value, $segmentCleanupPattern, '').Trim()
+        if ($segment.Length -gt 0) {
+          $segment
+        }
+      }
+    )
+    Assert-Equal ($actualSegments -join '|') ($segmentCase.Expected -join '|') "AstrBot segmented reply failed the $($segmentCase.Name) case."
+    foreach ($actualSegment in $actualSegments) {
+      Assert-True ($actualSegment.Length -le 15) "AstrBot segmented reply exceeded 15 characters in the $($segmentCase.Name) case."
+    }
+  }
   Assert-Equal @($freshAstr.platform).Count 1 'AstrBot platform count is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].id) 'akasha_ob11' 'AstrBot platform id is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].type) 'aiocqhttp' 'AstrBot platform type is wrong.'

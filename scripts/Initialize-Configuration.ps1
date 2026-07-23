@@ -563,9 +563,9 @@ function Initialize-AkashaConfiguration {
       Set-JsonProperty -Object $segmentedReply -Name 'interval_method' -Value 'random'
       Set-JsonProperty -Object $segmentedReply -Name 'interval' -Value '0.8,1.8'
       Set-JsonProperty -Object $segmentedReply -Name 'log_base' -Value 2.6
-      Set-JsonProperty -Object $segmentedReply -Name 'words_count_threshold' -Value 5000
+      Set-JsonProperty -Object $segmentedReply -Name 'words_count_threshold' -Value 2147483647
       Set-JsonProperty -Object $segmentedReply -Name 'split_mode' -Value 'regex'
-      Set-JsonProperty -Object $segmentedReply -Name 'regex' -Value '.{0,44}?(?:[\u3002\uff1f\uff01~\u2026\uff1b]+|[!?;]+|(?<!\d)\.(?!\d)|\r?\n+)|.{1,45}'
+      Set-JsonProperty -Object $segmentedReply -Name 'regex' -Value '.{0,14}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,15}'
       Set-JsonProperty -Object $segmentedReply -Name 'split_words' -Value @(
         [string]([char]0x3002),
         [string]([char]0xff1f),
@@ -573,7 +573,7 @@ function Initialize-AkashaConfiguration {
         '~',
         [string]([char]0x2026)
       )
-      Set-JsonProperty -Object $segmentedReply -Name 'content_cleanup_rule' -Value '[\r\n\t\u3000]+|(?<=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001]) +| +(?=[\u3400-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001])'
+      Set-JsonProperty -Object $segmentedReply -Name 'content_cleanup_rule' -Value '\s+'
 
       $akashaPlatform = [pscustomobject][ordered]@{
         id = 'akasha_ob11'
