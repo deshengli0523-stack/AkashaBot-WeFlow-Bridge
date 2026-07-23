@@ -37,6 +37,26 @@ function Assert-SequenceEqual {
   Assert-Equal $actualText $expectedText $Message
 }
 
+function Stop-TestProcessTree {
+  param([System.Diagnostics.Process]$Process)
+  if ($null -eq $Process) { return }
+  try {
+    if (-not $Process.HasExited) {
+      $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+      & $taskkill /PID $Process.Id /T /F 2>$null | Out-Null
+      [void]$Process.WaitForExit(5000)
+    }
+  } catch {
+    try {
+      if (-not $Process.HasExited) {
+        $Process.Kill()
+        [void]$Process.WaitForExit(5000)
+      }
+    } catch {
+    }
+  }
+}
+
 function Assert-ThrowsLike {
   param([scriptblock]$Action, [string]$Pattern, [string]$Message)
   try { & $Action } catch {
@@ -236,6 +256,11 @@ Assert-True ($calibrateBat -match 'exit /b %code%') "$($launchers.Calibrate) doe
 Assert-True ($calibrateBat -match '(?m)^pause\s*$') "$($launchers.Calibrate) must pause for interactive calibration."
 $healthBat = [System.IO.File]::ReadAllText((Join-Path $root $launchers.Health))
 Assert-True ($healthBat -match '(?m)^pause\s*$') 'Health launcher must always pause.'
+foreach ($name in @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health)) {
+  $launcherText = [System.IO.File]::ReadAllText((Join-Path $root $name))
+  Assert-True ($launcherText.Contains('-InstallRoot "%~dp0."')) "$name must terminate the source-relative install root with a dot before native argument parsing."
+  Assert-True (-not $launcherText.Contains('-InstallRoot "%~dp0"')) "$name passes a trailing backslash before the closing quote and can append a literal quote to InstallRoot."
+}
 foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop)) {
   Assert-True ([System.IO.File]::ReadAllText((Join-Path $root $name)) -match 'if not "%CODE%"=="0" pause') "$name must pause only on failure."
 }
@@ -261,15 +286,68 @@ $expectedPayloadSources = @(
 )
 Assert-SequenceEqual @($payload.Source | Sort-Object) @($expectedPayloadSources | Sort-Object) 'Installed payload manifest is not the frozen exact allowlist.'
 
-New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
-$externalRoot = Join-Path $fixtureRoot 'external packages and config'
-New-Item -ItemType Directory -Force -Path $externalRoot | Out-Null
-$weFlowExe = Join-Path $externalRoot 'WeFlow.exe'
-Copy-Item -LiteralPath (Get-Command powershell.exe).Source -Destination $weFlowExe -Force
-$weFlowConfig = Join-Path $externalRoot 'WeFlow-config.json'
-[System.IO.File]::WriteAllText($weFlowConfig, '{}', (New-Object System.Text.UTF8Encoding($false)))
-
 try {
+  New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
+  $launcherProbeRoot = Join-Path $fixtureRoot 'launcher transport with spaces'
+  $launcherProbeScripts = Join-Path $launcherProbeRoot 'scripts'
+  New-Item -ItemType Directory -Force -Path $launcherProbeScripts | Out-Null
+  $launcherProbeSource = @'
+param([string]$InstallRoot)
+$markerName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name) + '.txt'
+$markerPath = Join-Path (Split-Path -Parent $PSScriptRoot) $markerName
+[System.IO.File]::WriteAllText($markerPath, $InstallRoot, (New-Object System.Text.UTF8Encoding($false)))
+exit 0
+'@
+  $launcherProbeCases = @(
+    [pscustomobject]@{ Launcher = $launchers.Calibrate; Script = 'Calibrate-Uia.ps1' },
+    [pscustomobject]@{ Launcher = $launchers.Start; Script = 'Start-Services.ps1' },
+    [pscustomobject]@{ Launcher = $launchers.Stop; Script = 'Stop-Services.ps1' },
+    [pscustomobject]@{ Launcher = $launchers.Health; Script = 'Test-Health.ps1' }
+  )
+  foreach ($case in $launcherProbeCases) {
+    Copy-Item -LiteralPath (Join-Path $root $case.Launcher) -Destination (Join-Path $launcherProbeRoot $case.Launcher) -Force
+    [System.IO.File]::WriteAllText((Join-Path $launcherProbeScripts $case.Script), $launcherProbeSource, (New-Object System.Text.UTF8Encoding($false)))
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = 'cmd.exe'
+    $processInfo.Arguments = '/d /c call "' + $case.Launcher + '"'
+    $processInfo.WorkingDirectory = $launcherProbeRoot
+    $processInfo.UseShellExecute = $false
+    $processInfo.CreateNoWindow = $true
+    $processInfo.RedirectStandardInput = $true
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.RedirectStandardError = $true
+    $process = $null
+    try {
+      $process = New-Object System.Diagnostics.Process
+      $process.StartInfo = $processInfo
+      Assert-True $process.Start() "$($case.Launcher) transport probe did not start."
+      $process.StandardInput.WriteLine()
+      $process.StandardInput.Close()
+      if (-not $process.WaitForExit(15000)) {
+        Stop-TestProcessTree -Process $process
+        throw "$($case.Launcher) transport probe timed out."
+      }
+      $probeOutput = $process.StandardOutput.ReadToEnd() + $process.StandardError.ReadToEnd()
+      Assert-Equal $process.ExitCode 0 "$($case.Launcher) transport probe failed: $probeOutput"
+    } finally {
+      if ($null -ne $process) {
+        Stop-TestProcessTree -Process $process
+        $process.Dispose()
+      }
+    }
+    $markerPath = Join-Path $launcherProbeRoot ([System.IO.Path]::GetFileNameWithoutExtension($case.Script) + '.txt')
+    Assert-True (Test-Path -LiteralPath $markerPath -PathType Leaf) "$($case.Launcher) transport probe did not capture InstallRoot."
+    $receivedRoot = [System.IO.File]::ReadAllText($markerPath)
+    Assert-True (-not $receivedRoot.Contains('"')) "$($case.Launcher) appended a literal quote to InstallRoot."
+    Assert-Equal ([System.IO.Path]::GetFullPath($receivedRoot).TrimEnd('\', '/')) ([System.IO.Path]::GetFullPath($launcherProbeRoot).TrimEnd('\', '/')) "$($case.Launcher) changed InstallRoot during BAT to PowerShell transport."
+  }
+  $externalRoot = Join-Path $fixtureRoot 'external packages and config'
+  New-Item -ItemType Directory -Force -Path $externalRoot | Out-Null
+  $weFlowExe = Join-Path $externalRoot 'WeFlow.exe'
+  Copy-Item -LiteralPath (Get-Command powershell.exe).Source -Destination $weFlowExe -Force
+  $weFlowConfig = Join-Path $externalRoot 'WeFlow-config.json'
+  [System.IO.File]::WriteAllText($weFlowConfig, '{}', (New-Object System.Text.UTF8Encoding($false)))
+
   $successRoot = Join-Path $fixtureRoot 'successful install root with spaces'
   $success = New-TestBoundaries -Discoveries @($weFlowExe) -CalibrationStatus 'ready'
   $result = Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $success -SkipStart
