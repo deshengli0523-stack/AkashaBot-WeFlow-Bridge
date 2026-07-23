@@ -979,13 +979,18 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   $segmentPattern = [string]$freshAstr.platform_settings.segmented_reply.regex
   $segmentCleanupPattern = [string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule
   $segmentOptions = [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::Multiline
+  $fullWidthSpace = [string][char]0x3000
+  $chineseQuestion = [string][char]0xff1f
+  $chineseExclamation = [string][char]0xff01
+  $punctuationRun = $chineseQuestion + $chineseExclamation
   $segmentCases = @(
-    [pscustomobject]@{ Name = 'ordinary spaces'; Input = '甲乙 丙丁'; Expected = @('甲乙', '丙丁') },
-    [pscustomobject]@{ Name = 'tabs'; Input = "甲乙`t丙丁"; Expected = @('甲乙', '丙丁') },
-    [pscustomobject]@{ Name = 'blank lines'; Input = "甲乙`r`n`r`n丙丁"; Expected = @('甲乙', '丙丁') },
-    [pscustomobject]@{ Name = 'punctuation runs'; Input = '你好？！ 后续'; Expected = @('你好？！', '后续') },
-    [pscustomobject]@{ Name = 'decimal points'; Input = '版本3.14稳定'; Expected = @('版本3.14稳定') },
-    [pscustomobject]@{ Name = 'strict fifteen character cap'; Input = '一二三四五六七八九十甲乙丙丁戊己'; Expected = @('一二三四五六七八九十甲乙丙丁戊', '己') }
+    [pscustomobject]@{ Name = 'ordinary spaces'; Input = 'alpha beta'; Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'full-width spaces'; Input = ('alpha' + $fullWidthSpace + 'beta'); Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'tabs'; Input = "alpha`tbeta"; Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'blank lines'; Input = "alpha`r`n`r`nbeta"; Expected = @('alpha', 'beta') },
+    [pscustomobject]@{ Name = 'punctuation runs'; Input = ('hello' + $punctuationRun + ' next'); Expected = @(('hello' + $punctuationRun), 'next') },
+    [pscustomobject]@{ Name = 'decimal points'; Input = 'version3.14stable'; Expected = @('version3.14stab', 'le') },
+    [pscustomobject]@{ Name = 'strict fifteen character cap'; Input = 'abcdefghijklmnop'; Expected = @('abcdefghijklmno', 'p') }
   )
   foreach ($segmentCase in $segmentCases) {
     $actualSegments = @(
