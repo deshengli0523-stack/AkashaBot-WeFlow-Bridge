@@ -479,6 +479,15 @@ function Initialize-AkashaConfiguration {
               throw 'E_CONFIG_PATH: Configuration paths must remain inside the install root.'
             }
             $astrBotOwnership = New-AkashaAstrBotOwnership -Paths $Paths -Snapshot $pathSnapshot
+            $astrBotMarkerPath = Join-Path $Paths.AstrBotData '.astrbot'
+            Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $astrBotMarkerPath
+            $astrBotMarkerStream = [System.IO.File]::Open(
+              $astrBotMarkerPath,
+              [System.IO.FileMode]::CreateNew,
+              [System.IO.FileAccess]::Write,
+              [System.IO.FileShare]::None
+            )
+            $astrBotMarkerStream.Dispose()
             Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $astrConfigPath
             Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate (Join-Path $Paths.AstrBotData 'FIRST_LOGIN.txt')
             Push-Location $Paths.AstrBotData
@@ -486,7 +495,7 @@ function Initialize-AkashaConfiguration {
               if ($null -ne $AstrBotInitializer) {
                 & $AstrBotInitializer $Paths.AstrBotPython $Paths.AstrBotData
               } else {
-                Invoke-AkashaNative -FilePath $Paths.AstrBotPython -Arguments @('-m', 'astrbot.cli.__main__', 'init') -LogPath $Paths.InstallLog -StandardInput @('y') -SensitiveValues @($password) | Out-Null
+                Invoke-AkashaNative -FilePath $Paths.AstrBotPython -Arguments @('-m', 'astrbot.cli.__main__', 'init') -LogPath $Paths.InstallLog -SensitiveValues @($password) | Out-Null
               }
             } finally {
               Pop-Location

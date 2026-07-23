@@ -93,6 +93,7 @@ function New-TestBoundaries {
     [int]$PackageExitCode = 0,
     [int]$HealthExitCode = 0,
     [int[]]$HealthExitCodes = @(),
+    [string]$EnvironmentOutput = '',
     [AllowNull()][string]$SelectedInstaller = $null,
     [AllowNull()][object]$CalibrationStatus = 'required'
   )
@@ -105,6 +106,7 @@ function New-TestBoundaries {
     ShortcutEntries = @()
     PackageExitCode = $PackageExitCode
     HealthExitCode = $HealthExitCode
+    EnvironmentOutput = $EnvironmentOutput
     SelectedInstaller = $SelectedInstaller
     CalibrationStatus = $CalibrationStatus
     LockSeenByStarter = $true
@@ -134,6 +136,9 @@ function New-TestBoundaries {
   $environment = {
     param($paths, $python)
     $state.Calls.Add('environment')
+    if (-not [string]::IsNullOrWhiteSpace($state.EnvironmentOutput)) {
+      Write-Output $state.EnvironmentOutput
+    }
   }.GetNewClosure()
   $configuration = {
     param($paths, $configPath)
@@ -717,6 +722,13 @@ exit 0
   Assert-True (-not $default.State.LockSeenByStarter) 'Service start ran before lifecycle lock release.'
   $readyLog = Get-Content -LiteralPath (Join-Path $defaultRoot 'data\logs\install.log') -Raw -Encoding UTF8
   Assert-True ($readyLog -match 'calibration_required=false') 'Ready install log omitted the boolean calibration state.'
+
+  $noisyEnvironmentRoot = Join-Path $fixtureRoot 'native environment output'
+  $noisyEnvironment = New-TestBoundaries -Discoveries @($weFlowExe) -EnvironmentOutput 'fixture native output' -CalibrationStatus 'required'
+  $noisyEnvironmentResults = @(Invoke-TestInstall -InstallRoot $noisyEnvironmentRoot -WeFlowConfigPath $weFlowConfig -Boundaries $noisyEnvironment)
+  Assert-Equal $noisyEnvironmentResults.Count 1 'Native environment output escaped into the installer result and can trigger a false E_INSTALL_FAILED after completion.'
+  Assert-Equal $noisyEnvironmentResults[0].Status 'installed' 'Noisy environment install did not return the installed result.'
+  Assert-Equal $noisyEnvironmentResults[0].CalibrationRequired $true 'Noisy environment install lost the calibration-required result.'
 
   $transientReadyRoot = Join-Path $fixtureRoot 'transient readiness success'
   $transientReady = New-TestBoundaries -Discoveries @($weFlowExe) -HealthExitCodes @(1, 0) -CalibrationStatus 'ready'
