@@ -62,6 +62,33 @@ function Get-AkashaInstallPayload {
   return $entries.ToArray()
 }
 
+function Get-AkashaContactMemoryPluginPayload {
+  $pluginRoot = 'plugins\astrbot_plugin_akasha_contact_memory'
+  $entries = New-Object System.Collections.Generic.List[object]
+  foreach ($name in @(
+      'main.py',
+      'metadata.yaml',
+      '_conf_schema.json',
+      'README.md',
+      'akasha_memory\__init__.py',
+      'akasha_memory\models.py',
+      'akasha_memory\store.py',
+      'akasha_memory\weflow_sync.py',
+      'akasha_memory\context_builder.py',
+      'akasha_memory\qwen_client.py',
+      'akasha_memory\qwen_session.py',
+      'akasha_memory\provider.py',
+      'akasha_memory\runtime.py',
+      'akasha_memory\security.py'
+    )) {
+    $entries.Add([pscustomobject]@{
+      Source = Join-Path $pluginRoot $name
+      Relative = $name
+    })
+  }
+  return $entries.ToArray()
+}
+
 function Test-AkashaCanonicalFile {
   param(
     [Parameter(Mandatory)][string]$Root,
@@ -82,6 +109,35 @@ function Test-AkashaCanonicalFile {
   if ([string]::IsNullOrWhiteSpace($final)) { return $false }
   try { $final = [System.IO.Path]::GetFullPath($final) } catch { return $false }
   return $expected.Equals($final, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-AkashaContactMemoryPluginSource {
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][object[]]$Payload
+  )
+
+  $pluginRoot = Join-Path $Root 'plugins\astrbot_plugin_akasha_contact_memory'
+  if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) {
+    throw 'E_SOURCE_PLUGIN: The contact-memory plugin source directory is missing.'
+  }
+  foreach ($item in @(Get-Item -LiteralPath $pluginRoot -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $pluginRoot -Recurse -Force -ErrorAction Stop)) {
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      throw 'E_SOURCE_PLUGIN: The contact-memory plugin source contains a reparse point.'
+    }
+  }
+  $expected = @($Payload | ForEach-Object { [string]$_.Source } | Sort-Object)
+  $rootPrefixLength = $Root.TrimEnd('\', '/').Length + 1
+  $actual = @(
+    Get-ChildItem -LiteralPath $pluginRoot -Recurse -Force -File -ErrorAction Stop |
+      ForEach-Object { $_.FullName.Substring($rootPrefixLength) } |
+      Sort-Object
+  )
+  if ($actual.Count -ne $expected.Count -or
+      @($actual | Where-Object { $expected -cnotcontains $_ }).Count -ne 0 -or
+      @($expected | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
+    throw 'E_SOURCE_PLUGIN: The contact-memory plugin source does not match the exact payload allowlist.'
+  }
 }
 
 function Assert-AkashaInstallSource {
@@ -452,6 +508,101 @@ function Install-AkashaPayload {
   if (-not $cleanupSucceeded) { throw 'E_INSTALL_CLEANUP: Unable to remove installer transaction directories.' }
 }
 
+function Install-AkashaContactMemoryPlugin {
+  param(
+    [Parameter(Mandatory)][string]$SourceRoot,
+    [Parameter(Mandatory)]$Paths,
+    [Parameter(Mandatory)][object[]]$Payload,
+    [scriptblock]$ReplacementHook
+  )
+
+  $astrBotConfig = Join-Path $Paths.AstrBotData 'data\cmd_config.json'
+  if (-not (Test-AkashaCanonicalFile -Root $Paths.Root -Path $astrBotConfig)) {
+    throw 'E_PLUGIN_INSTALL: AstrBot must be initialized before the contact-memory plugin is deployed.'
+  }
+
+  $pluginName = 'astrbot_plugin_akasha_contact_memory'
+  $pluginsRoot = Join-Path $Paths.AstrBotData 'data\plugins'
+  $target = Join-Path $pluginsRoot $pluginName
+  $transactionId = [guid]::NewGuid().ToString('N')
+  $stageRoot = Join-Path $Paths.State ('.plugin-stage-' + $transactionId)
+  $stagedPlugin = Join-Path $stageRoot $pluginName
+  $backup = Join-Path $Paths.Backups ('plugin-' + $pluginName + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + $transactionId.Substring(0, 8))
+  Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @(
+    $Paths.AstrBotData, $pluginsRoot, $target, $Paths.State, $stageRoot, $stagedPlugin, $Paths.Backups, $backup
+  )
+
+  $oldMoved = $false
+  $newCommitted = $false
+  $operationError = $null
+  try {
+    if (Test-Path -LiteralPath $target) {
+      if (-not (Test-Path -LiteralPath $target -PathType Container)) {
+        throw 'E_PLUGIN_INSTALL: The contact-memory plugin target is not a directory.'
+      }
+      Assert-AkashaInstallTreeSafe -Paths $Paths -Path $target
+    }
+    New-AkashaInstallDirectory -Paths $Paths -Path $stageRoot
+    foreach ($entry in $Payload) {
+      $source = Join-Path $SourceRoot ([string]$entry.Source)
+      if (-not (Test-AkashaCanonicalFile -Root $SourceRoot -Path $source)) {
+        throw 'E_SOURCE_PAYLOAD: Contact-memory plugin source changed during installation.'
+      }
+      $destination = Join-Path $stagedPlugin ([string]$entry.Relative)
+      Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($stageRoot, $stagedPlugin, $destination)
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+      Copy-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $stagedPlugin 'main.py') -PathType Leaf)) {
+      throw 'E_PLUGIN_INSTALL: The staged contact-memory plugin is missing main.py.'
+    }
+
+    if (Test-Path -LiteralPath $target -PathType Container) {
+      New-AkashaInstallDirectory -Paths $Paths -Path $Paths.Backups
+      Move-Item -LiteralPath $target -Destination $backup -Force -ErrorAction Stop
+      $oldMoved = $true
+      if ($null -ne $ReplacementHook) { & $ReplacementHook 'AfterPluginExistingMoved' }
+    }
+
+    New-AkashaInstallDirectory -Paths $Paths -Path $pluginsRoot
+    Move-Item -LiteralPath $stagedPlugin -Destination $target -Force -ErrorAction Stop
+    $newCommitted = $true
+    if ($null -ne $ReplacementHook) { & $ReplacementHook 'AfterPluginCommit' }
+  } catch {
+    $operationError = $_
+  }
+
+  if ($null -ne $operationError -and ($oldMoved -or $newCommitted)) {
+    $rollbackSucceeded = $true
+    try {
+      if ($newCommitted -and (Test-Path -LiteralPath $target)) {
+        Remove-AkashaInstallTree -Paths $Paths -Path $target
+      }
+      if ($oldMoved -and (Test-Path -LiteralPath $backup)) {
+        New-AkashaInstallDirectory -Paths $Paths -Path $pluginsRoot
+        Move-Item -LiteralPath $backup -Destination $target -Force -ErrorAction Stop
+      }
+    } catch {
+      $rollbackSucceeded = $false
+    }
+    if (-not $rollbackSucceeded) {
+      $operationError.Exception.Data['AkashaRollbackFailure'] = 'E_PLUGIN_ROLLBACK'
+    }
+  }
+
+  $cleanupSucceeded = $true
+  try { Remove-AkashaInstallTree -Paths $Paths -Path $stageRoot } catch { $cleanupSucceeded = $false }
+  if ($null -ne $operationError) {
+    if (-not $cleanupSucceeded) {
+      $operationError.Exception.Data['AkashaCleanupFailure'] = 'E_PLUGIN_CLEANUP'
+    }
+    throw $operationError
+  }
+  if (-not $cleanupSucceeded) {
+    throw 'E_PLUGIN_CLEANUP: Contact-memory plugin staging cleanup failed.'
+  }
+}
+
 function New-AkashaShortcuts {
   param(
     [Parameter(Mandatory)][object[]]$Entries,
@@ -659,6 +810,7 @@ function Invoke-AkashaInstall {
   if ($null -eq $CalibrationStatusReader) { $CalibrationStatusReader = { param($configPath) Get-AkashaUiaCalibrationStatus -ConfigPath $configPath } }
 
   $payload = @(Get-AkashaInstallPayload)
+  $pluginPayload = @(Get-AkashaContactMemoryPluginPayload)
   $sourceContext = Open-AkashaLifecycleRootContext -Root $SourceRoot
   $rootContext = $null
   $stateContext = $null
@@ -670,7 +822,8 @@ function Invoke-AkashaInstall {
   $calibrationRequired = $false
   $installStateActive = $false
   try {
-    $version = Assert-AkashaInstallSource -Root $sourceContext.RootPath -Payload $payload
+    $version = Assert-AkashaInstallSource -Root $sourceContext.RootPath -Payload (@($payload) + @($pluginPayload))
+    Assert-AkashaContactMemoryPluginSource -Root $sourceContext.RootPath -Payload $pluginPayload
     $sourcePath = [System.IO.Path]::GetFullPath($sourceContext.RootPath).TrimEnd('\', '/')
     $installPath = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\', '/')
     $sourcePrefix = $sourcePath + [System.IO.Path]::DirectorySeparatorChar
@@ -746,6 +899,9 @@ function Invoke-AkashaInstall {
       throw
     }
     Write-AkashaInstallLog -Paths $paths -Message 'phase=configuration status=completed'
+    Write-AkashaInstallLog -Paths $paths -Message 'phase=plugin status=started'
+    Install-AkashaContactMemoryPlugin -SourceRoot $sourceContext.RootPath -Paths $paths -Payload $pluginPayload -ReplacementHook $ReplacementHook
+    Write-AkashaInstallLog -Paths $paths -Message 'phase=plugin status=completed'
 
     $launchers = Get-AkashaLauncherNames
     $desktop = [Environment]::GetFolderPath('Desktop')

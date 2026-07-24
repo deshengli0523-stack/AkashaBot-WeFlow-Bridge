@@ -61,6 +61,7 @@ public static class FixtureSleeper {
                 "EXE=" + Encode(System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName),
                 "ARGS=" + Encode(String.Join("\u001f", args)),
                 "CWD=" + Encode(Environment.CurrentDirectory),
+                "BRIDGECONFIG=" + Encode(Environment.GetEnvironmentVariable("AKASHABOT_BRIDGE_CONFIG_PATH")),
                 "CONFIG=" + Encode(Environment.GetEnvironmentVariable("AKASHABOT_CONFIG_PATH")),
                 "LOG=" + Encode(Environment.GetEnvironmentVariable("AKASHABOT_LOG_DIR")),
                 "STATE=" + Encode(Environment.GetEnvironmentVariable("AKASHABOT_STATE_DIR")),
@@ -292,6 +293,7 @@ try {
 
   $normal = New-InstallFixture -Name 'normal-start'
   $oldFixtureRecordDirectory = $env:FIXTURE_RECORD_DIR
+  $oldBridgeConfig = $env:AKASHABOT_BRIDGE_CONFIG_PATH
   $oldConfig = $env:AKASHABOT_CONFIG_PATH
   $oldLog = $env:AKASHABOT_LOG_DIR
   $oldState = $env:AKASHABOT_STATE_DIR
@@ -303,6 +305,7 @@ try {
   }
   try {
     $env:FIXTURE_RECORD_DIR = $normal.RecordRoot
+    $env:AKASHABOT_BRIDGE_CONFIG_PATH = 'parent-bridge-config-sentinel'
     $env:AKASHABOT_CONFIG_PATH = 'parent-config-sentinel'
     $env:AKASHABOT_LOG_DIR = 'parent-log-sentinel'
     $env:AKASHABOT_STATE_DIR = 'parent-state-sentinel'
@@ -340,11 +343,15 @@ try {
     Assert-Equal $bridgeChild.CONFIG $normal.Paths.BridgeConfig 'Bridge child did not receive its config path.'
     Assert-Equal $bridgeChild.LOG $normal.Paths.Logs 'Bridge child did not receive its log path.'
     Assert-Equal $bridgeChild.STATE $normal.Paths.State 'Bridge child did not receive its state path.'
+    Assert-Equal $astrChild.BRIDGECONFIG $normal.Paths.BridgeConfig 'AstrBot child did not receive the bridge config path.'
+    Assert-Equal $astrChild.STATE $normal.Paths.State 'AstrBot child did not receive the persistent state path.'
+    Assert-Equal $bridgeChild.BRIDGECONFIG '' 'Bridge child received the AstrBot-only bridge config path.'
+    Assert-Equal $weFlowChild.BRIDGECONFIG '' 'WeFlow child received the AstrBot-only bridge config path.'
     foreach ($nonBridge in @($astrChild, $weFlowChild)) {
       Assert-Equal $nonBridge.CONFIG '' 'A non-bridge child inherited AKASHABOT_CONFIG_PATH.'
       Assert-Equal $nonBridge.LOG '' 'A non-bridge child inherited AKASHABOT_LOG_DIR.'
-      Assert-Equal $nonBridge.STATE '' 'A non-bridge child inherited AKASHABOT_STATE_DIR.'
     }
+    Assert-Equal $weFlowChild.STATE '' 'WeFlow inherited AKASHABOT_STATE_DIR.'
     foreach ($child in $childRecords) {
       Assert-Equal $child.PASSWORD '' 'A normal child inherited ASTRBOT_DASHBOARD_INITIAL_PASSWORD.'
       Assert-Equal $child.PYTHONHOME '' 'A normal child inherited PYTHONHOME.'
@@ -356,6 +363,7 @@ try {
     Assert-Equal $astrChild.NOUSERSITE '1' 'AstrBot did not disable user site packages.'
     Assert-Equal $bridgeChild.NOUSERSITE '1' 'Bridge did not disable user site packages.'
     Assert-Equal $env:AKASHABOT_CONFIG_PATH 'parent-config-sentinel' 'Parent config environment was not restored.'
+    Assert-Equal $env:AKASHABOT_BRIDGE_CONFIG_PATH 'parent-bridge-config-sentinel' 'Parent bridge config environment was not restored.'
     Assert-Equal $env:AKASHABOT_LOG_DIR 'parent-log-sentinel' 'Parent log environment was not restored.'
     Assert-Equal $env:AKASHABOT_STATE_DIR 'parent-state-sentinel' 'Parent state environment was not restored.'
     Assert-Equal $env:ASTRBOT_DASHBOARD_INITIAL_PASSWORD 'parent-pw' 'Parent AstrBot password environment was not restored.'
@@ -379,6 +387,7 @@ try {
     Assert-Equal $repeatFixtureCount 3 'Repeated start launched an orphan process.'
   } finally {
     if ($null -eq $oldFixtureRecordDirectory) { Remove-Item Env:\FIXTURE_RECORD_DIR -ErrorAction SilentlyContinue } else { $env:FIXTURE_RECORD_DIR = $oldFixtureRecordDirectory }
+    if ($null -eq $oldBridgeConfig) { Remove-Item Env:\AKASHABOT_BRIDGE_CONFIG_PATH -ErrorAction SilentlyContinue } else { $env:AKASHABOT_BRIDGE_CONFIG_PATH = $oldBridgeConfig }
     if ($null -eq $oldConfig) { Remove-Item Env:\AKASHABOT_CONFIG_PATH -ErrorAction SilentlyContinue } else { $env:AKASHABOT_CONFIG_PATH = $oldConfig }
     if ($null -eq $oldLog) { Remove-Item Env:\AKASHABOT_LOG_DIR -ErrorAction SilentlyContinue } else { $env:AKASHABOT_LOG_DIR = $oldLog }
     if ($null -eq $oldState) { Remove-Item Env:\AKASHABOT_STATE_DIR -ErrorAction SilentlyContinue } else { $env:AKASHABOT_STATE_DIR = $oldState }

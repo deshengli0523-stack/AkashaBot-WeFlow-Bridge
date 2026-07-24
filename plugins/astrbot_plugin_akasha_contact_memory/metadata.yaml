@@ -1,0 +1,9 @@
+name: astrbot_plugin_akasha_contact_memory
+display_name: Akasha 联系人记忆
+desc: 为 AkashaBot WeFlow Bridge 的每个微信私聊联系人提供隔离、持久的 Qwen 上下文。
+author: deshengli0523-stack
+version: 0.1.0
+repo: https://github.com/deshengli0523-stack/AkashaBot-WeFlow-Bridge
+astrbot_version: "==4.26.6"
+support_platforms:
+  - aiocqhttp

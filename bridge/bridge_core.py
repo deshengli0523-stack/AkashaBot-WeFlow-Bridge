@@ -8,6 +8,7 @@
 4. 多层消息去重（rawid、内容、自回复）
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +30,79 @@ log = logging.getLogger("ob11-bridge")
 
 
 # ============ 桥接核心 ============
+
+
+def _text_value(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _exact_text_value(value) -> str:
+    return "" if value is None else str(value)
+
+
+def _source_timestamp(value):
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            return float(text)
+        except ValueError:
+            return text
+
+
+def _event_fingerprint(data: dict) -> str:
+    fingerprint_fields = {
+        "content": _exact_text_value(data.get("content")),
+        "message_type": _text_value(data.get("type") or data.get("msgType")),
+        "rawid": _text_value(data.get("rawid")),
+        "sender": _text_value(data.get("senderName") or data.get("sender")),
+        "session": _text_value(data.get("sessionId")),
+        "session_type": _text_value(data.get("sessionType")),
+        "source": _text_value(data.get("sourceName") or data.get("talkerName")),
+        "talker": _text_value(data.get("talkerId")),
+        "timestamp": _source_timestamp(data.get("timestamp")),
+    }
+    canonical = json.dumps(
+        fingerprint_fields,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _source_message_ref(data: dict, buffer_ordinal: int) -> dict:
+    raw_id = _text_value(data.get("rawid"))
+    return {
+        "rawid": raw_id,
+        "timestamp": _source_timestamp(data.get("timestamp")),
+        "event_fingerprint": _event_fingerprint(data),
+        "buffer_ordinal": int(buffer_ordinal),
+        "id_quality": "rawid" if raw_id else "event_fingerprint",
+    }
+
+
+def _insert_source_message_ref(
+    entry: dict,
+    data: dict,
+    index: int | None = None,
+) -> None:
+    refs = entry.setdefault("source_messages", [])
+    insertion_index = len(refs) if index is None else max(0, min(index, len(refs)))
+    refs.insert(insertion_index, _source_message_ref(data, insertion_index + 1))
+    for ordinal, source_ref in enumerate(refs, start=1):
+        source_ref["buffer_ordinal"] = ordinal
+
+
+def _account_identity() -> str:
+    return _text_value(getattr(config, "BOT_WXID", "")) or "wechat_bot"
 
 
 class WeFlowBridge:
@@ -76,17 +150,32 @@ class WeFlowBridge:
         if not self._active():
             return
         content = data.get("content", "")
-        source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
-        session_id_data = data.get("sessionId", "") or source_name
-        group_name_raw = data.get("groupName", "")
-        is_group = (data.get("sessionType", "") == "group") or bool(group_name_raw) or "@chatroom" in session_id_data
+        source_name = _text_value(
+            data.get("sourceName", "") or data.get("talkerName", "")
+        ) or "未知"
+        raw_session_id = _text_value(data.get("sessionId"))
+        group_name_raw = _text_value(data.get("groupName"))
+        session_probe = raw_session_id or source_name
+        is_group = (
+            data.get("sessionType", "") == "group"
+            or bool(group_name_raw)
+            or "@chatroom" in session_probe
+        )
+        if not is_group and not raw_session_id:
+            log.warning("跳过缺少稳定 sessionId 的私聊消息")
+            return
+        session_id_data = raw_session_id or source_name
 
         now = time.time()
         if content and content in self._sent_recently and now - self._sent_recently[content] < 120:
             log.info("⏭️ 自回复去重跳过: content_length=%d", len(content))
             return
 
-        sender_in_group = data.get("senderName", "") or data.get("sender", "") or data.get("sourceName", "")
+        sender_in_group = _text_value(
+            data.get("senderName", "")
+            or data.get("sender", "")
+            or data.get("sourceName", "")
+        )
 
         if is_group:
             group_raw = group_name_raw or source_name
@@ -152,12 +241,14 @@ class WeFlowBridge:
                     "group_name": base_name if is_group else "",
                     "sender_in_group": sender_in_group if is_group else "",
                     "session_id_data": session_id_data,
+                    "source_messages": [],
                 }
             entry = self.pending_buffers[buffer_key]
             if is_group and state.group_reply_mode == "batch" and sender_in_group:
                 entry["messages"].append(f'成员"{sender_in_group}"在群"{base_name}"中对你说：{content}')
             else:
                 entry["messages"].append(content)
+            _insert_source_message_ref(entry, data)
 
             if not entry["processing"]:
                 if entry["timer"]:
@@ -186,7 +277,12 @@ class WeFlowBridge:
             if not entry["messages"]:
                 return
             msgs = entry["messages"].copy()
+            source_messages = [
+                dict(source_message)
+                for source_message in entry.get("source_messages", [])
+            ]
             entry["messages"] = []
+            entry["source_messages"] = []
             entry["processing"] = True
             if entry["timer"]:
                 entry["timer"].cancel()
@@ -194,6 +290,8 @@ class WeFlowBridge:
 
         contact = entry.get("contact", sender_id)
         is_group = entry.get("is_group", False)
+        account = _account_identity()
+        session_id_data = _text_value(entry.get("session_id_data"))
         combined = "\n".join(msgs)
         log.info(
             "推送缓冲消息: messages=%d characters=%d group=%s",
@@ -202,13 +300,55 @@ class WeFlowBridge:
 
         # 构建 OneBot 事件（user_id 要用发言人身份，不能用群 sessionId）
         if is_group:
-            sender_wxid = entry.get("session_id_data", "") + "_" + (entry.get("sender_in_group", "") or entry.get("source_name", ""))
+            sender_wxid = session_id_data + "_" + (entry.get("sender_in_group", "") or entry.get("source_name", ""))
+            user_id = state._wxid_to_int(
+                sender_wxid,
+                account=account,
+                identity_type="group_sender",
+            )
         else:
-            sender_wxid = entry.get("session_id_data", sender_id)
-        user_id = state._wxid_to_int(sender_wxid)
+            if not session_id_data:
+                log.warning("跳过缺少稳定 sessionId 的私聊缓冲")
+                with self.buffer_lock:
+                    entry["processing"] = False
+                return
+            private_account = _text_value(getattr(config, "BOT_WXID", ""))
+            if not private_account:
+                log.warning("跳过缺少 BOT_WXID 的私聊缓冲")
+                with self.buffer_lock:
+                    current = self.pending_buffers.get(sender_id)
+                    if current is not None:
+                        current["messages"] = msgs + current.get("messages", [])
+                        current["source_messages"] = (
+                            source_messages + current.get("source_messages", [])
+                        )
+                        current["processing"] = False
+                return
+            account = private_account
+            try:
+                user_id = state.remember_private_route(
+                    session_id_data,
+                    account=account,
+                    routing_name=contact,
+                )
+            except Exception:
+                log.warning("私聊 route 持久化失败，本轮不推送")
+                with self.buffer_lock:
+                    current = self.pending_buffers.get(sender_id)
+                    if current is not None:
+                        current["messages"] = msgs + current.get("messages", [])
+                        current["source_messages"] = (
+                            source_messages + current.get("source_messages", [])
+                        )
+                        current["processing"] = False
+                return
 
         if is_group:
-            group_id = state._wxid_to_int(entry.get("group_name", contact))
+            group_id = state._wxid_to_int(
+                entry.get("group_name", contact),
+                account=account,
+                identity_type="group",
+            )
             sender_name = entry.get("sender_in_group", "") or entry.get("source_name", "未知")
 
             if state.group_reply_mode == "batch":
@@ -234,19 +374,31 @@ class WeFlowBridge:
             event = make_message_event("group", user_id, msg_segments,
                                        group_id=group_id,
                                        group_name=entry.get("group_name", contact),
-                                       nickname=sender_name)
+                                       nickname=sender_name,
+                                       account=account,
+                                       session=session_id_data,
+                                       source_messages=source_messages,
+                                       routing_name=contact)
         else:
             sender_name = entry.get("source_name", contact)
             event = make_message_event("private", user_id,
                                        [{"type": "text", "data": {"text": combined}}],
-                                       nickname=sender_name)
+                                       nickname=sender_name,
+                                       account=account,
+                                       session=session_id_data,
+                                       source_messages=source_messages,
+                                       routing_name=contact)
 
         if not self._active():
             return
 
         # 记录 user_id → contact 映射，供 API 回复时查找
         if is_group:
-            group_id = state._wxid_to_int(entry.get("group_name", contact))
+            group_id = state._wxid_to_int(
+                entry.get("group_name", contact),
+                account=account,
+                identity_type="group",
+            )
             state._ob_id_to_contact[group_id] = contact
         else:
             state._ob_id_to_contact[user_id] = contact
@@ -313,10 +465,11 @@ class WeFlowBridge:
                         msg_time = data.get("timestamp", 0)
                         if msg_time < self.start_timestamp:
                             continue
-                        raw_id = data.get("rawid", "")
-                        if raw_id in self.processed_ids:
-                            continue
-                        self.processed_ids.add(raw_id)
+                        raw_id = _text_value(data.get("rawid"))
+                        if raw_id:
+                            if raw_id in self.processed_ids:
+                                continue
+                            self.processed_ids.add(raw_id)
                         if not self.should_ignore(data):
                             log.info(
                                 "📩 收到 SSE 消息: content_length=%d",
@@ -391,15 +544,21 @@ class WeFlowBridge:
         """处理图片消息：从 WeFlow 取图 → ollama 描述 → 注入缓冲区"""
         if not self._active():
             return
-        session_id = data.get("sessionId", "")
-        source_name = data.get("sourceName", "") or "未知"
-        group_name = data.get("groupName", "")
-        rawid = data.get("rawid", "")
+        session_id = _text_value(data.get("sessionId"))
+        source_name = _text_value(data.get("sourceName")) or "未知"
+        group_name = _text_value(data.get("groupName"))
+        is_group = (
+            data.get("sessionType", "") == "group"
+            or bool(group_name)
+            or "@chatroom" in session_id
+        )
+        if not is_group and not session_id:
+            log.warning("跳过缺少稳定 sessionId 的私聊图片消息")
+            return
 
         log.info("🖼️ 收到图片消息: group=%s", bool(group_name))
 
-        talker_id = data.get("talkerId", "") or data.get("sessionId", "")
-        is_group = bool(group_name) or "@chatroom" in session_id
+        talker_id = _text_value(data.get("talkerId")) or session_id
 
         # 注册待处理的图片（ollama 完成前标记为 pending）
         img_event = threading.Event()
@@ -433,6 +592,7 @@ class WeFlowBridge:
                     if batch_key in self.pending_buffers:
                         entry = self.pending_buffers[batch_key]
                         entry["messages"].insert(0, f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]')
+                        _insert_source_message_ref(entry, data, 0)
                         entry["image_ready"] = True
                         self._schedule_buffer_locked(batch_key, 2)
                         log.info(f"📝 图片已注入批处理队列")
@@ -449,6 +609,7 @@ class WeFlowBridge:
                         "session_id_data": session_id,
                         "group_name": group_name,
                         "sender_in_group": source_name,
+                        "source_messages": [_source_message_ref(data, 1)],
                     }
                     log.info(f"📩 图片无文本跟随，创建批处理图片条目")
                     version = 1
@@ -461,6 +622,7 @@ class WeFlowBridge:
                     # 已有文本在排队，注入图片上下文
                     entry = self.pending_buffers[talker_id]
                     entry["messages"].insert(0, f"[图片: {caption_text}]")
+                    _insert_source_message_ref(entry, data, 0)
                     entry["image_ready"] = True
                     self._schedule_buffer_locked(talker_id, 2)
                     log.info(f"📝 图片已注入待处理文本队列")
@@ -478,6 +640,7 @@ class WeFlowBridge:
                         "session_id_data": session_id,
                         "group_name": group_name if is_group else "",
                         "sender_in_group": "",
+                        "source_messages": [_source_message_ref(data, 1)],
                     }
                     version = 1
                     timer = threading.Timer(2, lambda v=version, sid=talker_id: self.process_sender(sid, v))

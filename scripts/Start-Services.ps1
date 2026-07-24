@@ -597,6 +597,7 @@ function Start-AkashaOwnedProcess {
     if ([string]$argument -notmatch '^[A-Za-z0-9_.-]+$') { throw 'E_SERVICE_START: Invalid service argument.' }
   }
   $excluded = @(
+    'AKASHABOT_BRIDGE_CONFIG_PATH',
     'AKASHABOT_CONFIG_PATH',
     'AKASHABOT_LOG_DIR',
     'AKASHABOT_STATE_DIR',
@@ -616,7 +617,7 @@ function Start-AkashaOwnedProcess {
     $childEnvironment[[string]$item.Key] = [string]$item.Value
   }
   foreach ($name in $EnvironmentOverrides.Keys) {
-    if (@('AKASHABOT_CONFIG_PATH', 'AKASHABOT_LOG_DIR', 'AKASHABOT_STATE_DIR', 'PYTHONNOUSERSITE') -notcontains [string]$name) {
+    if (@('AKASHABOT_BRIDGE_CONFIG_PATH', 'AKASHABOT_CONFIG_PATH', 'AKASHABOT_LOG_DIR', 'AKASHABOT_STATE_DIR', 'PYTHONNOUSERSITE') -notcontains [string]$name) {
       throw 'E_SERVICE_START: Invalid service environment override.'
     }
     $childEnvironment[[string]$name] = [string]$EnvironmentOverrides[$name]
@@ -758,7 +759,11 @@ function Start-AkashaServices {
       }
 
       Assert-AkashaLaunchBoundary -Paths $paths -ExpectedWeFlowExecutable $preflight.WeFlowExecutable
-      $astrProcess = Start-AkashaOwnedProcess -FilePath $paths.AstrBotPython -ArgumentList @('-m', 'astrbot.cli.__main__', 'run') -WorkingDirectory $paths.AstrBotData -EnvironmentOverrides @{ PYTHONNOUSERSITE = '1' }
+      $astrProcess = Start-AkashaOwnedProcess -FilePath $paths.AstrBotPython -ArgumentList @('-m', 'astrbot.cli.__main__', 'run') -WorkingDirectory $paths.AstrBotData -EnvironmentOverrides @{
+        AKASHABOT_BRIDGE_CONFIG_PATH = $paths.BridgeConfig
+        AKASHABOT_STATE_DIR = $paths.State
+        PYTHONNOUSERSITE = '1'
+      }
       $astrEntry = [pscustomobject]@{ Name = 'astrbot'; Process = $astrProcess; Record = $null; ExecutablePath = $paths.AstrBotPython; CommandKind = 'AstrBotRun' }
       $started.Add($astrEntry)
       $astrRecord = New-AkashaProcessRecord -Name 'astrbot' -Process $astrProcess -ExecutablePath $paths.AstrBotPython -Owned $true -CommandKind 'AstrBotRun'

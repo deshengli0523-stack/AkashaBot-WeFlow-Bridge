@@ -143,6 +143,9 @@ function New-TestBoundaries {
   $configuration = {
     param($paths, $configPath)
     $state.Calls.Add('configuration')
+    $astrBotConfig = Join-Path $paths.AstrBotData 'data\cmd_config.json'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $astrBotConfig) | Out-Null
+    [System.IO.File]::WriteAllText($astrBotConfig, '{}', (New-Object System.Text.UTF8Encoding($false)))
   }.GetNewClosure()
   $shortcuts = {
     param($entries)
@@ -232,14 +235,14 @@ function Invoke-TestInstall {
 function Assert-NoTransactionResidue {
   param([string]$InstallRoot)
   if (-not (Test-Path -LiteralPath $InstallRoot)) { return }
-  $residue = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force | Where-Object { $_.Name -like '.install-stage-*' -or $_.Name -like '.install-rollback-*' })
+  $residue = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force | Where-Object { $_.Name -like '.install-stage-*' -or $_.Name -like '.install-rollback-*' -or $_.Name -like '.plugin-stage-*' })
   Assert-Equal $residue.Count 0 'Installer left transaction directories.'
 }
 
 function New-TestSourceFixture {
   param([string]$Path)
   New-Item -ItemType Directory -Force -Path $Path | Out-Null
-  foreach ($entry in @(Get-AkashaInstallPayload)) {
+  foreach ($entry in @(@(Get-AkashaInstallPayload) + @(Get-AkashaContactMemoryPluginPayload))) {
     $source = Join-Path $root ([string]$entry.Source)
     $destination = Join-Path $Path ([string]$entry.Source)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
@@ -344,9 +347,36 @@ $expectedPayloadSources = @(
   'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md'
 )
 Assert-SequenceEqual @($payload.Source | Sort-Object) @($expectedPayloadSources | Sort-Object) 'Installed payload manifest is not the frozen exact allowlist.'
+$pluginPayload = @(Get-AkashaContactMemoryPluginPayload)
+Assert-Equal $pluginPayload.Count 14 'Contact-memory plugin payload count changed.'
+$expectedPluginSources = @(
+  'plugins\astrbot_plugin_akasha_contact_memory\main.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\metadata.yaml',
+  'plugins\astrbot_plugin_akasha_contact_memory\_conf_schema.json',
+  'plugins\astrbot_plugin_akasha_contact_memory\README.md',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\__init__.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\models.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\store.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\weflow_sync.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\context_builder.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\qwen_client.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\qwen_session.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\provider.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\runtime.py',
+  'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\security.py'
+)
+Assert-SequenceEqual @($pluginPayload.Source | Sort-Object) @($expectedPluginSources | Sort-Object) 'Contact-memory plugin payload is not the frozen exact allowlist.'
 
 try {
   New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
+  $preInitRoot = Join-Path $fixtureRoot 'plugin before AstrBot init'
+  $preInitPaths = Get-AkashaBotPaths -Root $preInitRoot
+  New-Item -ItemType Directory -Force -Path $preInitPaths.State, $preInitPaths.Backups | Out-Null
+  Assert-ThrowsLike {
+    Install-AkashaContactMemoryPlugin -SourceRoot $root -Paths $preInitPaths -Payload $pluginPayload
+  } 'E_PLUGIN_INSTALL:*' 'Contact-memory plugin deployment ran before AstrBot init.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $preInitPaths.AstrBotData 'data\plugins\astrbot_plugin_akasha_contact_memory'))) 'Pre-init plugin deployment created the AstrBot plugin target.'
+
   $launcherProbeRoot = Join-Path $fixtureRoot 'launcher transport with spaces'
   $launcherProbeScripts = Join-Path $launcherProbeRoot 'scripts'
   New-Item -ItemType Directory -Force -Path $launcherProbeScripts | Out-Null
@@ -419,6 +449,9 @@ exit 0
   $expectedScripts = @($payload | Where-Object { $_.Destination -like 'scripts\*' } | ForEach-Object { [System.IO.Path]::GetFileName([string]$_.Destination) } | Sort-Object)
   $actualScripts = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'scripts') -File | Select-Object -ExpandProperty Name | Sort-Object)
   Assert-SequenceEqual $actualScripts $expectedScripts 'Installed script payload is not exact.'
+  $installedPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\astrbot_plugin_akasha_contact_memory'
+  $actualPluginFiles = @(Get-RelativeFiles -Base $installedPluginRoot)
+  Assert-SequenceEqual $actualPluginFiles @($pluginPayload.Relative | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object) 'Installed contact-memory plugin payload is not exact.'
   foreach ($name in @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $successRoot $name) -PathType Leaf) "Installed root payload is missing $name."
   }
@@ -518,6 +551,21 @@ exit 0
 
   $oldBridge = 'old bridge payload sentinel'
   [System.IO.File]::WriteAllText((Join-Path $successRoot 'app\bridge\main.py'), $oldBridge, (New-Object System.Text.UTF8Encoding($false)))
+  $oldPlugin = 'old contact-memory plugin sentinel'
+  [System.IO.File]::WriteAllText((Join-Path $installedPluginRoot 'main.py'), $oldPlugin, (New-Object System.Text.UTF8Encoding($false)))
+  $pluginDataRoot = Join-Path $successRoot 'data\astrbot\data\plugin_data\astrbot_plugin_akasha_contact_memory'
+  New-Item -ItemType Directory -Force -Path $pluginDataRoot | Out-Null
+  $pluginDataSentinel = Join-Path $pluginDataRoot 'memory.db'
+  [System.IO.File]::WriteAllText($pluginDataSentinel, 'plugin-data-preserved', (New-Object System.Text.UTF8Encoding($false)))
+  $bridgeIdentitySentinel = Join-Path $successRoot 'data\state\bridge_identity.sqlite3'
+  [System.IO.File]::WriteAllText($bridgeIdentitySentinel, 'bridge-identity-preserved', (New-Object System.Text.UTF8Encoding($false)))
+  $pluginDataFingerprint = Get-FileFingerprint $pluginDataSentinel
+  $bridgeIdentityFingerprint = Get-FileFingerprint $bridgeIdentitySentinel
+  $otherPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\unrelated_plugin'
+  New-Item -ItemType Directory -Force -Path $otherPluginRoot | Out-Null
+  $otherPluginSentinel = Join-Path $otherPluginRoot 'main.py'
+  [System.IO.File]::WriteAllText($otherPluginSentinel, 'unrelated-plugin-preserved', (New-Object System.Text.UTF8Encoding($false)))
+  $otherPluginFingerprint = Get-FileFingerprint $otherPluginSentinel
   New-Item -ItemType Directory -Force -Path (Join-Path $successRoot 'data\bridge') | Out-Null
   $seededSecret = 'seeded-secret-value-1234567890'
   $readyConfig = '{"access_token":"' + $seededSecret + '","uia_fixed_calibration":{"schema_version":1,"completed":true,"coordinate_space":"client_area_ratio","points":{"search_box":{"x":0.1,"y":0.1},"first_result":{"x":0.2,"y":0.2},"message_input":{"x":0.6,"y":0.8},"send_button":{"x":0.9,"y":0.9}},"reference":{"client_width":1200,"client_height":800,"aspect_ratio":1.5,"dpi":96}}}'
@@ -532,8 +580,13 @@ exit 0
   Assert-SequenceEqual @($rerun.State.Calls | Select-Object -Last 3) @('calibration', 'start', 'health') 'Ready schema 1 update changed calibration/start/health order.'
   Assert-Equal (Get-Content -LiteralPath (Join-Path $successRoot 'runtime\runtime-sentinel.txt') -Raw -Encoding UTF8) 'runtime-preserved' 'Rerun changed runtime data.'
   Assert-Equal (Get-FileFingerprint $installedBridgeConfig) $readyConfigFingerprint 'Ready schema 1 update changed bridge config bytes.'
+  Assert-Equal (Get-FileFingerprint $pluginDataSentinel) $pluginDataFingerprint 'Ready update changed contact-memory plugin_data.'
+  Assert-Equal (Get-FileFingerprint $bridgeIdentitySentinel) $bridgeIdentityFingerprint 'Ready update changed bridge identity state.'
+  Assert-Equal (Get-FileFingerprint $otherPluginSentinel) $otherPluginFingerprint 'Ready update changed an unrelated AstrBot plugin.'
   $bridgeBackups = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'data\backups') -Directory -Filter 'bridge-*')
   Assert-True (@($bridgeBackups | Where-Object { (Get-Content -LiteralPath (Join-Path $_.FullName 'main.py') -Raw -Encoding UTF8) -ceq $oldBridge }).Count -ge 1) 'Rerun did not back up the previous bridge.'
+  $pluginBackups = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'data\backups') -Directory -Filter 'plugin-astrbot_plugin_akasha_contact_memory-*')
+  Assert-True (@($pluginBackups | Where-Object { (Get-Content -LiteralPath (Join-Path $_.FullName 'main.py') -Raw -Encoding UTF8) -ceq $oldPlugin }).Count -ge 1) 'Rerun did not back up the previous contact-memory plugin code.'
   $safeArtifacts = (Get-Content -LiteralPath (Join-Path $successRoot 'data\state\install.json') -Raw -Encoding UTF8) + (Get-Content -LiteralPath (Join-Path $successRoot 'data\logs\install.log') -Raw -Encoding UTF8)
   Assert-True (-not $safeArtifacts.Contains($seededSecret) -and -not $safeArtifacts.Contains($weFlowExe)) 'A seeded secret or WeFlow executable path leaked into installer metadata.'
 
@@ -554,6 +607,16 @@ exit 0
   Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $rollback -SkipStart -ReplacementHook $failAfterMove } 'E_FIXTURE_REPLACEMENT_FAILURE*' 'Injected replacement failure was not preserved.' | Out-Null
   Assert-Equal (Get-Content -LiteralPath (Join-Path $successRoot 'app\bridge\main.py') -Raw -Encoding UTF8) $rollbackOld 'Failed replacement did not restore previous bridge.'
   Assert-Equal (Get-FileFingerprint $installedBridgeConfig) $legacyConfigFingerprint 'Failed replacement changed user config bytes.'
+  Assert-NoTransactionResidue -InstallRoot $successRoot
+
+  $pluginRollbackOld = 'rollback old contact-memory plugin sentinel'
+  [System.IO.File]::WriteAllText((Join-Path $installedPluginRoot 'main.py'), $pluginRollbackOld, (New-Object System.Text.UTF8Encoding($false)))
+  $pluginRollback = New-TestBoundaries -Discoveries @($weFlowExe)
+  $failAfterPluginMove = { param($phase) if ($phase -ceq 'AfterPluginExistingMoved') { throw 'E_FIXTURE_PLUGIN_REPLACEMENT_FAILURE' } }
+  Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $successRoot -WeFlowConfigPath $weFlowConfig -Boundaries $pluginRollback -SkipStart -ReplacementHook $failAfterPluginMove } 'E_FIXTURE_PLUGIN_REPLACEMENT_FAILURE*' 'Injected plugin replacement failure was not preserved.' | Out-Null
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $installedPluginRoot 'main.py') -Raw -Encoding UTF8) $pluginRollbackOld 'Failed plugin replacement did not restore previous plugin code.'
+  Assert-Equal (Get-FileFingerprint $pluginDataSentinel) $pluginDataFingerprint 'Failed plugin replacement changed plugin_data.'
+  Assert-Equal (Get-FileFingerprint $bridgeIdentitySentinel) $bridgeIdentityFingerprint 'Failed plugin replacement changed bridge identity state.'
   Assert-NoTransactionResidue -InstallRoot $successRoot
 
   $partialOldBridge = 'partial rollback bridge sentinel'
@@ -589,6 +652,22 @@ exit 0
   Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $missingSourceRoot -WeFlowConfigPath $weFlowConfig -Boundaries $missingSourceBoundaries -SourceRoot $missingSource -SkipStart } 'E_SOURCE_PAYLOAD:*' 'Missing source payload was accepted.' | Out-Null
   Assert-True (-not (Test-Path -LiteralPath $missingSourceRoot)) 'Missing source payload mutated InstallRoot.'
   Assert-Equal $missingSourceBoundaries.State.Calls.Count 0 'Missing source payload crossed an external/heavy boundary.'
+
+  $missingPluginSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source missing one plugin file')
+  Remove-Item -LiteralPath (Join-Path $missingPluginSource 'plugins\astrbot_plugin_akasha_contact_memory\main.py') -Force
+  $missingPluginRoot = Join-Path $fixtureRoot 'missing plugin install root'
+  $missingPluginBoundaries = New-TestBoundaries -Discoveries @($weFlowExe)
+  Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $missingPluginRoot -WeFlowConfigPath $weFlowConfig -Boundaries $missingPluginBoundaries -SourceRoot $missingPluginSource -SkipStart } 'E_SOURCE_PAYLOAD:*' 'Missing plugin payload was accepted.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath $missingPluginRoot)) 'Missing plugin payload mutated InstallRoot.'
+  Assert-Equal $missingPluginBoundaries.State.Calls.Count 0 'Missing plugin payload crossed an external/heavy boundary.'
+
+  $extraPluginSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source with an extra plugin file')
+  [System.IO.File]::WriteAllText((Join-Path $extraPluginSource 'plugins\astrbot_plugin_akasha_contact_memory\unexpected.txt'), 'unexpected', (New-Object System.Text.UTF8Encoding($false)))
+  $extraPluginRoot = Join-Path $fixtureRoot 'extra plugin install root'
+  $extraPluginBoundaries = New-TestBoundaries -Discoveries @($weFlowExe)
+  Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $extraPluginRoot -WeFlowConfigPath $weFlowConfig -Boundaries $extraPluginBoundaries -SourceRoot $extraPluginSource -SkipStart } 'E_SOURCE_PLUGIN:*' 'Unexpected plugin payload was accepted.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath $extraPluginRoot)) 'Unexpected plugin payload mutated InstallRoot.'
+  Assert-Equal $extraPluginBoundaries.State.Calls.Count 0 'Unexpected plugin payload crossed an external/heavy boundary.'
 
   $unsafeSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source with junction')
   $outsideBridgeSource = Join-Path $fixtureRoot 'outside bridge source'

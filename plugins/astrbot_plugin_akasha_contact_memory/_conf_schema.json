@@ -1,0 +1,86 @@
+{
+  "mode": {
+    "description": "运行模式",
+    "type": "string",
+    "options": ["off", "shadow", "active"],
+    "labels": ["关闭", "影子归档", "启用独立联系人会话"],
+    "default": "shadow",
+    "hint": "更新后默认 shadow。确认归档和 Provider 配置正常后再切换 active。"
+  },
+  "source_provider_id": {
+    "description": "现有 Qwen Provider ID",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空时读取 AstrBot 当前默认 Provider。API Key 仅从此 Provider 读取，不复制到插件配置。"
+  },
+  "qwen_model": {
+    "description": "Qwen 模型",
+    "type": "string",
+    "default": "qwen3.7-max"
+  },
+  "qwen_responses_base_url": {
+    "description": "Responses API Base URL",
+    "type": "string",
+    "default": "",
+    "hint": "留空时复用源 Provider 的 api_base；应以 /compatible-mode/v1 结尾。"
+  },
+  "bridge_config_path": {
+    "description": "桥接配置路径覆盖",
+    "type": "string",
+    "default": "",
+    "hint": "正常安装无需填写，由启动脚本通过 AKASHABOT_BRIDGE_CONFIG_PATH 注入。"
+  },
+  "allow_non_loopback_weflow": {
+    "description": "允许非回环 WeFlow 地址",
+    "type": "bool",
+    "default": false,
+    "hint": "默认只允许 localhost、127.0.0.1 或 ::1。"
+  },
+  "cold_sync_messages": {
+    "description": "首次同步条数",
+    "type": "int",
+    "default": 2000
+  },
+  "fallback_sync_messages": {
+    "description": "首次同步超时后的兜底条数",
+    "type": "int",
+    "default": 500
+  },
+  "sync_budget_seconds": {
+    "description": "前台同步超时秒数",
+    "type": "float",
+    "default": 3.0
+  },
+  "seed_max_tokens": {
+    "description": "新云端会话最大播种 token",
+    "type": "int",
+    "default": 150000
+  },
+  "soft_context_tokens": {
+    "description": "云端会话软上限 token",
+    "type": "int",
+    "default": 700000
+  },
+  "fallback_context_tokens": {
+    "description": "Chat Completions 回退注入上限 token",
+    "type": "int",
+    "default": 120000
+  },
+  "cloud_ttl_days": {
+    "description": "云端会话最长使用天数",
+    "type": "float",
+    "default": 7.0,
+    "hint": "阿里云当前最多保留 7 天；到期后从本地 SQLite 自动重建。"
+  },
+  "request_timeout_seconds": {
+    "description": "Qwen 请求超时秒数",
+    "type": "float",
+    "default": 120.0
+  },
+  "enable_session_cache": {
+    "description": "启用 Qwen Session Cache",
+    "type": "bool",
+    "default": true
+  }
+}

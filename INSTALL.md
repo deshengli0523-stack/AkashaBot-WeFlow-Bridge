@@ -55,6 +55,23 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 
 打开 `http://127.0.0.1:6185`，使用文件中的初始信息登录，立即修改 AstrBot 密码，并配置模型提供商与 API Key。确认新密码可以登录后安全删除 `FIRST_LOGIN.txt`。桥接面板位于 `http://127.0.0.1:8766`，会显示最近的完整联系人名称、群聊成员、收发方向和聊天正文。
 
+### 配置联系人记忆
+
+安装器已经部署联系人记忆插件，但首次安装和更新都保守地保持 `shadow` 模式。按以下顺序启用：
+
+1. 在桥接面板填写当前机器人微信账号的真实 `bot_wxid`。它用于区分不同微信账号；留空时私聊身份、记忆与发送均会失败关闭。
+2. 在 AstrBot 中创建或确认一个 OpenAI 兼容的 Qwen Provider，模型填写 `qwen3.7-max`，API Base 使用对应阿里云工作空间的 `/compatible-mode/v1` 根路径。
+3. 打开 `Akasha 联系人记忆` 插件配置，将 `source_provider_id` 选择为上述 Provider。正常安装无需填写桥接配置路径，启动脚本会在进程环境中传入。
+4. 通过管理员会话运行 `/akasha_memory status`，确认 `qwen_ready: True`。`shadow` 会同步和归档，但不会改变现有回复。
+5. 将 `mode` 改为 `active` 并重载插件。之后每个微信私聊联系人使用独立 Qwen conversation；群聊不会进入记忆系统。
+
+如果现有 Provider 的 `api_base` 不是 Responses API 根路径，只覆盖插件的 `qwen_responses_base_url`，API Key 仍从 `source_provider_id` 读取。不要在插件配置中复制 API Key。
+AstrBot 的 `tool_schema_mode` 请保持默认的 `full`；改成 `skills_like` 后，带工具的轮次会回退到源 Provider，并在下次回复前重建该联系人的云端会话。
+
+`/akasha_memory rebuild` 会让当前私聊联系人在下次回复时从本地记录重新播种；`/akasha_memory forget CONFIRM` 会删除当前联系人的云端会话和本地记忆。这两个命令只能从目标 Akasha 私聊执行，并要求管理员权限。
+
+私聊回复仍通过昵称或备注名搜索微信，但发送前必须从 WeFlow 联系人接口唯一匹配到本轮稳定 `sessionId`。同名、目标不符或接口不可验证时不会调用 UIA 发送；请为同名联系人设置唯一备注名后再试。
+
 ## 7. 日常启动、停止与检查
 
 安装目录中有 `校准.bat`、`启动.bat`、`停止.bat`、`健康检查.bat`。桌面只创建启动、停止、健康检查三个快捷方式。
@@ -78,7 +95,7 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 4. 如果显示环境或微信布局变化，运行安装目录的 `校准.bat` 重新校准。
 5. 运行 `启动.bat` 和 `健康检查.bat`。
 
-安装器拒绝在已记录服务仍运行时覆盖文件，并返回 `E_INSTALL_RUNNING`。正常重装保留安装根目录下的 `data` 和现有配置；旧桥接目录以及修改前的 WeFlow/AstrBot 配置会备份到 `data\backups`。
+安装器拒绝在已记录服务仍运行时覆盖文件，并返回 `E_INSTALL_RUNNING`。正常重装保留安装根目录下的 `data`、联系人记忆数据库和现有配置；旧桥接目录以及修改前的 WeFlow/AstrBot 配置会备份到 `data\backups`。联系人记忆插件代码在 AstrBot 初始化完成后单独暂存并原子替换，失败会恢复旧插件代码，不会删除 `data\astrbot\data\plugin_data`。
 
 ## 9. 常见错误
 
@@ -102,11 +119,11 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 
 ## 10. 日志、检测与安全排障
 
-安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`；`data\state` 只用于安装结果与进程诊断，不包含用于定位界面的校准细节。`bridge.log` 默认记录私聊联系人、群名与群成员、收到的完整正文、Bot 尝试发送的完整正文及 `sent`/`failed` 状态；令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
+安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`；`data\state` 还包含稳定身份映射和联系人记忆迁移前的一致性 SQLite 快照，不包含用于定位界面的校准细节。联系人消息数据库和 DPAPI 保护的本机密钥封装位于 `data\astrbot\data\plugin_data\astrbot_plugin_akasha_contact_memory`。`bridge.log` 默认记录私聊联系人、群名与群成员、收到的完整正文、Bot 尝试发送的完整正文及 `sent`/`failed` 状态；令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
 
 Web 控制面板只解析结构化 `CHAT` 记录，不返回其他原始运行日志；聊天区域显示完整联系人、群名、群成员、方向、状态和正文。面板及接口只接受 `127.0.0.1` 或 `localhost` 的同源请求。任何能使用当前 Windows 账户打开该面板的人都可能看到聊天内容。
 
-当前 `data\bridge\config.json` 与 `data\backups` 中的配置备份都可能包含敏感校准数据，诊断系统不会收集这些数据。`bridge.log` 也属于本机高敏数据。求助时只能提供经过人工逐行检查、删除联系人、正文、路径和凭据后的少量日志摘录，同时提供固定错误码、失败阶段、组件版本和四项健康检查结果。
+当前 `data\bridge\config.json`、`data\backups`、`data\state` 中的数据库或备份，以及 AstrBot `plugin_data` 都可能包含敏感身份或聊天数据，诊断系统不会收集这些数据。`bridge.log` 也属于本机高敏数据。求助时只能提供经过人工逐行检查、删除联系人、正文、路径和凭据后的少量日志摘录，同时提供固定错误码、失败阶段、组件版本和四项健康检查结果。
 
 绝不要发送 `data\bridge\config.json`。不要发送整个 `data` 目录、原始未检查日志、`FIRST_LOGIN.txt`、WeFlow/AstrBot 配置、API Key、令牌、数据库、聊天内容或附件。
 

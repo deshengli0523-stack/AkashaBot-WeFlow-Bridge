@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0 - 2026-07-24
+
+- Add an installer-managed AstrBot 4.26.6 plugin that permanently archives private WeChat history in local SQLite and isolates memory by the stable `(WeChat account, sessionId)` identity rather than nickname.
+- Give each private contact an independent Qwen Conversations session while reusing one existing AstrBot Provider and API key. Switching A → B → A resumes A's cloud conversation without re-seeding its complete history.
+- Seed new or expired Qwen sessions from at most 150,000 estimated tokens of relevant older records and recent confirmed history; rotate at a 700,000-token soft limit or after the provider's seven-day retention window.
+- Import the latest 2,000 WeFlow records on first contact use, fall back to 500 within the foreground budget, and continue an uncapped local backfill in the background.
+- Persist collision-safe OneBot identities in `data\state\bridge_identity.sqlite3`, reject private events without a stable `sessionId`, and carry per-source message references through buffered OneBot events.
+- Require a concrete bot `wxid` for private identity isolation, store only salted HMAC identity mappings, and reject ambiguous or unverifiable nickname routes before UIA can select the first result.
+- Deploy plugin code only after AstrBot initialization with exact-file validation, atomic replacement, rollback, and preservation of plugin data. Existing installs start in `shadow` mode.
+- Protect the local contact HMAC key with Windows DPAPI, encrypt raw account/session identifiers, keep API credentials in the existing AstrBot Provider, and require explicit confirmation before forgetting a contact.
+
+### Automated verification
+
+- Stable contact identity, same-nickname isolation, A → B → A cloud-session reuse, generated-output reconciliation, and local forget behavior are covered by focused plugin tests.
+- Bridge identity persistence, missing-session fail-closed behavior, buffered source references, installer atomicity, update preservation, rollback, and release allowlists are covered by the existing unified Windows test gate.
+
 ## 0.2.8 - 2026-07-23
 
 - Probe the WeFlow sessions endpoint during startup so current WeFlow versions do not reject readiness checks that omit the required message `talker`.

@@ -48,6 +48,8 @@ function Assert-AkashaTask8Layout {
     'SECURITY.md',
     'bridge\calibrate_uia_fixed.py',
     'bridge\uia_support.py',
+    'plugins\astrbot_plugin_akasha_contact_memory\main.py',
+    'tests\python\test_contact_memory.py',
     'scripts\Calibrate-Uia.ps1',
     (((Join-AkashaCharacters @(0x6821, 0x51C6))) + '.bat')
   )
@@ -64,8 +66,8 @@ function Assert-AkashaTask8Layout {
   }
 
   $publishedFiles = @(Get-AkashaPublishedFiles)
-  if ($publishedFiles.Count -ne 50) {
-    throw "Documentation/layout gate: expected 50 publish files, found $($publishedFiles.Count)."
+  if ($publishedFiles.Count -ne 65) {
+    throw "Documentation/layout gate: expected 65 publish files, found $($publishedFiles.Count)."
   }
 
   $updateLauncher = (Join-AkashaCharacters @(0x66F4, 0x65B0)) + '.bat'
@@ -209,10 +211,10 @@ jobs:
     }
   }
 
-  Assert-AkashaContains -Text $changelog -Expected '## 0.2.8 - 2026-07-23' -Context 'CHANGELOG.md'
+  Assert-AkashaContains -Text $changelog -Expected '## 0.3.0 - 2026-07-24' -Context 'CHANGELOG.md'
   $version = (Read-AkashaUtf8Strict -Path (Join-Path $root 'VERSION')).Trim()
-  if ($version -cne '0.2.8') {
-    throw "Documentation/layout gate: VERSION must be 0.2.8, found '$version'."
+  if ($version -cne '0.3.0') {
+    throw "Documentation/layout gate: VERSION must be 0.3.0, found '$version'."
   }
 
   foreach ($relativeLink in @('INSTALL.md', 'SECURITY.md')) {

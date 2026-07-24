@@ -23,6 +23,8 @@ import config
 from privacy import chat_record
 
 log = logging.getLogger("ob11-bridge")
+_CONTACTS_LIMIT = 10000
+_CONTACTS_TIMEOUT_SECONDS = 5
 
 
 def _write_outbound_log(scope: str, contact: object, body: object, sent: object) -> None:
@@ -37,6 +39,141 @@ def _write_outbound_log(scope: str, contact: object, body: object, sent: object)
         log.info("CHAT %s", entry)
     else:
         log.error("CHAT %s", entry)
+
+
+def _normalize_target_id(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized.isdecimal():
+            parsed = int(normalized)
+            return parsed if parsed > 0 else None
+    return None
+
+
+def _contact_route_names(contact: dict) -> set[str]:
+    output = set()
+    for key in ("displayName", "remark", "nickname", "alias"):
+        value = contact.get(key)
+        if isinstance(value, str) and value.strip():
+            output.add(value.strip().casefold())
+    return output
+
+
+def _resolve_private_contact(target_id: int) -> str | None:
+    try:
+        route = state.get_private_route(target_id)
+    except Exception:
+        log.warning("[OB11] 私聊路由状态不可用")
+        return None
+    if not isinstance(route, dict):
+        log.warning("[OB11] 私聊路由不存在")
+        return None
+    routing_name = route.get("routing_name")
+    if not isinstance(routing_name, str) or not routing_name.strip():
+        log.warning("[OB11] 私聊路由名称无效")
+        return None
+    routing_name = routing_name.strip()
+    base_url = str(getattr(config, "WE_FLOW_BASE_URL", "") or "").strip().rstrip("/")
+    token = str(getattr(config, "ACCESS_TOKEN", "") or "").strip()
+    account = str(getattr(config, "BOT_WXID", "") or "").strip()
+    if not account:
+        log.warning("[OB11] 私聊账号标识未配置")
+        return None
+    if not base_url or not token:
+        log.warning("[OB11] 私聊联系人校验未配置")
+        return None
+
+    try:
+        response = requests.get(
+            f"{base_url}/api/v1/contacts",
+            params={"keyword": routing_name, "limit": _CONTACTS_LIMIT},
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=_CONTACTS_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            log.warning(
+                "[OB11] 私聊联系人校验失败: status=%s",
+                response.status_code,
+            )
+            return None
+        payload = response.json()
+    except Exception:
+        log.warning("[OB11] 私聊联系人 API 不可用")
+        return None
+
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        log.warning("[OB11] 私聊联系人响应无效")
+        return None
+    contacts = payload.get("contacts")
+    count = payload.get("count")
+    if (
+        not isinstance(contacts, list)
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count != len(contacts)
+        or count >= _CONTACTS_LIMIT
+        or any(not isinstance(contact, dict) for contact in contacts)
+    ):
+        log.warning("[OB11] 私聊联系人列表不可验证")
+        return None
+
+    normalized_route = routing_name.casefold()
+    exact_matches = [
+        contact
+        for contact in contacts
+        if normalized_route in _contact_route_names(contact)
+    ]
+    if len(exact_matches) != 1:
+        log.warning(
+            "[OB11] 私聊联系人名称不唯一: matches=%s",
+            len(exact_matches),
+        )
+        return None
+    selected = exact_matches[0]
+    if str(selected.get("type") or "").strip().casefold() != "friend":
+        log.warning("[OB11] 私聊联系人类型不匹配")
+        return None
+    session = selected.get("username")
+    if not isinstance(session, str) or not session.strip():
+        log.warning("[OB11] 私聊联系人稳定标识缺失")
+        return None
+    try:
+        target_matches = state.private_route_matches(
+            route,
+            account=account,
+            session=session.strip(),
+        )
+    except Exception:
+        log.warning("[OB11] 私聊联系人稳定标识不可验证")
+        return None
+    if target_matches is not True:
+        log.warning("[OB11] 私聊联系人目标不匹配")
+        return None
+    return routing_name
+
+
+async def _send_api_response(response_data: dict) -> bool:
+    for retry in range(10):
+        try:
+            if state._ob_ws:
+                await state._ob_ws.send(json.dumps(response_data, ensure_ascii=False))
+                log.info("[OB11] API 响应已发送")
+                return True
+            if retry < 9:
+                await asyncio.sleep(0.5)
+        except Exception:
+            log.warning("[OB11] API 响应发送失败: attempt=%s/10", retry + 1)
+            if retry < 9:
+                await asyncio.sleep(0.5)
+    log.warning("[OB11] WS 未连接，API 响应未发送；继续尝试本地处理")
+    return False
 
 
 async def _handle_ob_api(data: dict, generation=None):
@@ -60,27 +197,9 @@ async def _handle_ob_api(data: dict, generation=None):
     echo = data.get("echo", "")
     log.info("[OB11] 收到 API 请求: has_echo=%s", bool(echo))
 
-    # 先回响应（必须在处理消息前回，否则 AstrBot 超时）
-    resp_sent = False
     resp_data = {"status": "ok", "retcode": 0, "data": {}}
     if echo:
         resp_data["echo"] = echo
-    # 如果 WS 暂时断连，等一会重试
-    for retry in range(10):
-        try:
-            if state._ob_ws:
-                await state._ob_ws.send(json.dumps(resp_data, ensure_ascii=False))
-                resp_sent = True
-                log.info("[OB11] API 响应已发送")
-                break
-            if retry < 9:
-                await asyncio.sleep(0.5)
-        except Exception:
-            log.warning("[OB11] API 响应发送失败: attempt=%s/10", retry + 1)
-            if retry < 9:
-                await asyncio.sleep(0.5)
-    if not resp_sent:
-        log.warning("[OB11] WS 未连接，API 响应未发送；继续尝试本地处理")
 
     if action in ("send_msg", "send_private_msg", "send_group_msg"):
         is_group = action == "send_group_msg" or (
@@ -90,21 +209,46 @@ async def _handle_ob_api(data: dict, generation=None):
                 or params.get("group_id") not in (None, "", 0, "0")
             )
         )
-        target_id = params.get("group_id" if is_group else "user_id", 0)
+        submitted_target = params.get("group_id" if is_group else "user_id", 0)
+        target_id = _normalize_target_id(submitted_target)
         message = params.get("message", [])
-        target_valid = (
-            isinstance(target_id, (int, str))
-            and not isinstance(target_id, bool)
-        )
-        contact = (
-            state._ob_id_to_contact.get(target_id, str(target_id))
-            if target_valid
-            else "未知"
-        )
         scope = "group" if is_group else "private"
-        if not params_valid or not target_valid or not isinstance(message, list):
+        if not params_valid or target_id is None or not isinstance(message, list):
+            failed_response = {
+                "status": "failed",
+                "retcode": 1400,
+                "data": {},
+            }
+            if echo:
+                failed_response["echo"] = echo
+            await _send_api_response(failed_response)
+            contact = "未知"
             _write_outbound_log(scope, contact, "[无效消息]", False)
             return
+
+        if is_group:
+            contact = state._ob_id_to_contact.get(target_id, str(target_id))
+        else:
+            contact = await asyncio.to_thread(_resolve_private_contact, target_id)
+            if contact is None:
+                failed_response = {
+                    "status": "failed",
+                    "retcode": 1404,
+                    "data": {},
+                }
+                if echo:
+                    failed_response["echo"] = echo
+                await _send_api_response(failed_response)
+                _write_outbound_log(
+                    "private",
+                    "未知",
+                    "[路由校验失败]",
+                    False,
+                )
+                return
+
+        # A successful ACK means the recipient passed all synchronous preflight.
+        await _send_api_response(resp_data)
 
         # 逐段处理：文字和图片分别发送
         for seg in message:
@@ -219,6 +363,7 @@ async def _handle_ob_api(data: dict, generation=None):
             # 其他类型（record, video 等）忽略
 
     else:
+        await _send_api_response(resp_data)
         log.debug("[OB11] 收到未处理的 API 操作")
 
     # 注意：API 响应已在函数开头统一发送，此处不再重复
@@ -257,12 +402,24 @@ def _extract_text(message: list) -> str:
 
 def make_message_event(message_type: str, user_id: int, message: list,
                        group_id: int = 0, group_name: str = "",
-                       nickname: str = "") -> dict:
+                       nickname: str = "", account: str = "",
+                       session: str = "", source_messages: list | None = None,
+                       routing_name: str = "") -> dict:
     """构造 OneBot v11 消息事件"""
     event = {
         "time": int(time.time()),
         "self_id": state._self_id_int,
         "post_type": "message",
+        "akasha_schema": 1,
+        "account": str(account),
+        "session": str(session),
+        "type": str(message_type),
+        "source_messages": [
+            dict(source_message)
+            for source_message in (source_messages or [])
+            if isinstance(source_message, dict)
+        ],
+        "routing_name": str(routing_name),
     }
     if message_type == "group":
         event["message_type"] = "group"

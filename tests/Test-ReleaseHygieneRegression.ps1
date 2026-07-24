@@ -476,6 +476,16 @@ try {
   Assert-GateFail -Case 'missing bridge file' -ExpectedMessage 'Missing publish file: bridge/web_panel.py'
   Copy-RepositoryFileToFixture -RelativePath 'bridge/web_panel.py'
 
+  $extraPluginPath = Get-FixturePath -RelativePath 'plugins/astrbot_plugin_akasha_contact_memory/unexpected.py'
+  Set-Content -LiteralPath $extraPluginPath -Value '# unexpected plugin file' -Encoding UTF8
+  Assert-GateFail -Case 'unexpected contact-memory plugin file' -ExpectedMessage 'Unexpected publish file: plugins/astrbot_plugin_akasha_contact_memory/unexpected.py'
+  Remove-Item -LiteralPath $extraPluginPath -Force
+
+  $requiredPluginPath = Get-FixturePath -RelativePath 'plugins/astrbot_plugin_akasha_contact_memory/main.py'
+  Remove-Item -LiteralPath $requiredPluginPath -Force
+  Assert-GateFail -Case 'missing contact-memory plugin main' -ExpectedMessage 'Missing publish file: plugins/astrbot_plugin_akasha_contact_memory/main.py'
+  Copy-RepositoryFileToFixture -RelativePath 'plugins/astrbot_plugin_akasha_contact_memory/main.py'
+
   $unexpectedRootPath = Get-FixturePath -RelativePath 'unexpected-root.txt'
   Set-Content -LiteralPath $unexpectedRootPath -Value 'unexpected' -Encoding UTF8
   Assert-GateFail -Case 'unexpected release root file' -ExpectedMessage 'Unexpected publish file: unexpected-root.txt'

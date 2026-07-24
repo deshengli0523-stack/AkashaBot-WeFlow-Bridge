@@ -37,6 +37,20 @@ $expectedPublishFiles = @(
   'bridge/uia_fixed_sender.py',
   'bridge/uia_support.py',
   'bridge/web_panel.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/README.md',
+  'plugins/astrbot_plugin_akasha_contact_memory/_conf_schema.json',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/__init__.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/context_builder.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/models.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/provider.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/qwen_client.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/qwen_session.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/runtime.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/security.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/store.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/weflow_sync.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/main.py',
+  'plugins/astrbot_plugin_akasha_contact_memory/metadata.yaml',
   'scripts/AkashaBot.Common.psm1',
   'scripts/Calibrate-Uia.ps1',
   'scripts/Initialize-Configuration.ps1',
@@ -55,6 +69,7 @@ $expectedPublishFiles = @(
   'tests/Test-ReleaseHygieneRegression.ps1',
   'tests/Run-All.ps1',
   'tests/python/test_bridge_runtime.py',
+  'tests/python/test_contact_memory.py',
   'tests/python/test_uia_calibration.py',
   'tests/python/test_uia_fixed_sender.py',
   'tests/python/test_uia_support.py',
@@ -64,12 +79,12 @@ $expectedPublishFiles = @(
   ((-join @([char]0x5065, [char]0x5EB7, [char]0x68C0, [char]0x67E5)) + '.bat'),
   ((-join @([char]0x6821, [char]0x51C6)) + '.bat')
 )
-if ($expectedPublishFiles.Count -ne 50) {
-  throw "Release allowlist invariant is not 50 files: $($expectedPublishFiles.Count)"
+if ($expectedPublishFiles.Count -ne 65) {
+  throw "Release allowlist invariant is not 65 files: $($expectedPublishFiles.Count)"
 }
 $uniqueExpectedPublishFiles = @($expectedPublishFiles | Sort-Object -Unique)
-if ($uniqueExpectedPublishFiles.Count -ne 50) {
-  throw "Release allowlist must contain 50 unique entries; duplicate entries were found."
+if ($uniqueExpectedPublishFiles.Count -ne 65) {
+  throw "Release allowlist must contain 65 unique entries; duplicate entries were found."
 }
 $publishFiles = @(
   foreach ($entry in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop |
@@ -97,8 +112,8 @@ foreach ($relativePath in $actualPublishFiles) {
   }
 }
 $uniqueActualPublishFiles = @($actualPublishFiles | Sort-Object -Unique)
-if ($actualPublishFiles.Count -ne 50 -or $uniqueActualPublishFiles.Count -ne 50) {
-  throw "Published files must contain exactly 50 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
+if ($actualPublishFiles.Count -ne 65 -or $uniqueActualPublishFiles.Count -ne 65) {
+  throw "Published files must contain exactly 65 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
 }
 
 $bridgeRoot = Join-Path $root 'bridge'
@@ -761,8 +776,8 @@ foreach ($file in $textFiles) {
 }
 
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
-if ($version -cne '0.2.8') {
-  throw "VERSION must be 0.2.8, found '$version'."
+if ($version -cne '0.3.0') {
+  throw "VERSION must be 0.3.0, found '$version'."
 }
 
 $template = Get-Content -LiteralPath (Join-Path $root 'bridge\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json

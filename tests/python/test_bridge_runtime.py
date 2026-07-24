@@ -8,6 +8,7 @@ import pathlib
 import re
 import runpy
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -245,6 +246,73 @@ class BridgeRuntimeTests(unittest.TestCase):
         cache_dir = pathlib.Path(__file__).parent / "__pycache__"
         if cache_dir.is_dir():
             shutil.rmtree(cache_dir)
+
+    @staticmethod
+    def _load_ob_protocol(module_name, state_module, config_module, requests_module):
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            BRIDGE / "ob_protocol.py",
+        )
+        protocol = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(protocol)
+        return protocol
+
+    @staticmethod
+    def _configure_verified_private_route(
+        state_module,
+        config_module,
+        requests_module,
+        *,
+        target_id=7,
+        routing_name="private-contact",
+        session="private-session",
+    ):
+        expected_session = session
+        route = {
+            "ob_id": target_id,
+            "identity_hmac": b"r" * 32,
+            "routing_name": routing_name,
+        }
+        state_module.get_private_route = (
+            lambda ob_id: route if int(ob_id) == target_id else None
+        )
+        state_module.private_route_matches = (
+            lambda supplied_route, *, account, session: (
+                supplied_route is route
+                and account == "test-bot-account"
+                and session == expected_session
+            )
+        )
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "test-" + "contacts-" + "token"
+        config_module.BOT_WXID = "test-bot-account"
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "success": True,
+                    "count": 1,
+                    "contacts": [
+                        {
+                            "username": session,
+                            "displayName": routing_name,
+                            "type": "friend",
+                        }
+                    ],
+                }
+
+        requests_module.get = lambda *_args, **_kwargs: FakeResponse()
 
     def test_config_and_log_paths_follow_environment(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1267,6 +1335,11 @@ class BridgeRuntimeTests(unittest.TestCase):
             config_module = types.ModuleType("config")
             config_module.ASTRBOT_ATTACHMENTS = str(root)
             requests_module = types.ModuleType("requests")
+            self._configure_verified_private_route(
+                state_module,
+                config_module,
+                requests_module,
+            )
 
             spec = importlib.util.spec_from_file_location(
                 "task4_ob_protocol_under_test",
@@ -1363,6 +1436,11 @@ class BridgeRuntimeTests(unittest.TestCase):
             config_module = types.ModuleType("config")
             config_module.ASTRBOT_ATTACHMENTS = str(root)
             requests_module = types.ModuleType("requests")
+            self._configure_verified_private_route(
+                state_module,
+                config_module,
+                requests_module,
+            )
 
             spec = importlib.util.spec_from_file_location(
                 "task4_ob_protocol_exception_test",
@@ -1421,6 +1499,11 @@ class BridgeRuntimeTests(unittest.TestCase):
             config_module = types.ModuleType("config")
             config_module.ASTRBOT_ATTACHMENTS = str(root)
             requests_module = types.ModuleType("requests")
+            self._configure_verified_private_route(
+                state_module,
+                config_module,
+                requests_module,
+            )
 
             spec = importlib.util.spec_from_file_location(
                 "task4_ob_protocol_image_precondition_test",
@@ -1480,6 +1563,11 @@ class BridgeRuntimeTests(unittest.TestCase):
         config_module = types.ModuleType("config")
         config_module.ASTRBOT_ATTACHMENTS = ""
         requests_module = types.ModuleType("requests")
+        self._configure_verified_private_route(
+            state_module,
+            config_module,
+            requests_module,
+        )
         spec = importlib.util.spec_from_file_location(
             "task4_ob_protocol_malformed_segment_test",
             BRIDGE / "ob_protocol.py",
@@ -1539,6 +1627,965 @@ class BridgeRuntimeTests(unittest.TestCase):
                 self.assertEqual(len(chat_lines), 1)
                 self.assertIn('"status":"failed"', chat_lines[0])
                 self.assertNotIn("must not run", "\n".join(logs.output))
+
+    def test_bridge_identity_uses_persistent_salt_without_plaintext_identifiers(self):
+        def load_state(module_name):
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                BRIDGE / "state.py",
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ,
+                {"AKASHABOT_STATE_DIR": temporary},
+                clear=False,
+            ):
+                first_state = load_state("bridge_identity_state_first")
+                first_id = first_state._wxid_to_int(
+                    "wxid-contact-a",
+                    account="wxid-bot",
+                    identity_type="private",
+                )
+                second_state = load_state("bridge_identity_state_second")
+                repeated_id = second_state._wxid_to_int(
+                    "wxid-contact-a",
+                    account="wxid-bot",
+                    identity_type="private",
+                )
+                other_id = second_state._wxid_to_int(
+                    "wxid-contact-a",
+                    account="wxid-bot",
+                    identity_type="group",
+                )
+
+            self.assertEqual(first_id, repeated_id)
+            self.assertNotEqual(first_id, other_id)
+            self.assertGreater(first_id, 0)
+            self.assertLessEqual(first_id, (1 << 53) - 1)
+
+            database_path = pathlib.Path(temporary) / "bridge_identity.sqlite3"
+            self.assertTrue(database_path.is_file())
+            connection = sqlite3.connect(database_path)
+            try:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                self.assertIn("identity_meta", tables)
+                salt = connection.execute(
+                    """
+                    SELECT value
+                    FROM identity_meta
+                    WHERE key = 'identity_salt'
+                    """
+                ).fetchone()
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(identity_map)"
+                    ).fetchall()
+                }
+                rows = connection.execute(
+                    """
+                    SELECT identity_hmac, ob_id
+                    FROM identity_map
+                    ORDER BY ob_id
+                    """
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(version, 2)
+            self.assertIsNotNone(salt)
+            self.assertEqual(len(salt[0]), 32)
+            self.assertNotIn("account", columns)
+            self.assertNotIn("source_id", columns)
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(len(row[0]) == 32 for row in rows))
+            self.assertIn(first_id, {row[1] for row in rows})
+            raw_database = database_path.read_bytes()
+            self.assertNotIn(b"wxid-bot", raw_database)
+            self.assertNotIn(b"wxid-contact-a", raw_database)
+
+    def test_bridge_identity_migrates_plaintext_v1_without_changing_ob_id(self):
+        def load_state(module_name):
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                BRIDGE / "state.py",
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = pathlib.Path(temporary) / "bridge_identity.sqlite3"
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE identity_map (
+                        account TEXT NOT NULL,
+                        identity_type TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        ob_id INTEGER NOT NULL UNIQUE,
+                        created_at INTEGER NOT NULL,
+                        PRIMARY KEY (account, identity_type, source_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO identity_map (
+                        account,
+                        identity_type,
+                        source_id,
+                        ob_id,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-account-private",
+                        "private",
+                        "legacy-session-private",
+                        424242,
+                        1,
+                    ),
+                )
+                connection.execute("PRAGMA user_version = 1")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with mock.patch.dict(
+                os.environ,
+                {"AKASHABOT_STATE_DIR": temporary},
+                clear=False,
+            ):
+                state_module = load_state("bridge_identity_state_migration")
+                migrated_id = state_module._wxid_to_int(
+                    "legacy-session-private",
+                    account="legacy-account-private",
+                    identity_type="private",
+                )
+
+            self.assertEqual(migrated_id, 424242)
+            connection = sqlite3.connect(database_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(identity_map)"
+                    ).fetchall()
+                }
+                self.assertIn("identity_hmac", columns)
+                self.assertNotIn("account", columns)
+                self.assertNotIn("source_id", columns)
+                legacy_table = connection.execute(
+                    """
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = 'identity_map_legacy'
+                    """
+                ).fetchone()
+                row = connection.execute(
+                    "SELECT identity_hmac, ob_id FROM identity_map"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertIsNone(legacy_table)
+            self.assertEqual(row[1], 424242)
+            self.assertEqual(len(row[0]), 32)
+            raw_database = database_path.read_bytes()
+            self.assertNotIn(b"legacy-account-private", raw_database)
+            self.assertNotIn(b"legacy-session-private", raw_database)
+
+    def test_private_route_persists_hmac_identity_and_refreshes_routing_name(self):
+        def load_state(module_name):
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                BRIDGE / "state.py",
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ,
+                {"AKASHABOT_STATE_DIR": temporary},
+                clear=False,
+            ):
+                first_state = load_state("bridge_private_route_state_first")
+                self.assertTrue(
+                    hasattr(first_state, "remember_private_route"),
+                    "persistent private route API is missing",
+                )
+                ob_id = first_state.remember_private_route(
+                    "private-session-raw",
+                    account="private-account-raw",
+                    routing_name="唯一备注",
+                )
+                repeated_id = first_state.remember_private_route(
+                    "private-session-raw",
+                    account="private-account-raw",
+                    routing_name="更新备注",
+                )
+                second_state = load_state("bridge_private_route_state_second")
+                route = second_state.get_private_route(ob_id)
+
+                self.assertEqual(repeated_id, ob_id)
+                self.assertIsNotNone(route)
+                self.assertEqual(route["routing_name"], "更新备注")
+                self.assertTrue(
+                    second_state.private_route_matches(
+                        route,
+                        account="private-account-raw",
+                        session="private-session-raw",
+                    )
+                )
+                self.assertFalse(
+                    second_state.private_route_matches(
+                        route,
+                        account="private-account-raw",
+                        session="different-session",
+                    )
+                )
+
+            database_path = pathlib.Path(temporary) / "bridge_identity.sqlite3"
+            connection = sqlite3.connect(database_path)
+            try:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(private_routes)"
+                    ).fetchall()
+                }
+                rows = connection.execute(
+                    """
+                    SELECT ob_id, identity_hmac, routing_name
+                    FROM private_routes
+                    """
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(
+                columns,
+                {"ob_id", "identity_hmac", "routing_name", "updated_at"},
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], ob_id)
+            self.assertEqual(len(rows[0][1]), 32)
+            self.assertEqual(rows[0][2], "更新备注")
+            raw_database = database_path.read_bytes()
+            self.assertNotIn(b"private-account-raw", raw_database)
+            self.assertNotIn(b"private-session-raw", raw_database)
+
+    def test_private_send_uses_only_unique_contacts_match_for_stable_route(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send(self, payload):
+                self.payloads.append(json.loads(payload))
+
+        class FakeSender:
+            def __init__(self):
+                self.calls = []
+
+            def send_text(self, contact, text):
+                self.calls.append((contact, text))
+                return True
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "success": True,
+                    "count": 1,
+                    "contacts": [
+                        {
+                            "username": "stable-private-session",
+                            "displayName": "唯一备注",
+                            "remark": "唯一备注",
+                            "nickname": "原昵称",
+                            "alias": "alias",
+                            "type": "friend",
+                        }
+                    ],
+                }
+
+        route = {
+            "ob_id": 7,
+            "identity_hmac": b"x" * 32,
+            "routing_name": "唯一备注",
+        }
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = FakeWebSocket()
+        state_module._ob_id_to_contact = {}
+        state_module.sender_instance = FakeSender()
+        state_module.get_private_route = lambda ob_id: route if ob_id == 7 else None
+        state_module.private_route_matches = (
+            lambda supplied_route, *, account, session: (
+                supplied_route is route
+                and account == "bot-account"
+                and session == "stable-private-session"
+            )
+        )
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "contacts-" + "token"
+        config_module.BOT_WXID = "bot-account"
+        request_calls = []
+        requests_module = types.ModuleType("requests")
+
+        def get_contacts(url, **kwargs):
+            request_calls.append((url, kwargs))
+            return FakeResponse()
+
+        requests_module.get = get_contacts
+        protocol = self._load_ob_protocol(
+            "private_route_success_ob_protocol",
+            state_module,
+            config_module,
+            requests_module,
+        )
+
+        request = {
+            "action": "send_private_msg",
+            "params": {
+                "user_id": "7",
+                "message": [
+                    {"type": "text", "data": {"text": "private-body"}}
+                ],
+            },
+            "echo": "private-route-success",
+        }
+        with self.assertLogs("ob11-bridge", level="INFO"):
+            asyncio.run(protocol._handle_ob_api(request))
+
+        self.assertEqual(
+            state_module.sender_instance.calls,
+            [("唯一备注", "private-body")],
+        )
+        self.assertEqual(len(request_calls), 1)
+        url, kwargs = request_calls[0]
+        self.assertEqual(url, "http://127.0.0.1:5031/api/v1/contacts")
+        self.assertEqual(
+            kwargs["params"],
+            {"keyword": "唯一备注", "limit": 10000},
+        )
+        self.assertEqual(
+            kwargs["headers"]["Authorization"],
+            "Bearer contacts-" + "token",
+        )
+        self.assertGreater(kwargs["timeout"], 0)
+        self.assertEqual(state_module._ob_ws.payloads[-1]["status"], "ok")
+        self.assertEqual(state_module._ob_ws.payloads[-1]["retcode"], 0)
+
+    def test_private_send_fails_closed_before_uia_when_route_is_not_verifiable(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send(self, payload):
+                self.payloads.append(json.loads(payload))
+
+        class UnexpectedSender:
+            def __init__(self):
+                self.calls = []
+
+            def send_text(self, contact, text):
+                self.calls.append((contact, text))
+                return True
+
+        class FakeResponse:
+            def __init__(self, payload=None, status_code=200):
+                self._payload = payload
+                self.status_code = status_code
+
+            def json(self):
+                return self._payload
+
+        route = {
+            "ob_id": 7,
+            "identity_hmac": b"x" * 32,
+            "routing_name": "同名联系人",
+        }
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = FakeWebSocket()
+        state_module._ob_id_to_contact = {7: "unsafe-memory-fallback"}
+        state_module.sender_instance = UnexpectedSender()
+        state_module.get_private_route = lambda ob_id: route if ob_id == 7 else None
+        state_module.private_route_matches = (
+            lambda _route, *, account, session: (
+                account == "bot-account" and session == "expected-session"
+            )
+        )
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "contacts-" + "token"
+        config_module.BOT_WXID = "bot-account"
+        requests_module = types.ModuleType("requests")
+        current_result = {"value": None}
+
+        def get_contacts(*_args, **_kwargs):
+            value = current_result["value"]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        requests_module.get = get_contacts
+        protocol = self._load_ob_protocol(
+            "private_route_failure_ob_protocol",
+            state_module,
+            config_module,
+            requests_module,
+        )
+        request = {
+            "action": "send_private_msg",
+            "params": {
+                "user_id": 7,
+                "message": [
+                    {"type": "text", "data": {"text": "must-not-send"}}
+                ],
+            },
+            "echo": "private-route-failure",
+        }
+        cases = {
+            "duplicate routing name": FakeResponse(
+                {
+                    "success": True,
+                    "count": 2,
+                    "contacts": [
+                        {
+                            "username": "expected-session",
+                            "displayName": "同名联系人",
+                            "type": "friend",
+                        },
+                        {
+                            "username": "other-session",
+                            "remark": "同名联系人",
+                            "type": "friend",
+                        },
+                    ],
+                }
+            ),
+            "stable target mismatch": FakeResponse(
+                {
+                    "success": True,
+                    "count": 1,
+                    "contacts": [
+                        {
+                            "username": "other-session",
+                            "displayName": "同名联系人",
+                            "type": "friend",
+                        }
+                    ],
+                }
+            ),
+            "wrong contact type": FakeResponse(
+                {
+                    "success": True,
+                    "count": 1,
+                    "contacts": [
+                        {
+                            "username": "expected-session",
+                            "displayName": "同名联系人",
+                            "type": "group",
+                        }
+                    ],
+                }
+            ),
+            "truncated result": FakeResponse(
+                {
+                    "success": True,
+                    "count": 10000,
+                    "contacts": [
+                        {
+                            "username": "expected-session",
+                            "displayName": "同名联系人",
+                            "type": "friend",
+                        }
+                    ],
+                }
+            ),
+            "http failure": FakeResponse({}, status_code=503),
+            "malformed payload": FakeResponse({"success": True, "contacts": {}}),
+            "unavailable": RuntimeError("contacts unavailable"),
+        }
+        for label, result in cases.items():
+            with self.subTest(case=label):
+                current_result["value"] = result
+                state_module._ob_ws.payloads.clear()
+                state_module.sender_instance.calls.clear()
+                with self.assertLogs("ob11-bridge", level="INFO"):
+                    asyncio.run(protocol._handle_ob_api(request))
+                self.assertEqual(state_module.sender_instance.calls, [])
+                self.assertEqual(len(state_module._ob_ws.payloads), 1)
+                self.assertEqual(
+                    state_module._ob_ws.payloads[0]["status"],
+                    "failed",
+                )
+                self.assertNotEqual(
+                    state_module._ob_ws.payloads[0]["retcode"],
+                    0,
+                )
+
+        state_module.get_private_route = lambda _ob_id: None
+        current_result["value"] = FakeResponse(
+            {"success": True, "count": 0, "contacts": []}
+        )
+        state_module._ob_ws.payloads.clear()
+        with self.assertLogs("ob11-bridge", level="INFO"):
+            asyncio.run(protocol._handle_ob_api(request))
+        self.assertEqual(state_module.sender_instance.calls, [])
+        self.assertEqual(state_module._ob_ws.payloads[0]["status"], "failed")
+
+        state_module.get_private_route = (
+            lambda ob_id: route if ob_id == 7 else None
+        )
+        state_module.private_route_matches = (
+            lambda _route, *, account, session: True
+        )
+        config_module.BOT_WXID = ""
+        current_result["value"] = FakeResponse(
+            {
+                "success": True,
+                "count": 1,
+                "contacts": [
+                    {
+                        "username": "expected-session",
+                        "displayName": "同名联系人",
+                        "type": "friend",
+                    }
+                ],
+            }
+        )
+        state_module._ob_ws.payloads.clear()
+        state_module.sender_instance.calls.clear()
+        with self.assertLogs("ob11-bridge", level="INFO"):
+            asyncio.run(protocol._handle_ob_api(request))
+        self.assertEqual(state_module.sender_instance.calls, [])
+        self.assertEqual(state_module._ob_ws.payloads[0]["status"], "failed")
+
+    def test_group_send_keeps_existing_route_without_contacts_api(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send(self, payload):
+                self.payloads.append(json.loads(payload))
+
+        class FakeSender:
+            def __init__(self):
+                self.calls = []
+
+            def send_text(self, contact, text):
+                self.calls.append((contact, text))
+                return True
+
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = FakeWebSocket()
+        state_module._ob_id_to_contact = {9: "现有群聊"}
+        state_module.sender_instance = FakeSender()
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        requests_module = types.ModuleType("requests")
+        requests_module.get = mock.Mock(
+            side_effect=AssertionError("group must not query contacts API")
+        )
+        protocol = self._load_ob_protocol(
+            "group_route_unchanged_ob_protocol",
+            state_module,
+            config_module,
+            requests_module,
+        )
+        request = {
+            "action": "send_group_msg",
+            "params": {
+                "group_id": 9,
+                "message": [{"type": "text", "data": {"text": "group-body"}}],
+            },
+            "echo": "group-route",
+        }
+
+        with self.assertLogs("ob11-bridge", level="INFO"):
+            asyncio.run(protocol._handle_ob_api(request))
+
+        self.assertEqual(
+            state_module.sender_instance.calls,
+            [("现有群聊", "group-body")],
+        )
+        requests_module.get.assert_not_called()
+        self.assertEqual(state_module._ob_ws.payloads[-1]["status"], "ok")
+
+    def test_onebot_message_event_contains_exact_akasha_contract(self):
+        state_module = types.ModuleType("state")
+        state_module._self_id_int = 91
+        state_module._ob_ws = None
+        state_module._ob_ws_loop = None
+        state_module._ob_id_to_contact = {}
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        requests_module = types.ModuleType("requests")
+
+        spec = importlib.util.spec_from_file_location(
+            "akasha_contract_ob_protocol",
+            BRIDGE / "ob_protocol.py",
+        )
+        protocol = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(protocol)
+
+        source_messages = [
+            {
+                "rawid": "server-1",
+                "timestamp": 123,
+                "event_fingerprint": "a" * 64,
+                "buffer_ordinal": 1,
+                "id_quality": "rawid",
+            }
+        ]
+        event = protocol.make_message_event(
+            "private",
+            73,
+            [{"type": "text", "data": {"text": "hello"}}],
+            nickname="route-name",
+            account="wxid-bot",
+            session="wxid-contact",
+            source_messages=source_messages,
+            routing_name="route-name",
+        )
+
+        self.assertEqual(event["akasha_schema"], 1)
+        self.assertEqual(event["account"], "wxid-bot")
+        self.assertEqual(event["session"], "wxid-contact")
+        self.assertEqual(event["type"], "private")
+        self.assertEqual(event["source_messages"], source_messages)
+        self.assertIsNot(event["source_messages"][0], source_messages[0])
+        self.assertEqual(event["routing_name"], "route-name")
+        json.dumps(event, ensure_ascii=False)
+
+    def test_private_buffer_requires_session_and_preserves_source_refs(self):
+        class FakeTimer:
+            def __init__(self, *_args, **_kwargs):
+                self.daemon = False
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        identity_calls = []
+        private_route_calls = []
+        pushed_events = []
+
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        state_module._self_id_int = 1
+        state_module._ob_id_to_contact = {}
+
+        def identity_mapper(source_id, **kwargs):
+            identity_calls.append((source_id, kwargs))
+            return 7001
+
+        def remember_private_route(session, **kwargs):
+            private_route_calls.append((session, kwargs))
+            return 7001
+
+        state_module._wxid_to_int = identity_mapper
+        state_module.remember_private_route = remember_private_route
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = "wxid-bot"
+        config_module.BUFFER_SECONDS = 5
+        ob_protocol_module = types.ModuleType("ob_protocol")
+
+        def make_event(message_type, user_id, message, **kwargs):
+            return {
+                "message_type": message_type,
+                "user_id": user_id,
+                "message": message,
+                **kwargs,
+            }
+
+        ob_protocol_module.make_message_event = make_event
+        ob_protocol_module.push_event = lambda event: pushed_events.append(event) or 1
+        requests_module = types.ModuleType("requests")
+
+        spec = importlib.util.spec_from_file_location(
+            "bridge_source_reference_test",
+            BRIDGE / "bridge_core.py",
+        )
+        bridge_core = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "ob_protocol": ob_protocol_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(bridge_core)
+
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        with mock.patch.object(bridge_core.threading, "Timer", FakeTimer):
+            with self.assertLogs("ob11-bridge", level="WARNING"):
+                bridge.add_to_buffer(
+                    {
+                        "content": "missing stable identity",
+                        "sourceName": "route-only-name",
+                        "sessionType": "private",
+                    }
+                )
+            self.assertEqual(bridge.pending_buffers, {})
+
+            bridge.add_to_buffer(
+                {
+                    "content": "first",
+                    "sourceName": "route-name",
+                    "sessionId": "wxid-contact",
+                    "sessionType": "private",
+                    "rawid": "server-1",
+                    "timestamp": 101,
+                }
+            )
+            bridge.add_to_buffer(
+                {
+                    "content": "second",
+                    "sourceName": "route-name",
+                    "sessionId": "wxid-contact",
+                    "sessionType": "private",
+                    "rawid": "",
+                    "timestamp": "102",
+                }
+            )
+
+        refs = bridge.pending_buffers["wxid-contact"]["source_messages"]
+        self.assertEqual([ref["buffer_ordinal"] for ref in refs], [1, 2])
+        self.assertEqual(refs[0]["id_quality"], "rawid")
+        self.assertEqual(refs[1]["id_quality"], "event_fingerprint")
+        self.assertRegex(refs[0]["event_fingerprint"], r"^[0-9a-f]{64}$")
+
+        bridge.process_sender("wxid-contact")
+        self.assertEqual(
+            private_route_calls,
+            [
+                (
+                    "wxid-contact",
+                    {"account": "wxid-bot", "routing_name": "route-name"},
+                )
+            ],
+        )
+        self.assertEqual(identity_calls, [])
+        self.assertEqual(len(pushed_events), 1)
+        event = pushed_events[0]
+        self.assertEqual(event["account"], "wxid-bot")
+        self.assertEqual(event["session"], "wxid-contact")
+        self.assertEqual(event["routing_name"], "route-name")
+        self.assertEqual(event["source_messages"], refs)
+
+        with mock.patch.object(bridge_core.threading, "Timer", FakeTimer):
+            bridge.add_to_buffer(
+                {
+                    "content": "group still accepted",
+                    "sourceName": "group-route",
+                    "senderName": "member",
+                    "groupName": "group-route",
+                    "sessionType": "group",
+                    "rawid": "group-1",
+                    "timestamp": 103,
+                }
+            )
+        group_keys = [
+            key
+            for key, entry in bridge.pending_buffers.items()
+            if entry["is_group"] and entry["messages"]
+        ]
+        self.assertEqual(len(group_keys), 1)
+        bridge.process_sender(group_keys[0])
+        self.assertEqual(len(pushed_events), 2)
+        group_event = pushed_events[1]
+        self.assertEqual(group_event["message_type"], "group")
+        self.assertEqual(group_event["session"], "group-route")
+        self.assertEqual(group_event["routing_name"], "group-route")
+        self.assertIn(
+            "member在群group-route中说：group still accepted",
+            group_event["message"][1]["data"]["text"],
+        )
+
+    def test_private_buffer_is_not_pushed_when_route_persistence_fails(self):
+        pushed_events = []
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        state_module._self_id_int = 1
+        state_module._ob_id_to_contact = {}
+        state_module.remember_private_route = mock.Mock(
+            side_effect=RuntimeError("injected route persistence failure")
+        )
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = "wxid-bot"
+        config_module.BUFFER_SECONDS = 5
+        ob_protocol_module = types.ModuleType("ob_protocol")
+        ob_protocol_module.make_message_event = lambda *args, **kwargs: {
+            "args": args,
+            **kwargs,
+        }
+        ob_protocol_module.push_event = (
+            lambda event: pushed_events.append(event) or 1
+        )
+        requests_module = types.ModuleType("requests")
+        bridge_core = importlib.util.module_from_spec(
+            importlib.util.spec_from_file_location(
+                "bridge_route_persistence_failure_test",
+                BRIDGE / "bridge_core.py",
+            )
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "ob_protocol": ob_protocol_module,
+                "requests": requests_module,
+            },
+        ):
+            bridge_core.__spec__.loader.exec_module(bridge_core)
+
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge.pending_buffers["wxid-contact"] = {
+            "messages": ["must not push"],
+            "source_messages": [],
+            "timer": None,
+            "timer_version": 1,
+            "processing": False,
+            "contact": "route-name",
+            "is_group": False,
+            "source_name": "route-name",
+            "group_name": "",
+            "sender_in_group": "",
+            "session_id_data": "wxid-contact",
+        }
+        caught = None
+        with self.assertLogs("ob11-bridge", level="WARNING"):
+            try:
+                bridge.process_sender("wxid-contact")
+            except RuntimeError as exc:
+                caught = exc
+
+        self.assertIsNone(caught, "route persistence failure escaped timer callback")
+        self.assertEqual(pushed_events, [])
+        self.assertFalse(
+            bridge.pending_buffers["wxid-contact"]["processing"]
+        )
+
+        state_module.remember_private_route.side_effect = None
+        state_module.remember_private_route.return_value = 7001
+        state_module.remember_private_route.reset_mock()
+        config_module.BOT_WXID = ""
+        with self.assertLogs("ob11-bridge", level="WARNING"):
+            bridge.process_sender("wxid-contact")
+
+        state_module.remember_private_route.assert_not_called()
+        self.assertEqual(pushed_events, [])
+        self.assertEqual(
+            bridge.pending_buffers["wxid-contact"]["messages"],
+            ["must not push"],
+        )
+        self.assertFalse(
+            bridge.pending_buffers["wxid-contact"]["processing"]
+        )
+
+    def test_sse_messages_without_rawid_are_not_added_to_processed_ids(self):
+        timestamp = 2_000_000_000
+        payloads = [
+            {
+                "content": "first",
+                "sourceName": "route-name",
+                "sessionId": "wxid-contact",
+                "sessionType": "private",
+                "timestamp": timestamp,
+                "rawid": "",
+            },
+            {
+                "content": "second",
+                "sourceName": "route-name",
+                "sessionId": "wxid-contact",
+                "sessionType": "private",
+                "timestamp": timestamp,
+            },
+        ]
+
+        class FakeResponse:
+            status_code = 200
+
+            def iter_lines(self, decode_unicode=False):
+                self.decode_unicode = decode_unicode
+                return [
+                    "data:" + json.dumps(payload, ensure_ascii=False)
+                    for payload in payloads
+                ]
+
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = ""
+        config_module.BUFFER_SECONDS = 5
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "test-token"
+        ob_protocol_module = types.ModuleType("ob_protocol")
+        ob_protocol_module.make_message_event = lambda *_args, **_kwargs: {}
+        ob_protocol_module.push_event = lambda _event: 1
+        requests_module = types.ModuleType("requests")
+        requests_module.get = lambda *_args, **_kwargs: FakeResponse()
+        requests_module.exceptions = types.SimpleNamespace(
+            ConnectionError=ConnectionError,
+        )
+
+        spec = importlib.util.spec_from_file_location(
+            "bridge_empty_rawid_sse_test",
+            BRIDGE / "bridge_core.py",
+        )
+        bridge_core = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "ob_protocol": ob_protocol_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(bridge_core)
+
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge.start_timestamp = timestamp - 1
+        bridge.add_to_buffer = mock.Mock()
+        bridge.listen_sse()
+
+        self.assertEqual(bridge.add_to_buffer.call_count, 2)
+        self.assertEqual(bridge.processed_ids, set())
 
     def test_inbound_chat_logs_include_private_contact_group_sender_and_full_body(self):
         class FakeTimer:
@@ -1644,6 +2691,11 @@ class BridgeRuntimeTests(unittest.TestCase):
             config_module = types.ModuleType("config")
             config_module.ASTRBOT_ATTACHMENTS = str(root)
             requests_module = types.ModuleType("requests")
+            self._configure_verified_private_route(
+                state_module,
+                config_module,
+                requests_module,
+            )
 
             spec = importlib.util.spec_from_file_location(
                 "task4_ob_protocol_tmp_path_test",
