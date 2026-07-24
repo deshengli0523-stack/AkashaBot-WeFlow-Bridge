@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+import importlib.util
 import json
 import pathlib
 import sqlite3
@@ -8,6 +9,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
@@ -24,7 +26,220 @@ from akasha_memory.security import SecretManager  # noqa: E402
 from akasha_memory.store import MemoryStore  # noqa: E402
 
 
+def _load_plugin_main_with_astrbot_stubs():
+    def decorator(*_args, **_kwargs):
+        def apply(function):
+            return function
+
+        return apply
+
+    def command_group(*_args, **_kwargs):
+        def apply(function):
+            function.command = decorator
+            return function
+
+        return apply
+
+    filter_stub = types.SimpleNamespace(
+        EventMessageType=types.SimpleNamespace(PRIVATE_MESSAGE="private"),
+        PermissionType=types.SimpleNamespace(ADMIN="admin"),
+        after_message_sent=decorator,
+        command_group=command_group,
+        event_message_type=decorator,
+        on_agent_done=decorator,
+        on_astrbot_loaded=decorator,
+        on_llm_request=decorator,
+        permission_type=decorator,
+    )
+
+    class FakeStar:
+        def __init__(self, context, config=None):
+            self.context = context
+            self.config = config or {}
+
+    class FakeProvider:
+        pass
+
+    provider_cls_map = {}
+
+    def register_provider_adapter(provider_type, _description):
+        def apply(provider_class):
+            provider_cls_map[provider_type] = provider_class
+            return provider_class
+
+        return apply
+
+    fake_modules = {
+        "aiohttp": types.ModuleType("aiohttp"),
+        "astrbot": types.ModuleType("astrbot"),
+        "astrbot.api": types.ModuleType("astrbot.api"),
+        "astrbot.api.event": types.ModuleType("astrbot.api.event"),
+        "astrbot.api.provider": types.ModuleType("astrbot.api.provider"),
+        "astrbot.api.star": types.ModuleType("astrbot.api.star"),
+        "astrbot.core": types.ModuleType("astrbot.core"),
+        "astrbot.core.provider": types.ModuleType("astrbot.core.provider"),
+        "astrbot.core.provider.entities": types.ModuleType(
+            "astrbot.core.provider.entities"
+        ),
+        "astrbot.core.provider.register": types.ModuleType(
+            "astrbot.core.provider.register"
+        ),
+    }
+    fake_modules["astrbot.api"].logger = types.SimpleNamespace(
+        error=lambda *_args, **_kwargs: None,
+        info=lambda *_args, **_kwargs: None,
+    )
+    fake_modules["astrbot.api.event"].AstrMessageEvent = type(
+        "AstrMessageEvent", (), {}
+    )
+    fake_modules["astrbot.api.event"].filter = filter_stub
+    fake_modules["astrbot.api.provider"].Provider = FakeProvider
+    fake_modules["astrbot.api.provider"].ProviderRequest = type(
+        "ProviderRequest", (), {}
+    )
+    fake_modules["astrbot.api.star"].Context = type("Context", (), {})
+    fake_modules["astrbot.api.star"].Star = FakeStar
+    fake_modules["astrbot.api.star"].StarTools = type("StarTools", (), {})
+    fake_modules["astrbot.core.provider.entities"].LLMResponse = type(
+        "LLMResponse", (), {}
+    )
+    fake_modules["astrbot.core.provider.entities"].ProviderType = (
+        types.SimpleNamespace(CHAT_COMPLETION="chat")
+    )
+    fake_modules["astrbot.core.provider.entities"].TokenUsage = type(
+        "TokenUsage", (), {}
+    )
+    fake_modules["astrbot.core.provider.register"].provider_cls_map = (
+        provider_cls_map
+    )
+    fake_modules[
+        "astrbot.core.provider.register"
+    ].register_provider_adapter = register_provider_adapter
+
+    package_name = "_akasha_contact_memory_plugin_test"
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(PLUGIN)]
+    fake_modules[package_name] = package
+    spec = importlib.util.spec_from_file_location(
+        f"{package_name}.main",
+        PLUGIN / "main.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    fake_modules[spec.name] = module
+    with mock.patch.dict(sys.modules, fake_modules):
+        spec.loader.exec_module(module)
+    return module
+
+
 class ContactMemoryTests(unittest.TestCase):
+    def test_provider_binding_waits_for_astrbot_loaded_hook(self):
+        module = _load_plugin_main_with_astrbot_stubs()
+
+        async def scenario():
+            manager = types.SimpleNamespace(inst_map={})
+            context = types.SimpleNamespace(provider_manager=manager)
+            plugin = module.Main(context, {})
+            cold_calls = 0
+
+            async def initialize_cold():
+                nonlocal cold_calls
+                cold_calls += 1
+                await asyncio.sleep(0)
+                plugin.runtime = object()
+
+            plugin._initialize_runtime_locked = initialize_cold
+            await plugin.initialize()
+            self.assertEqual(0, cold_calls)
+
+            await asyncio.gather(
+                plugin.initialize_after_astrbot_loaded(),
+                plugin.initialize_after_astrbot_loaded(),
+            )
+            self.assertEqual(1, cold_calls)
+            self.assertTrue(
+                getattr(manager, module.ASTRBOT_LOADED_MARKER)
+            )
+
+            hot_plugin = module.Main(context, {})
+            hot_calls = 0
+
+            async def initialize_hot():
+                nonlocal hot_calls
+                hot_calls += 1
+                hot_plugin.runtime = object()
+
+            hot_plugin._initialize_runtime_locked = initialize_hot
+            await hot_plugin.initialize()
+            self.assertEqual(1, hot_calls)
+
+            late_manager = types.SimpleNamespace(
+                inst_map={},
+                _mcp_init_task=object(),
+            )
+            late_context = types.SimpleNamespace(
+                provider_manager=late_manager
+            )
+            late_plugin = module.Main(late_context, {})
+            late_calls = 0
+
+            async def initialize_late():
+                nonlocal late_calls
+                late_calls += 1
+                late_plugin.runtime = object()
+
+            late_plugin._initialize_runtime_locked = initialize_late
+            await late_plugin.initialize()
+            self.assertEqual(1, late_calls)
+
+            retry_plugin = module.Main(context, {})
+            retry_calls = 0
+
+            async def initialize_with_retry():
+                nonlocal retry_calls
+                retry_calls += 1
+                if retry_calls == 1:
+                    raise RuntimeError("fixture initialization failure")
+                retry_plugin.runtime = object()
+
+            retry_plugin._initialize_runtime_locked = initialize_with_retry
+            with self.assertRaisesRegex(
+                RuntimeError, "fixture initialization failure"
+            ):
+                await retry_plugin.initialize()
+            await retry_plugin.initialize()
+            self.assertEqual(2, retry_calls)
+
+            class FakeRuntime:
+                def __init__(self):
+                    self.closed = False
+
+                async def close(self):
+                    self.closed = True
+
+            racing_plugin = module.Main(context, {})
+            started = asyncio.Event()
+            release = asyncio.Event()
+            racing_runtime = FakeRuntime()
+
+            async def initialize_racing():
+                started.set()
+                await release.wait()
+                racing_plugin.runtime = racing_runtime
+
+            racing_plugin._initialize_runtime_locked = initialize_racing
+            initialize_task = asyncio.create_task(racing_plugin.initialize())
+            await started.wait()
+            terminate_task = asyncio.create_task(racing_plugin.terminate())
+            await asyncio.sleep(0)
+            self.assertFalse(terminate_task.done())
+            release.set()
+            await asyncio.gather(initialize_task, terminate_task)
+            self.assertTrue(racing_runtime.closed)
+            self.assertIsNone(racing_plugin.runtime)
+            self.assertTrue(racing_plugin._terminated)
+
+        asyncio.run(scenario())
+
     def test_contact_key_is_stable_but_session_scoped(self):
         with tempfile.TemporaryDirectory(prefix="akasha-memory-secret-") as temp:
             root = pathlib.Path(temp)
