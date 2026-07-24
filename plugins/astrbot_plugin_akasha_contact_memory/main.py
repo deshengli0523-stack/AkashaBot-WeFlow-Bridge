@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from .akasha_memory.store import MemoryStore
 from .akasha_memory.weflow_sync import WeFlowSync
 
 PLUGIN_NAME = "astrbot_plugin_akasha_contact_memory"
+ASTRBOT_LOADED_MARKER = "_akasha_contact_memory_astrbot_loaded"
 
 
 def _value(config: dict, key: str, default: Any) -> Any:
@@ -50,6 +52,8 @@ class Main(Star):
         self.memory_provider: AkashaQwenMemoryProvider | None = None
         self.source_provider: Provider | None = None
         self._effective_mode = "off"
+        self._runtime_lock = asyncio.Lock()
+        self._terminated = False
 
     def _source_provider(self) -> Provider | None:
         source_id = str(_value(self.config, "source_provider_id", "")).strip()
@@ -98,7 +102,14 @@ class Main(Star):
                     "该 Provider 可能已被移除。"
                 )
 
-    async def initialize(self) -> None:
+    async def _initialize_runtime(self) -> None:
+        async with self._runtime_lock:
+            if self._terminated or self.runtime is not None:
+                return
+
+            await self._initialize_runtime_locked()
+
+    async def _initialize_runtime_locked(self) -> None:
         data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
         secrets = SecretManager(data_dir)
         state_dir_value = os.environ.get("AKASHABOT_STATE_DIR", "").strip()
@@ -134,24 +145,24 @@ class Main(Star):
             ),
         )
 
-        self.source_provider = self._source_provider()
+        source_provider = self._source_provider()
         model = str(_value(self.config, "qwen_model", "qwen3.7-max")).strip()
         base_url = _base_url(
-            self.source_provider,
+            source_provider,
             str(_value(self.config, "qwen_responses_base_url", "")),
         )
         qwen_sessions: QwenSessionManager | None = None
         source_has_key = False
-        if self.source_provider:
+        if source_provider:
             try:
-                source_has_key = bool(self.source_provider.get_current_key().strip())
+                source_has_key = bool(source_provider.get_current_key().strip())
             except Exception:
                 source_has_key = False
-        if self.source_provider and source_has_key and base_url:
+        if source_provider and source_has_key and base_url:
             try:
                 client = QwenClient(
                     base_url=base_url,
-                    api_key=self.source_provider.get_current_key,
+                    api_key=source_provider.get_current_key,
                     request_timeout=float(
                         _value(self.config, "request_timeout_seconds", 120)
                     ),
@@ -181,8 +192,7 @@ class Main(Star):
                 "Akasha 联系人记忆缺少可用的源 Provider 或 Responses base URL，"
                 "已降级为 shadow 模式。"
             )
-        self._effective_mode = effective_mode
-        self.runtime = ContactMemoryRuntime(
+        runtime = ContactMemoryRuntime(
             mode=effective_mode,
             secret_manager=secrets,
             store=store,
@@ -194,34 +204,74 @@ class Main(Star):
             ),
         )
 
-        if (
-            effective_mode == "active"
-            and qwen_sessions
-            and self.source_provider
-        ):
-            manager = self.context.provider_manager
-            existing = manager.inst_map.get(PROVIDER_ID)
-            if existing is not None:
-                await manager.terminate_provider(PROVIDER_ID)
-            self.memory_provider = AkashaQwenMemoryProvider(
-                {
-                    "id": PROVIDER_ID,
-                    "type": PROVIDER_TYPE,
-                    "model": model,
-                    "enable": True,
-                },
-                getattr(self.source_provider, "provider_settings", {}),
-                runtime=self.runtime,
-                fallback_provider=self.source_provider,
-            )
-            self.context.register_provider(self.memory_provider)
-            # Context.register_provider() does not populate inst_map in 4.26.6.
-            manager.inst_map[PROVIDER_ID] = self.memory_provider
+        memory_provider: AkashaQwenMemoryProvider | None = None
+        try:
+            if effective_mode == "active" and qwen_sessions and source_provider:
+                manager = self.context.provider_manager
+                existing = manager.inst_map.get(PROVIDER_ID)
+                if existing is not None:
+                    await manager.terminate_provider(PROVIDER_ID)
+                memory_provider = AkashaQwenMemoryProvider(
+                    {
+                        "id": PROVIDER_ID,
+                        "type": PROVIDER_TYPE,
+                        "model": model,
+                        "enable": True,
+                    },
+                    getattr(source_provider, "provider_settings", {}),
+                    runtime=runtime,
+                    fallback_provider=source_provider,
+                )
+                self.context.register_provider(memory_provider)
+                # Context.register_provider() does not populate inst_map in 4.26.6.
+                manager.inst_map[PROVIDER_ID] = memory_provider
+        except BaseException:
+            await runtime.close()
+            raise
+
+        # Publish only after every fallible construction/registration step has
+        # succeeded, so a failed attempt remains retryable.
+        self.source_provider = source_provider
+        self.memory_provider = memory_provider
+        self._effective_mode = effective_mode
+        self.runtime = runtime
         logger.info(
             "Akasha 联系人记忆插件已启动：mode=%s, qwen_ready=%s",
             self._effective_mode,
             bool(qwen_sessions),
         )
+
+    async def initialize(self) -> None:
+        # AstrBot 4.26.6 loads plugins before it instantiates configured
+        # Providers. During a hot reload the provider map is already populated,
+        # so initialize immediately; during process startup defer to the
+        # official loaded hook below.
+        manager = getattr(self.context, "provider_manager", None)
+        providers_ready = bool(
+            manager is not None
+            and (
+                getattr(manager, ASTRBOT_LOADED_MARKER, False)
+                or getattr(manager, "inst_map", None)
+                # AstrBot 4.26.6 creates this task only at the end of
+                # ProviderManager.initialize(). This also distinguishes a
+                # first late plugin install when every Provider failed or the
+                # configured Provider list is empty.
+                or getattr(manager, "_mcp_init_task", None) is not None
+            )
+        )
+        if providers_ready:
+            await self._initialize_runtime()
+        else:
+            logger.info(
+                "Akasha 联系人记忆正在等待 AstrBot Provider 初始化完成。"
+            )
+
+    @filter.on_astrbot_loaded()
+    async def initialize_after_astrbot_loaded(self) -> None:
+        manager = getattr(self.context, "provider_manager", None)
+        if manager is not None:
+            setattr(manager, ASTRBOT_LOADED_MARKER, True)
+        await self._initialize_runtime()
 
     @filter.event_message_type(
         filter.EventMessageType.PRIVATE_MESSAGE,
@@ -411,12 +461,19 @@ class Main(Star):
             yield event.plain_result("当前联系人的本地记忆与云端会话已删除。")
 
     async def terminate(self) -> None:
-        runtime = self.runtime
-        if self.memory_provider:
-            manager = self.context.provider_manager
-            if manager.inst_map.get(PROVIDER_ID) is self.memory_provider:
-                await manager.terminate_provider(PROVIDER_ID)
+        async with self._runtime_lock:
+            self._terminated = True
+            runtime = self.runtime
+            memory_provider = self.memory_provider
+            self.runtime = None
             self.memory_provider = None
-        if runtime:
-            await runtime.close()
-        self.runtime = None
+            self.source_provider = None
+            self._effective_mode = "off"
+            try:
+                if memory_provider:
+                    manager = self.context.provider_manager
+                    if manager.inst_map.get(PROVIDER_ID) is memory_provider:
+                        await manager.terminate_provider(PROVIDER_ID)
+            finally:
+                if runtime:
+                    await runtime.close()
