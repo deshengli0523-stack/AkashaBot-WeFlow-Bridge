@@ -1,7 +1,7 @@
 # Akasha 私聊联系人记忆与 Qwen3.7-Max 会话设计
 
-日期：2026-07-24  
-状态：总体设计已获用户确认，等待书面规格复核  
+日期：2026-07-24
+状态：总体设计已获用户确认，等待书面规格复核
 目标版本：AkashaBot-WeFlow-Bridge 后续版本、AstrBot 4.26.6、Qwen3.7-Max
 
 ## 1. 背景与结论
@@ -163,14 +163,22 @@ Qwen 输出在 UIA 成功发送并被 WeFlow 同步确认前，只是“待确�
   "akasha_account_id": "<raw local account id>",
   "akasha_session_id": "<raw private session id>",
   "akasha_session_type": "private",
-  "akasha_source_message_ids": ["<stable id>"],
-  "akasha_source_timestamp_min": 0,
-  "akasha_source_timestamp_max": 0,
+  "akasha_source_messages": [
+    {
+      "rawid": "<stable id or null>",
+      "timestamp": 0,
+      "event_fingerprint": "<sha256>",
+      "buffer_ordinal": 0,
+      "id_quality": "stable"
+    }
+  ],
   "akasha_routing_name": "<current display name>"
 }
 ```
 
 这些字段只在本机 bridge → AstrBot 链路传输。插件日志、Qwen metadata 和诊断输出只使用其 HMAC 派生的匿名 ID。
+
+`akasha_source_messages` 必须逐条保存引用，不能只给一组 ID 和时间范围，否则合并消息后无法把正文、ID 和时间一一对应。`rawid` 非空时 `id_quality=stable`；为空时 bridge 使用 SSE 实际存在的字段（会话、时间、方向、发送者、消息类型、正文或媒体描述）生成 `event_fingerprint`，并标为 `provisional`。不得假设 SSE 一定存在 `localId`。
 
 ### 5.4 昵称使用规则
 
@@ -188,11 +196,19 @@ Qwen 输出在 UIA 成功发送并被 WeFlow 同步确认前，只是“待确�
 只修改本项目自有 bridge 和启动脚本，不修改 AstrBot 官方包：
 
 - `bridge/state.py`：替换不稳定的 Python `hash()`；持久化 identity salt、稳定 OneBot ID 映射和发送路由。
-- `bridge/bridge_core.py`：合并消息时同时保留每条消息的 `rawid`、`timestamp` 和 `sessionId`，不能只保留拼接文本。非空 `rawid` 才进入原有去重集合；空 `rawid` 使用包含会话、时间、本地 ID、方向和内容哈希的复合指纹。
+- `bridge/bridge_core.py`：合并消息时同时保留逐条 `akasha_source_messages`，不能只保留拼接文本。非空 `rawid` 才进入原有去重集合；空 `rawid` 不进入该集合并按至少一次语义继续转发，避免当前实现把所有空 ID 消息误判为同一条。
 - `bridge/ob_protocol.py`：把 5.3 节字段加入 OneBot 原始事件。事件中不得放入 WeFlow access token。
 - `scripts/Start-Services.ps1`：启动 AstrBot 时设置 `AKASHABOT_BRIDGE_CONFIG_PATH`，指向现有 bridge 配置。插件通过该只读路径取得 WeFlow 地址和凭据，不再复制一份秘密配置。
 
 上述扩展字段由 AstrBot 4.26.6 保留在原始消息对象中。插件只处理 `FriendMessage`，不得在字段缺失时退回昵称构造记忆身份。
+
+Bridge 身份状态固定保存于：
+
+```text
+<install root>/data/state/bridge_identity.sqlite3
+```
+
+其中保存 schema version、`identity_salt`、联系人 HMAC 到 OneBot ID 的碰撞映射及最近路由昵称。普通升级、插件代码替换和 AstrBot 重装均保留该文件；只有用户明确执行完整数据重置时删除。插件自己的联系人 HMAC 密钥与 bridge identity salt 相互独立，并以当前 Windows 用户 DPAPI 保护后保存在 `<插件数据目录>/secrets.dpapi`。
 
 ## 6. 本地数据模型
 
@@ -229,6 +245,7 @@ Qwen 输出在 UIA 成功发送并被 WeFlow 同步确认前，只是“待确�
 - `content_type`
 - `content`
 - `source_hash`
+- `id_quality`：`stable`、`fallback` 或 `provisional`
 - `imported_at`
 
 唯一约束：
@@ -237,7 +254,9 @@ Qwen 输出在 UIA 成功发送并被 WeFlow 同步确认前，只是“待确�
 UNIQUE(contact_id, source_message_uid)
 ```
 
-优先使用 WeFlow 稳定消息 ID。缺失时使用 `sessionId + timestamp + localId + direction + content_hash` 生成后备 UID；不得仅用时间戳。
+优先使用 WeFlow REST 返回的稳定 `serverId`、`rawid`、`messageId` 或 `localId`。若 REST 记录确实不提供任何稳定 ID，才用其实际存在的稳定字段生成规范化哈希，并用同一排序组内的确定性序号区分完全相同的记录；不得假设某字段存在，也不得仅用时间戳。SSE 的 `provisional` 指纹只用于本轮关联，后续 REST 同步应将其核对并归一到稳定 UID。
+
+若 WeFlow REST 对两条记录既无稳定 ID、稳定顺序也无法从内容和时间区分，信息论上无法同时保证“合法重复不丢失”和“重放绝不重复”。此时系统选择不丢消息的至少一次语义，标记 `DEGRADED_IDENTITY` 并向管理员告警；不得宣称精确一次。正式发布前必须用真实 WeFlow 样本验证稳定 ID 或稳定排序契约。
 
 ### `sync_state`
 
@@ -300,10 +319,11 @@ UNIQUE(contact_id, source_message_uid)
 2. 获取联系人级异步锁。
 3. 若存在删除墓碑，跳过导入并使用无长期记忆模式。
 4. 从 WeFlow 拉取最近 2,000 条，按 `(timestamp, message_uid)` 正序处理。
-5. 同步等待预算默认 3 秒。
-6. 预算内未完成时，至少尝试最近 500 条；仍失败则使用当前消息和已有 AstrBot 上下文回复。
-7. 导入事务提交后再推进游标。
-8. 启动后台回填，按时间向前分页，直到没有更早记录。
+5. 使用扩展字段中的逐条消息引用对本轮入站消息去重；稳定 ID 优先，`provisional` 记录只做本轮一对一关联。当前消息只作为本轮新输入提交一次，不能同时出现在播种历史中。
+6. 同步等待预算默认 3 秒。
+7. 预算内未完成时，至少尝试最近 500 条；仍失败则使用当前消息和已有 AstrBot 上下文回复。
+8. 导入事务提交后再推进游标。
+9. 启动后台回填，按时间向前分页，直到没有更早记录。
 
 “2,000 条”和“500 条”只是冷启动批次，不是数据库保留上限。
 
@@ -478,7 +498,7 @@ Provider：
 2. 验证插件文件精确 allowlist、版本和 SHA-256。
 3. 先按现有流程安装 AstrBot venv 并运行 AstrBot `init`；确认 `<install root>/data/astrbot/data/cmd_config.json` 已生成。
 4. 只有初始化成功后，才在 `data/state` 下建立临时 staging 目录并部署插件。不得提前创建 `data/astrbot`，否则现有安装器会将其判定为不完整 AstrBot 安装。
-5. 备份且仅备份：
+5. 停止 AstrBot，单独备份且只替换目标插件代码目录：
 
    ```text
    <install root>/data/astrbot/data/plugins/astrbot_plugin_akasha_contact_memory
@@ -491,9 +511,10 @@ Provider：
    <install root>/data/astrbot/data/plugin_data/astrbot_plugin_akasha_contact_memory
    ```
 
-8. 插件代码替换失败时恢复旧代码；数据库迁移失败时恢复迁移前 SQLite 备份。
-9. 普通升级和普通卸载默认保留插件数据；只有显式隐私删除才清除。
-10. 部署完成后才启动 AstrBot；启动时注入 `AKASHABOT_BRIDGE_CONFIG_PATH`。
+8. 数据库迁移前执行 `PRAGMA quick_check`，再使用 SQLite backup API 创建一致性快照到 `data/state` 的专用备份目录；不得在 WAL 开启时只复制单个 `.db` 文件。
+9. 在事务中运行迁移并再次执行 `PRAGMA quick_check`。迁移、校验或代码替换任一步失败时，保持 AstrBot 停止，恢复旧插件代码和迁移前数据库快照，再验证后启动旧版本。
+10. 普通升级和普通卸载默认保留插件数据、bridge identity 数据和密钥；只有显式隐私删除或完整数据重置才按对应范围清除。
+11. 部署完成后才启动 AstrBot；`Start-Services.ps1` 必须把 `$Paths.BridgeConfig` 的绝对路径写入该进程的 `AKASHABOT_BRIDGE_CONFIG_PATH`，且不得把 access token 展开到命令行参数或日志。
 
 安装包严禁包含：
 
@@ -515,7 +536,7 @@ Provider：
 - 失败关闭：身份不明确时不注入记忆，不发送给猜测联系人。
 - 本地优先：云端失败不清空本地记录。
 - 联系人隔离：所有数据库操作必须显式携带完整联系人键或内部 `contact_id`。
-- 幂等：重启、重放、SSE 重连、REST 重叠同步不产生重复消息。
+- 幂等：具备稳定源 ID 的重启、重放、SSE 重连和 REST 重叠同步不产生重复消息；缺少稳定身份契约时按 6 节的降级语义处理。
 - 有限等待：历史同步不能无限阻塞当前回复。
 - 可恢复：任何云端会话都可以从本地数据库重建。
 
@@ -560,7 +581,8 @@ Provider：
 - 不同微信账号的相同 session ID 不合并。
 - 昵称变化不改变联系人主键。
 - 群聊和缺失 session ID 的事件被拒绝。
-- 同一消息重放不重复。
+- 具备稳定源 ID 的同一消息重放不重复。
+- SSE 不存在 `localId` 时仍可构造 `provisional` 引用，且两个同批次的相同文本不会被 bridge 折叠。
 - 同秒多消息按复合游标稳定排序。
 - 摘要版本、原文覆盖区间和哈希一致。
 - Token 预算不会超过 700,000。
@@ -569,6 +591,7 @@ Provider：
 ### 13.2 集成测试
 
 - Mock WeFlow：首次 2,000 条、超时降为 500 条、后台全量回填。
+- Mock WeFlow：当前入站消息虽已出现在 REST 历史中，仍只向模型提交一次。
 - Mock WeFlow：SSE 丢失后由 REST 重叠补齐。
 - Mock Qwen：每联系人创建不同 conversation ID。
 - Mock Qwen：A → B → A 切换只查找既有 conversation ID，不触发重新播种，且两个联系人共用同一 Provider 凭据。
@@ -598,7 +621,7 @@ Provider：
 6. 联系人改名后仍能召回旧记录。
 7. 两个同名联系人触发失败关闭，不自动点击第一个结果。
 8. 首次同步导入近期 2,000 条，后台最终导入全部可读取历史。
-9. 重启、SSE 重连、空 `rawid` 消息和重复 REST 拉取后不丢消息、不重复计数。
+9. 重启、SSE 重连、空 `rawid` 消息和重复 REST 拉取后不丢消息；有稳定 REST ID 时不重复计数，无稳定身份契约时明确进入 `DEGRADED_IDENTITY` 而不伪装为精确一次。
 10. Qwen会话模拟超过 7 天后自动重建且回答连续。
 11. Qwen不可用时只使用该联系人的本地降级上下文。
 12. UIA取消发送后，下一轮不把未发送回答当作真实聊天。
