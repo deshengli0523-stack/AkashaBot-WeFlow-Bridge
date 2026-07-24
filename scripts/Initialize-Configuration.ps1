@@ -212,6 +212,12 @@ function Read-AkashaConfigurationJson {
   }
 }
 
+function ConvertTo-AkashaCanonicalJson {
+  param([AllowNull()]$Value)
+
+  return ($Value | ConvertTo-Json -Depth 100 -Compress)
+}
+
 function New-AkashaAstrBotOwnership {
   param(
     [Parameter(Mandatory)]$Paths,
@@ -462,7 +468,7 @@ function Initialize-AkashaConfiguration {
     $bridgeBackup = $null
     $weFlowBackup = $null
     $bridgeRollbackRequired = $false
-    $weFlowWritten = $false
+    $weFlowRollbackRequired = $false
     $operationError = $null
     try {
       if ($freshAstrBot) {
@@ -524,6 +530,7 @@ function Initialize-AkashaConfiguration {
       if ($astr.GetType() -ne [System.Management.Automation.PSCustomObject]) {
         throw 'E_ASTRBOT_SCHEMA: AstrBot configuration is missing dashboard or platform data.'
       }
+      $astrOriginalCanonical = ConvertTo-AkashaCanonicalJson -Value $astr
       $dashboardProperty = $astr.PSObject.Properties['dashboard']
       $platformProperty = $astr.PSObject.Properties['platform']
       if ($null -eq $dashboardProperty -or $null -eq $dashboardProperty.Value -or
@@ -626,6 +633,7 @@ function Initialize-AkashaConfiguration {
       }
 
       if ($freshBridge) {
+        $bridgeOriginalCanonical = $null
         $token = New-HexToken
         $bridge = $bridgeTemplate
         Set-JsonProperty -Object $bridge -Name 'access_token' -Value $token
@@ -640,6 +648,7 @@ function Initialize-AkashaConfiguration {
         if ($bridge.GetType() -ne [System.Management.Automation.PSCustomObject]) {
           throw 'E_CONFIGURATION_SCHEMA: Bridge configuration must be a JSON object.'
         }
+        $bridgeOriginalCanonical = ConvertTo-AkashaCanonicalJson -Value $bridge
         $tokenProperty = $bridge.PSObject.Properties['access_token']
         $token = if ($null -eq $tokenProperty) { '' } else { [string]$tokenProperty.Value }
         if ($token -cnotmatch '^[0-9a-f]{64}$') {
@@ -675,6 +684,7 @@ function Initialize-AkashaConfiguration {
       if ($weFlow.GetType() -ne [System.Management.Automation.PSCustomObject]) {
         throw 'E_CONFIGURATION_SCHEMA: WeFlow configuration must be a JSON object.'
       }
+      $weFlowOriginalCanonical = ConvertTo-AkashaCanonicalJson -Value $weFlow
       Set-JsonProperty -Object $weFlow -Name 'httpApiEnabled' -Value $true
       Set-JsonProperty -Object $weFlow -Name 'httpApiHost' -Value '127.0.0.1'
       Set-JsonProperty -Object $weFlow -Name 'httpApiPort' -Value 5031
@@ -682,21 +692,30 @@ function Initialize-AkashaConfiguration {
       Set-JsonProperty -Object $weFlow -Name 'messagePushEnabled' -Value $true
       Set-JsonProperty -Object $weFlow -Name 'messagePushFilterMode' -Value 'all'
 
+      $astrWriteRequired = $freshAstrBot -or
+        ((ConvertTo-AkashaCanonicalJson -Value $astr) -cne $astrOriginalCanonical)
+      $bridgeWriteRequired = $freshBridge -or
+        ((ConvertTo-AkashaCanonicalJson -Value $bridge) -cne $bridgeOriginalCanonical)
+      $weFlowWriteRequired =
+        (ConvertTo-AkashaCanonicalJson -Value $weFlow) -cne $weFlowOriginalCanonical
+
       Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
       try {
-        if (-not $freshAstrBot) {
+        if ((-not $freshAstrBot) -and $astrWriteRequired) {
           Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
           Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
           $astrBackup = Backup-AkashaFile -Path $astrConfigPath -BackupRoot $Paths.Backups
         }
-        if (-not $freshBridge) {
+        if ((-not $freshBridge) -and $bridgeWriteRequired) {
           Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
           Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
           $bridgeBackup = Backup-AkashaFile -Path $Paths.BridgeConfig -BackupRoot $Paths.Backups
         }
-        Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
-        Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
-        $weFlowBackup = Backup-AkashaFile -Path $WeFlowConfigPath -BackupRoot $Paths.Backups
+        if ($weFlowWriteRequired) {
+          Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+          Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups
+          $weFlowBackup = Backup-AkashaFile -Path $WeFlowConfigPath -BackupRoot $Paths.Backups
+        }
       } catch {
         if ($_.Exception.Message -ceq 'E_CONFIG_PATH: Configuration paths must remain inside the install root.') {
           throw $_
@@ -705,25 +724,29 @@ function Initialize-AkashaConfiguration {
       }
 
       try {
-        Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
-        & $JsonWriter -Path $astrConfigPath -Value $astr
-        Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
-        if (@(Get-Process -Name 'WeFlow' -ErrorAction SilentlyContinue).Count -gt 0) {
-          throw 'E_WEFLOW_RUNNING: Close WeFlow before updating its configuration.'
+        if ($astrWriteRequired) {
+          Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+          & $JsonWriter -Path $astrConfigPath -Value $astr
         }
-        & $JsonWriter -Path $WeFlowConfigPath -Value $weFlow
-        $weFlowWritten = $true
+        if ($weFlowWriteRequired) {
+          Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+          if (@(Get-Process -Name 'WeFlow' -ErrorAction SilentlyContinue).Count -gt 0) {
+            throw 'E_WEFLOW_RUNNING: Close WeFlow before updating its configuration.'
+          }
+          $weFlowRollbackRequired = $true
+          & $JsonWriter -Path $WeFlowConfigPath -Value $weFlow
+        }
         if ($freshBridge) {
           Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
           Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeData
           New-Item -ItemType Directory -Force -Path $Paths.BridgeData | Out-Null
         }
-        Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
-        Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
-        $bridgeRollbackRequired = -not $freshBridge
-        & $JsonWriter -Path $Paths.BridgeConfig -Value $bridge
-        if ($freshBridge) {
-          $freshBridgeCreated = $true
+        if ($bridgeWriteRequired) {
+          Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
+          Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
+          $bridgeRollbackRequired = (-not $freshBridge) -and $bridgeWriteRequired
+          $freshBridgeCreated = $freshBridge
+          & $JsonWriter -Path $Paths.BridgeConfig -Value $bridge
         }
         if ($freshAstrBot) {
           $firstLoginPath = Join-Path $Paths.AstrBotData 'FIRST_LOGIN.txt'
@@ -776,7 +799,7 @@ function Initialize-AkashaConfiguration {
           $rollbackSucceeded = $false
         }
       }
-      if ($weFlowWritten -and $null -ne $weFlowBackup) {
+      if ($weFlowRollbackRequired -and $null -ne $weFlowBackup) {
         if (-not (Invoke-AkashaRollbackStep {
               Assert-AkashaConfigurationTransactionPaths -Paths $Paths -Snapshot $pathSnapshot
               Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.Backups

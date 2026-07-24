@@ -1355,6 +1355,9 @@ class BridgeRuntimeTests(unittest.TestCase):
                 },
             ):
                 spec.loader.exec_module(protocol)
+            privacy = runpy.run_path(str(BRIDGE / "privacy.py"))
+            pseudonym = privacy["pseudonym"]
+            message_meta = privacy["message_meta"]
 
             messages = {
                 "文字": [{"type": "text", "data": {"text": "private-body"}}],
@@ -1378,13 +1381,20 @@ class BridgeRuntimeTests(unittest.TestCase):
                         output = "\n".join(logs.output)
                         self.assertIn('"event":"outbound"', output)
                         self.assertIn('"status":"failed"', output)
-                        self.assertIn('"contact":"private-contact"', output)
+                        self.assertIn(
+                            f'"contact":"{pseudonym("private-contact")}"',
+                            output,
+                        )
                         if label == "文字":
-                            self.assertIn('"body":"private-body"', output)
+                            expected_body = message_meta("private-body")
                         elif label == "图片":
-                            self.assertIn('"body":"[图片]"', output)
+                            expected_body = message_meta("[图片]")
                         else:
-                            self.assertIn('"body":"[表情]"', output)
+                            expected_body = message_meta("[表情]")
+                        self.assertIn(
+                            f'"body":"{expected_body}"',
+                            output,
+                        )
                         self.assertNotIn(image_path.name, output)
 
             for label, message in messages.items():
@@ -1403,13 +1413,20 @@ class BridgeRuntimeTests(unittest.TestCase):
                     output = "\n".join(logs.output)
                     self.assertIn('"event":"outbound"', output)
                     self.assertIn('"status":"sent"', output)
-                    self.assertIn('"contact":"private-contact"', output)
+                    self.assertIn(
+                        f'"contact":"{pseudonym("private-contact")}"',
+                        output,
+                    )
                     if label == "文字":
-                        self.assertIn('"body":"private-body"', output)
+                        expected_body = message_meta("private-body")
                     elif label == "图片":
-                        self.assertIn('"body":"[图片]"', output)
+                        expected_body = message_meta("[图片]")
                     else:
-                        self.assertIn('"body":"[表情]"', output)
+                        expected_body = message_meta("[表情]")
+                    self.assertIn(
+                        f'"body":"{expected_body}"',
+                        output,
+                    )
                     self.assertNotIn(image_path.name, output)
 
     def test_ob_sender_exceptions_log_one_failed_chat_record_without_details(self):
@@ -1540,7 +1557,7 @@ class BridgeRuntimeTests(unittest.TestCase):
                     self.assertEqual(len(chat_lines), 1)
                     output = "\n".join(logs.output)
                     self.assertIn('"status":"failed"', output)
-                    self.assertIn('"body":"[图片]"', output)
+                    self.assertIn('"body":"type=text length=4"', output)
                     if file_value:
                         self.assertNotIn(file_value, output)
 
@@ -2711,7 +2728,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual(bridge.add_to_buffer.call_count, 2)
         self.assertEqual(bridge.processed_ids, set())
 
-    def test_inbound_chat_logs_include_private_contact_group_sender_and_full_body(self):
+    def test_inbound_chat_logs_use_pseudonyms_and_body_metadata(self):
         class FakeTimer:
             def __init__(self, *_args, **_kwargs):
                 self.daemon = False
@@ -2773,23 +2790,26 @@ class BridgeRuntimeTests(unittest.TestCase):
             for line in logs.output
             if "CHAT " in line
         ]
+        privacy = runpy.run_path(str(BRIDGE / "privacy.py"))
+        pseudonym = privacy["pseudonym"]
+        message_meta = privacy["message_meta"]
         self.assertEqual(
             records,
             [
                 {
                     "event": "inbound",
                     "scope": "private",
-                    "contact": "联系人甲",
+                    "contact": pseudonym("联系人甲"),
                     "status": "received",
-                    "body": "私聊第一行\n私聊第二行🙂",
+                    "body": message_meta("私聊第一行\n私聊第二行🙂"),
                 },
                 {
                     "event": "inbound",
                     "scope": "group",
-                    "contact": "项目群",
-                    "sender": "群成员乙",
+                    "contact": pseudonym("项目群"),
+                    "sender": pseudonym("群成员乙"),
                     "status": "received",
-                    "body": "群消息正文",
+                    "body": message_meta("群消息正文"),
                 },
             ],
         )
@@ -2937,7 +2957,7 @@ class BridgeRuntimeTests(unittest.TestCase):
     def test_base64_tempfile_close_failure_retries_and_removes_owned_path(self):
         self._assert_failed_base64_tempfile_stage_is_cleaned("close")
 
-    def test_chat_log_helpers_preserve_names_and_bodies_but_redact_secrets_and_paths(self):
+    def test_chat_log_helpers_pseudonymize_names_and_reduce_body_to_metadata(self):
         privacy_path = BRIDGE / "privacy.py"
         self.assertTrue(privacy_path.is_file(), "bridge/privacy.py is missing")
         privacy = runpy.run_path(str(privacy_path))
@@ -2967,10 +2987,10 @@ class BridgeRuntimeTests(unittest.TestCase):
             {
                 "event": "inbound",
                 "scope": "group",
-                "contact": "项目群",
-                "sender": "联系人甲",
+                "contact": pseudonym("项目群"),
+                "sender": pseudonym("联系人甲"),
                 "status": "received",
-                "body": "第一行\n第二行🙂",
+                "body": message_meta("第一行\n第二行🙂"),
             },
         )
 
@@ -3093,9 +3113,12 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertNotIn("\u0085", separator_encoded)
         self.assertNotIn("\u2028", separator_encoded)
         self.assertNotIn("\u2029", separator_encoded)
-        self.assertEqual(json.loads(separator_encoded)["body"], separator_body)
+        self.assertEqual(
+            json.loads(separator_encoded)["body"],
+            message_meta(separator_body),
+        )
 
-    def test_chat_log_file_end_to_end_preserves_chat_and_filters_private_values(self):
+    def test_chat_log_file_end_to_end_contains_only_pseudonym_and_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             config_path = root / "data" / "config.json"
@@ -3164,12 +3187,19 @@ class BridgeRuntimeTests(unittest.TestCase):
             self.assertNotIn(configured_credential, raw_line)
             self.assertNotIn(configured_image_credential, raw_line)
             self.assertNotIn(local_path, raw_line)
+            self.assertNotIn("联系人甲", raw_line)
+            self.assertNotIn("正文", raw_line)
+            self.assertNotIn("然后回复", raw_line)
             record = json.loads(raw_line.split("CHAT ", 1)[1])
-            self.assertEqual(record["contact"], "联系人甲")
-            self.assertIn(f"正文 {ordinary_backslash}", record["body"])
-            self.assertIn("然后回复", record["body"])
-            self.assertIn("[REDACTED]", record["body"])
-            self.assertIn("分隔甲\u2028乙", record["body"])
+            privacy = runpy.run_path(str(BRIDGE / "privacy.py"))
+            self.assertEqual(
+                record["contact"],
+                privacy["pseudonym"]("联系人甲"),
+            )
+            self.assertEqual(
+                record["body"],
+                privacy["message_meta"](chat_body),
+            )
 
     def test_source_logs_use_chat_records_and_exclude_raw_paths_and_exceptions(self):
         legacy_markers = (

@@ -15,10 +15,13 @@ from uia_support import (  # noqa: E402
     CALIBRATION_INVALID,
     CALIBRATION_REQUIRED,
     CALIBRATION_WINDOW,
+    CONTACT_SELECTION_FAILED,
     RECALIBRATION_REQUIRED,
     CalibrationError,
     ClientMetrics,
+    ScreenRect,
     Win32WeChatDriver,
+    _ensure_per_monitor_dpi_awareness,
     build_calibration,
     ratio_from_screen_point,
     screen_point_from_ratio,
@@ -50,6 +53,7 @@ class FakeUser32:
         self.client_rect = (0, 0, 1600, 900)
         self.client_rect_result = 1
         self.client_origin = (100, 50)
+        self.window_rects = {10: (90, 40, 1710, 960)}
         self.dpi = 120
         self.maximized = True
         self.window_from_point_result = 11
@@ -111,7 +115,13 @@ class FakeUser32:
         return 1
 
     def GetWindowRect(self, hwnd, rect_pointer):
-        raise AssertionError("GetWindowRect must not be used")
+        self.calls.append(("GetWindowRect", hwnd))
+        value = self.window_rects.get(hwnd)
+        if value is None:
+            return 0
+        rect = rect_pointer._obj
+        rect.left, rect.top, rect.right, rect.bottom = value
+        return 1
 
     def GetDpiForWindow(self, hwnd):
         self.calls.append(("GetDpiForWindow", hwnd))
@@ -221,6 +231,28 @@ class FakeKernel32:
         return 0
 
 
+class FakeDpiAwarenessUser32:
+    def __init__(self, set_result, process_context=-4, raises=False):
+        self.set_result = set_result
+        self.process_context = ctypes.c_void_p(process_context)
+        self.raises = raises
+        self.calls = []
+
+    def SetProcessDpiAwarenessContext(self, context):
+        self.calls.append(("set", context.value))
+        if self.raises:
+            raise OSError("unavailable")
+        return self.set_result
+
+    def GetDpiAwarenessContextForProcess(self, process):
+        self.calls.append(("get_process", process))
+        return self.process_context
+
+    def AreDpiAwarenessContextsEqual(self, first, second):
+        self.calls.append(("equal", first.value, second.value))
+        return first.value == second.value
+
+
 class FakeHookRunner:
     def __init__(self, events):
         self.events = events
@@ -305,6 +337,58 @@ VALID_POINTS = {
     "message_input": (1060, 770),
     "send_button": (1540, 860),
 }
+
+
+class DpiAwarenessTests(unittest.TestCase):
+    def test_per_monitor_v2_is_requested_before_coordinate_work(self):
+        user32 = FakeDpiAwarenessUser32(set_result=1)
+
+        _ensure_per_monitor_dpi_awareness(user32)
+
+        self.assertEqual(
+            user32.calls,
+            [("set", ctypes.c_void_p(-4).value)],
+        )
+
+    def test_existing_per_monitor_context_is_accepted(self):
+        for context in (-4, -3):
+            with self.subTest(context=context):
+                user32 = FakeDpiAwarenessUser32(
+                    set_result=0,
+                    process_context=context,
+                )
+
+                _ensure_per_monitor_dpi_awareness(user32)
+
+                self.assertEqual(
+                    user32.calls[0],
+                    ("set", ctypes.c_void_p(-4).value),
+                )
+                self.assertIn(("get_process", None), user32.calls)
+
+    def test_thread_override_cannot_mask_an_unsafe_process_context(self):
+        user32 = FakeDpiAwarenessUser32(
+            set_result=0,
+            process_context=-2,
+        )
+
+        with self.assertRaises(CalibrationError) as raised:
+            _ensure_per_monitor_dpi_awareness(user32)
+
+        self.assertEqual(raised.exception.code, CALIBRATION_WINDOW)
+        self.assertIn(("get_process", None), user32.calls)
+
+    def test_unavailable_context_fails_closed(self):
+        cases = (
+            FakeDpiAwarenessUser32(set_result=0, raises=True),
+        )
+
+        for user32 in cases:
+            with self.subTest(user32=user32):
+                with self.assertRaises(CalibrationError) as raised:
+                    _ensure_per_monitor_dpi_awareness(user32)
+
+                self.assertEqual(raised.exception.code, CALIBRATION_WINDOW)
 
 
 class CoordinateConversionTests(unittest.TestCase):
@@ -707,6 +791,55 @@ class Win32WindowBoundaryTests(unittest.TestCase):
         kernel32.process_images[100] = r"c:/program files/tencent/WECHAT.EXE"
 
         self.assertEqual(driver.get_client_metrics(10), METRICS)
+
+
+class Win32SearchPopupTests(unittest.TestCase):
+    def make_driver(self, user32=None, kernel32=None):
+        active_user32 = user32 or FakeUser32()
+        active_user32.windows[20] = {
+            "class": "Qt51514QWindowToolSaveBits",
+            "title": "",
+            "visible": True,
+        }
+        active_user32.window_order = [10, 20]
+        active_user32.pids[20] = 100
+        active_user32.window_rects[20] = (150, 145, 700, 600)
+        return Win32WeChatDriver(
+            user32=active_user32,
+            kernel32=kernel32 or FakeKernel32(),
+            hook_runner=FakeHookRunner([]),
+        )
+
+    def test_same_process_popup_is_found_and_clicked(self):
+        user32 = FakeUser32()
+        driver = self.make_driver(user32=user32)
+        self.assertEqual(driver.find_wechat_window(), 10)
+
+        popup = driver.find_search_popup(
+            10,
+            {"x": 0.1, "y": 0.1},
+        )
+
+        self.assertEqual(popup, (20, ScreenRect(150, 145, 700, 600)))
+        user32.window_from_point_result = 21
+        user32.roots[21] = 20
+        driver.click_search_popup_point(10, 20, (300, 200))
+        self.assertIn(("SetCursorPos", 300, 200), user32.calls)
+        self.assertEqual(
+            len([call for call in user32.calls if call[0] == "mouse_event"]),
+            2,
+        )
+
+    def test_other_process_popup_is_rejected(self):
+        user32 = FakeUser32()
+        driver = self.make_driver(user32=user32)
+        self.assertEqual(driver.find_wechat_window(), 10)
+        user32.pids[20] = 200
+
+        with self.assertRaises(CalibrationError) as raised:
+            driver.find_search_popup(10, {"x": 0.1, "y": 0.1})
+
+        self.assertEqual(raised.exception.code, CONTACT_SELECTION_FAILED)
 
 
 class Win32CaptureTests(unittest.TestCase):

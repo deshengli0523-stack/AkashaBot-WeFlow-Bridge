@@ -6,6 +6,7 @@ import threading
 import time
 
 import state
+from uia_contact_selector import OcrContactSelector
 from uia_support import (
     CalibrationError,
     Win32WeChatDriver,
@@ -52,6 +53,7 @@ class UiaFixedSender:
         self,
         calibration,
         driver=None,
+        contact_selector=None,
         sleep_fn=time.sleep,
         monotonic_fn=time.monotonic,
         pre_paste_preview_delay: float = 1.0,
@@ -61,6 +63,11 @@ class UiaFixedSender:
         self.driver = driver or Win32WeChatDriver()
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
+        self.contact_selector = contact_selector or OcrContactSelector(
+            self.driver,
+            sleep_fn=sleep_fn,
+            monotonic_fn=monotonic_fn,
+        )
         self.pre_paste_preview_delay = max(0.0, float(pre_paste_preview_delay))
         self.pre_send_delay = max(0.0, float(pre_send_delay))
         self._lock = _SHARED_SEND_LOCK
@@ -86,14 +93,17 @@ class UiaFixedSender:
         )
         self._pause(0.12)
 
-    def _paste_text(self, value: str) -> None:
+    def _paste_text(self, value: str, before_paste=None) -> bool:
         import pyperclip
 
         pyperclip.copy(value)
         try:
             self._pause(0.05)
+            if before_paste is not None and before_paste() is not True:
+                return False
             self.driver.hotkey_ctrl(VK_V)
             self._pause(0.05)
+            return True
         finally:
             try:
                 if pyperclip.paste() == value:
@@ -106,9 +116,13 @@ class UiaFixedSender:
         self.driver.hotkey_ctrl(VK_A)
         self._pause(0.05)
         self._paste_text(contact)
-        self._pause(0.45)
-        self._click(hwnd, "first_result")
-        self._pause(0.75)
+        self._pause(0.12)
+        self.contact_selector.select_contact(
+            hwnd,
+            self.calibration["points"]["search_box"],
+            contact,
+        )
+        self._pause(0.20)
 
     def _focus_and_clear_input(self, hwnd: int) -> None:
         self._click(hwnd, "message_input")
@@ -169,8 +183,13 @@ class UiaFixedSender:
             self._pause(0.05)
         return self._send_active(cancel_event)
 
-    def _discard_pasted_text(self, hwnd: int) -> None:
+    def _discard_pasted_text(self, hwnd: int, contact: str) -> None:
         try:
+            try:
+                self.contact_selector.verify_selected_contact(hwnd, contact)
+            except Exception:
+                self._select_contact(hwnd, contact)
+            self.contact_selector.verify_selected_contact(hwnd, contact)
             self._focus_and_clear_input(hwnd)
         except Exception:
             log.warning("[UIA_FIXED] cancelled text could not be cleared")
@@ -207,7 +226,21 @@ class UiaFixedSender:
                 self._focus_and_clear_input(hwnd)
                 if not self._wait_until_resumed(cancel_event):
                     return False
-                self._paste_text(text)
+                def before_text_paste() -> bool:
+                    self.contact_selector.verify_selected_contact(
+                        hwnd,
+                        contact,
+                    )
+                    return bool(
+                        self._send_active(cancel_event)
+                        and not state.paused.is_set()
+                    )
+
+                if not self._paste_text(
+                    text,
+                    before_paste=before_text_paste,
+                ):
+                    return False
                 pasted = True
                 if not self._wait_for_review(
                     self.pre_send_delay,
@@ -217,6 +250,7 @@ class UiaFixedSender:
                     return False
                 if not self._wait_until_resumed(cancel_event):
                     return False
+                self.contact_selector.verify_selected_contact(hwnd, contact)
                 if not state.try_commit_send(cancel_event):
                     return False
                 committed = True
@@ -227,7 +261,7 @@ class UiaFixedSender:
                 return False
             finally:
                 if pasted and not committed and hwnd is not None:
-                    self._discard_pasted_text(hwnd)
+                    self._discard_pasted_text(hwnd, contact)
                 state.end_send_preview(cancel_event)
 
     def send_image(self, contact: str, image_path: str) -> bool:
@@ -236,6 +270,9 @@ class UiaFixedSender:
             if not os.path.isfile(image_path):
                 log.error("[UIA_FIXED] send failed")
                 return False
+            hwnd = None
+            pasted = False
+            committed = False
             lifecycle_event = threading.Event()
             try:
                 if not self._wait_until_resumed(lifecycle_event):
@@ -249,12 +286,31 @@ class UiaFixedSender:
                     return False
                 self.driver.copy_image_to_clipboard(image_path)
                 self._pause(0.20)
-                self.driver.hotkey_ctrl(VK_V)
-                self._pause(0.50)
                 if not self._wait_until_resumed(lifecycle_event):
                     return False
+                self.contact_selector.verify_selected_contact(hwnd, contact)
+                if (
+                    not self._send_active(lifecycle_event)
+                    or state.paused.is_set()
+                ):
+                    return False
+                self.driver.hotkey_ctrl(VK_V)
+                self._pause(0.50)
+                pasted = True
+                if not self._wait_until_resumed(lifecycle_event):
+                    return False
+                self.contact_selector.verify_selected_contact(hwnd, contact)
+                if (
+                    not self._send_active(lifecycle_event)
+                    or state.paused.is_set()
+                ):
+                    return False
+                committed = True
                 self._send_button(hwnd)
                 return True
             except Exception as caught:
                 self._log_failure(caught)
                 return False
+            finally:
+                if pasted and not committed and hwnd is not None:
+                    self._discard_pasted_text(hwnd, contact)

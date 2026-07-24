@@ -13,6 +13,7 @@ CALIBRATION_INVALID = "E_UIA_CALIBRATION_INVALID"
 CALIBRATION_WINDOW = "E_UIA_CALIBRATION_WINDOW"
 CALIBRATION_BUSY = "E_UIA_CALIBRATION_BUSY"
 RECALIBRATION_REQUIRED = "E_UIA_RECALIBRATION_REQUIRED"
+CONTACT_SELECTION_FAILED = "E_UIA_CONTACT_SELECTION_FAILED"
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -33,6 +34,9 @@ CF_DIB = 8
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_IMAGE_BUFFER_SIZE = 32768
 WECHAT_PROCESS_BASENAMES = frozenset({"wechat.exe", "weixin.exe"})
+WECHAT_SEARCH_POPUP_CLASS = "Qt51514QWindowToolSaveBits"
+PER_MONITOR_AWARE = ctypes.c_void_p(-3)
+PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 
 
 class _POINT(ctypes.Structure):
@@ -82,6 +86,23 @@ class CalibrationError(RuntimeError):
         self.code = code
 
 
+def _ensure_per_monitor_dpi_awareness(user32) -> None:
+    """Keep window metrics, captured points, and injected clicks in physical pixels."""
+    try:
+        if user32.SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2):
+            return
+        current = user32.GetDpiAwarenessContextForProcess(None)
+        if user32.AreDpiAwarenessContextsEqual(
+            current, PER_MONITOR_AWARE_V2
+        ) or user32.AreDpiAwarenessContextsEqual(
+            current, PER_MONITOR_AWARE
+        ):
+            return
+    except Exception:
+        pass
+    raise CalibrationError(CALIBRATION_WINDOW)
+
+
 @dataclass(frozen=True)
 class ClientMetrics:
     hwnd: int
@@ -93,6 +114,22 @@ class ClientMetrics:
     visible: bool
     maximized: bool
     foreground: bool
+
+
+@dataclass(frozen=True)
+class ScreenRect:
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
 
 
 @dataclass(frozen=True)
@@ -112,6 +149,7 @@ class Win32WeChatDriver:
         self._bound_window_identity = None
         if native_user32:
             self._configure_user32_abi()
+            _ensure_per_monitor_dpi_awareness(self.user32)
         if native_kernel32:
             self._configure_kernel32_abi()
 
@@ -132,11 +170,27 @@ class Win32WeChatDriver:
                 ctypes.c_int,
             ),
             "GetForegroundWindow": ([], wintypes.HWND),
+            "SetProcessDpiAwarenessContext": (
+                [ctypes.c_void_p],
+                wintypes.BOOL,
+            ),
+            "GetDpiAwarenessContextForProcess": (
+                [wintypes.HANDLE],
+                ctypes.c_void_p,
+            ),
+            "AreDpiAwarenessContextsEqual": (
+                [ctypes.c_void_p, ctypes.c_void_p],
+                wintypes.BOOL,
+            ),
             "GetWindowThreadProcessId": (
                 [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)],
                 wintypes.DWORD,
             ),
             "GetClientRect": (
+                [wintypes.HWND, ctypes.POINTER(_RECT)],
+                wintypes.BOOL,
+            ),
+            "GetWindowRect": (
                 [wintypes.HWND, ctypes.POINTER(_RECT)],
                 wintypes.BOOL,
             ),
@@ -370,6 +424,95 @@ class Win32WeChatDriver:
             maximized=bool(self.user32.IsZoomed(hwnd)),
             foreground=int(self.user32.GetForegroundWindow() or 0) == hwnd,
         )
+
+    def _get_screen_rect(self, hwnd: int) -> ScreenRect:
+        rect = _RECT()
+        if not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        result = ScreenRect(rect.left, rect.top, rect.right, rect.bottom)
+        if result.width <= 0 or result.height <= 0:
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        return result
+
+    def find_search_popup(
+        self,
+        main_hwnd: int,
+        search_point: Mapping[str, object],
+    ) -> tuple[int, ScreenRect]:
+        """Return the one same-process WeChat search popup near the search box."""
+        main_identity = self._ensure_bound_window_identity(main_hwnd)
+        metrics = self._validated_click_metrics(main_hwnd, search_point)
+        search_x, search_y = screen_point_from_ratio(search_point, metrics)
+        candidates: list[tuple[int, ScreenRect]] = []
+
+        @_WNDENUMPROC
+        def collect(hwnd, _lparam):
+            popup_hwnd = int(hwnd)
+            if (
+                popup_hwnd == main_hwnd
+                or not self.user32.IsWindowVisible(popup_hwnd)
+                or self._window_class(popup_hwnd) != WECHAT_SEARCH_POPUP_CLASS
+            ):
+                return True
+            try:
+                identity = self._query_window_identity(popup_hwnd)
+                rect = self._get_screen_rect(popup_hwnd)
+            except CalibrationError:
+                return True
+            if (
+                identity.pid != main_identity.pid
+                or identity.image != main_identity.image
+                or rect.width < 160
+                or rect.height < 80
+                or rect.width > metrics.width * 0.60
+                or rect.height > metrics.height * 0.90
+                or rect.left < metrics.left - metrics.width * 0.05
+                or rect.right > metrics.left + metrics.width * 1.05
+                or rect.top < metrics.top - metrics.height * 0.05
+                or rect.bottom > metrics.top + metrics.height * 1.05
+                or not rect.left <= search_x <= rect.right
+                or rect.top > search_y + metrics.height * 0.20
+            ):
+                return True
+            candidates.append((popup_hwnd, rect))
+            return True
+
+        if not self.user32.EnumWindows(collect, 0) or len(candidates) != 1:
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        return candidates[0]
+
+    def click_search_popup_point(
+        self,
+        main_hwnd: int,
+        popup_hwnd: int,
+        point: tuple[int, int],
+    ) -> None:
+        """Click one point only after revalidating the same-process search popup."""
+        main_identity = self._ensure_bound_window_identity(main_hwnd)
+        self.get_client_metrics(main_hwnd)
+        if (
+            not self.user32.IsWindowVisible(popup_hwnd)
+            or self._window_class(popup_hwnd) != WECHAT_SEARCH_POPUP_CLASS
+        ):
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        popup_identity = self._query_window_identity(popup_hwnd)
+        rect = self._get_screen_rect(popup_hwnd)
+        if (
+            popup_identity.pid != main_identity.pid
+            or popup_identity.image != main_identity.image
+            or not rect.left <= point[0] < rect.right
+            or not rect.top <= point[1] < rect.bottom
+        ):
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+
+        child = int(self.user32.WindowFromPoint(_POINT(*point)) or 0)
+        root = int(self.user32.GetAncestor(child, GA_ROOT) or 0)
+        if not child or root != popup_hwnd:
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        if not self.user32.SetCursorPos(*point):
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
     def _capture_point_is_valid(self, hwnd: int, point: tuple[int, int]) -> bool:
         if not self._point_targets_bound_window(hwnd, point):

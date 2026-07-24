@@ -34,9 +34,11 @@ $expectedPublishFiles = @(
   'bridge/requirements.lock',
   'bridge/requirements.txt',
   'bridge/state.py',
+  'bridge/uia_contact_selector.py',
   'bridge/uia_fixed_sender.py',
   'bridge/uia_support.py',
   'bridge/web_panel.py',
+  'bridge/windows_ocr_selector.ps1',
   'plugins/astrbot_plugin_akasha_contact_memory/README.md',
   'plugins/astrbot_plugin_akasha_contact_memory/_conf_schema.json',
   'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/__init__.py',
@@ -70,6 +72,7 @@ $expectedPublishFiles = @(
   'tests/Run-All.ps1',
   'tests/python/test_bridge_runtime.py',
   'tests/python/test_contact_memory.py',
+  'tests/python/test_uia_contact_selector.py',
   'tests/python/test_uia_calibration.py',
   'tests/python/test_uia_fixed_sender.py',
   'tests/python/test_uia_support.py',
@@ -79,12 +82,12 @@ $expectedPublishFiles = @(
   ((-join @([char]0x5065, [char]0x5EB7, [char]0x68C0, [char]0x67E5)) + '.bat'),
   ((-join @([char]0x6821, [char]0x51C6)) + '.bat')
 )
-if ($expectedPublishFiles.Count -ne 65) {
-  throw "Release allowlist invariant is not 65 files: $($expectedPublishFiles.Count)"
+if ($expectedPublishFiles.Count -ne 68) {
+  throw "Release allowlist invariant is not 68 files: $($expectedPublishFiles.Count)"
 }
 $uniqueExpectedPublishFiles = @($expectedPublishFiles | Sort-Object -Unique)
-if ($uniqueExpectedPublishFiles.Count -ne 65) {
-  throw "Release allowlist must contain 65 unique entries; duplicate entries were found."
+if ($uniqueExpectedPublishFiles.Count -ne 68) {
+  throw "Release allowlist must contain 68 unique entries; duplicate entries were found."
 }
 $publishFiles = @(
   foreach ($entry in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop |
@@ -112,8 +115,8 @@ foreach ($relativePath in $actualPublishFiles) {
   }
 }
 $uniqueActualPublishFiles = @($actualPublishFiles | Sort-Object -Unique)
-if ($actualPublishFiles.Count -ne 65 -or $uniqueActualPublishFiles.Count -ne 65) {
-  throw "Published files must contain exactly 65 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
+if ($actualPublishFiles.Count -ne 68 -or $uniqueActualPublishFiles.Count -ne 68) {
+  throw "Published files must contain exactly 68 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
 }
 
 $bridgeRoot = Join-Path $root 'bridge'

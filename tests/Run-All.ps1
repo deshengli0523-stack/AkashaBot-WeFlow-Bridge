@@ -66,8 +66,8 @@ function Assert-AkashaTask8Layout {
   }
 
   $publishedFiles = @(Get-AkashaPublishedFiles)
-  if ($publishedFiles.Count -ne 65) {
-    throw "Documentation/layout gate: expected 65 publish files, found $($publishedFiles.Count)."
+  if ($publishedFiles.Count -ne 68) {
+    throw "Documentation/layout gate: expected 68 publish files, found $($publishedFiles.Count)."
   }
 
   $updateLauncher = (Join-AkashaCharacters @(0x66F4, 0x65B0)) + '.bat'

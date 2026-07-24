@@ -200,16 +200,16 @@ def chat_record(
     status: str,
     sender: object = "",
 ) -> str:
-    """Return one JSON log line containing a full chat audit record."""
+    """Return one JSON audit line without contact names or chat content."""
     payload = {
         "event": str(event),
         "scope": str(scope),
-        "contact": redact_log_text(contact),
+        "contact": pseudonym(contact),
     }
     if sender not in (None, ""):
-        payload["sender"] = redact_log_text(sender)
+        payload["sender"] = pseudonym(sender)
     payload["status"] = str(status)
-    payload["body"] = redact_log_text(body)
+    payload["body"] = message_meta(body)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     for separator in ("\u0085", "\u2028", "\u2029"):
         encoded = encoded.replace(separator, f"\\u{ord(separator):04x}")
