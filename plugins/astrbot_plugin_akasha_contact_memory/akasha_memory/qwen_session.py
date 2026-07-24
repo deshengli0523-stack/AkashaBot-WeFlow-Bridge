@@ -145,6 +145,10 @@ class QwenSessionManager:
                         seed_items[offset : offset + 20],
                     )
                     await self.store.record_qwen_items(session.id, item_ids)
+                session = await self.store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=memory_revision,
+                )
                 return session
             except MemoryRevisionChanged:
                 try:
@@ -230,6 +234,7 @@ class QwenSessionManager:
                     current_prompt=prompt,
                     exclude_source_uids=exclude_source_uids,
                 )
+            response_id = ""
             try:
                 await self.store.set_qwen_session_inflight(
                     session.id,
@@ -244,6 +249,7 @@ class QwenSessionManager:
                     tool_choice=tool_choice,
                     request_max_retries=request_max_retries,
                 )
+                response_id = result.response_id
                 pending_ids = tuple(call.call_id for call in result.tool_calls)
                 if len(pending_ids) != len(set(pending_ids)):
                     raise RuntimeError("Qwen returned duplicate tool call IDs")
@@ -251,22 +257,42 @@ class QwenSessionManager:
                     session.estimated_tokens,
                     result.input_tokens + result.output_tokens,
                 )
-                await self.store.update_qwen_session_usage(
-                    session.id,
-                    estimated_tokens=estimated,
-                    response_id=result.response_id,
-                    pending_owner=request_key if pending_ids else "",
-                    pending_call_ids=pending_ids,
-                )
                 if result.text and not result.tool_calls:
                     await self.store.archive_generated(
                         contact.id,
                         response_id=result.response_id,
                         content=result.text,
                     )
+                await self.store.update_qwen_session_usage(
+                    session.id,
+                    request_key=request_key,
+                    estimated_tokens=estimated,
+                    response_id=result.response_id,
+                    pending_owner=request_key if pending_ids else "",
+                    pending_call_ids=pending_ids,
+                )
                 return result
+            except asyncio.CancelledError:
+                # A cancelled caller must never leave a clean cloud
+                # conversation containing an answer that was not sent.
+                dirty_task = asyncio.create_task(
+                    self.store.fail_qwen_response(
+                        contact.id,
+                        session.id,
+                        response_id=response_id,
+                    )
+                )
+                try:
+                    await asyncio.shield(dirty_task)
+                except asyncio.CancelledError:
+                    await dirty_task
+                raise
             except Exception:
-                await self.store.mark_qwen_session_dirty(session.id)
+                await self.store.fail_qwen_response(
+                    contact.id,
+                    session.id,
+                    response_id=response_id,
+                )
                 raise
 
     async def archive_fallback_output(

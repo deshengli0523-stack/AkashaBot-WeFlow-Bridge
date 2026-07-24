@@ -1836,10 +1836,21 @@ class BridgeRuntimeTests(unittest.TestCase):
                     account="private-account-raw",
                     routing_name="更新备注",
                 )
+                volatile_binding = first_state.get_private_route_binding(ob_id)
                 second_state = load_state("bridge_private_route_state_second")
                 route = second_state.get_private_route(ob_id)
 
                 self.assertEqual(repeated_id, ob_id)
+                self.assertEqual(
+                    volatile_binding,
+                    {
+                        "ob_id": ob_id,
+                        "account": "private-account-raw",
+                        "session": "private-session-raw",
+                        "routing_name": "更新备注",
+                    },
+                )
+                self.assertIsNone(second_state.get_private_route_binding(ob_id))
                 self.assertIsNotNone(route)
                 self.assertEqual(route["routing_name"], "更新备注")
                 self.assertTrue(
@@ -1991,6 +2002,93 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual(state_module._ob_ws.payloads[-1]["status"], "ok")
         self.assertEqual(state_module._ob_ws.payloads[-1]["retcode"], 0)
 
+    def test_private_send_failure_notifies_memory_plugin_before_failed_ack(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send(self, payload):
+                self.payloads.append(json.loads(payload))
+
+        class CancelledSender:
+            def send_text(self, _contact, _text):
+                return False
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "success": True,
+                    "count": 1,
+                    "contacts": [
+                        {
+                            "username": "stable-private-session",
+                            "displayName": "唯一备注",
+                            "type": "friend",
+                        }
+                    ],
+                }
+
+        route = {
+            "ob_id": 7,
+            "identity_hmac": b"x" * 32,
+            "routing_name": "唯一备注",
+        }
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = FakeWebSocket()
+        state_module._ob_id_to_contact = {}
+        state_module._self_id_int = 99
+        state_module.sender_instance = CancelledSender()
+        state_module.get_private_route = lambda ob_id: route if ob_id == 7 else None
+        state_module.private_route_matches = (
+            lambda supplied_route, *, account, session: (
+                supplied_route is route
+                and account == "bot-account"
+                and session == "stable-private-session"
+            )
+        )
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "contacts-" + "token"
+        config_module.BOT_WXID = "bot-account"
+        requests_module = types.ModuleType("requests")
+        requests_module.get = lambda *_args, **_kwargs: FakeResponse()
+        protocol = self._load_ob_protocol(
+            "private_route_send_failure_ob_protocol",
+            state_module,
+            config_module,
+            requests_module,
+        )
+
+        request = {
+            "action": "send_private_msg",
+            "params": {
+                "user_id": 7,
+                "message": [
+                    {"type": "text", "data": {"text": "cancelled-body"}}
+                ],
+            },
+            "echo": "private-send-failure",
+        }
+        with self.assertLogs("ob11-bridge", level="INFO"):
+            asyncio.run(protocol._handle_ob_api(request))
+
+        self.assertEqual(len(state_module._ob_ws.payloads), 2)
+        notice, response = state_module._ob_ws.payloads
+        self.assertEqual("notice", notice["post_type"])
+        self.assertEqual("akasha_send_result", notice["notice_type"])
+        self.assertEqual("failed", notice["sub_type"])
+        self.assertIs(notice["success"], False)
+        self.assertEqual("bot-account", notice["account"])
+        self.assertEqual("stable-private-session", notice["session"])
+        self.assertEqual(7, notice["user_id"])
+        self.assertEqual("failed", response["status"])
+        self.assertNotEqual(0, response["retcode"])
+        self.assertEqual("private-send-failure", response["echo"])
+
     def test_private_send_fails_closed_before_uia_when_route_is_not_verifiable(self):
         class FakeWebSocket:
             def __init__(self):
@@ -2025,6 +2123,16 @@ class BridgeRuntimeTests(unittest.TestCase):
         state_module._ob_id_to_contact = {7: "unsafe-memory-fallback"}
         state_module.sender_instance = UnexpectedSender()
         state_module.get_private_route = lambda ob_id: route if ob_id == 7 else None
+        state_module.get_private_route_binding = lambda ob_id: (
+            {
+                "ob_id": 7,
+                "account": "bot-account",
+                "session": "expected-session",
+                "routing_name": "同名联系人",
+            }
+            if ob_id == 7
+            else None
+        )
         state_module.private_route_matches = (
             lambda _route, *, account, session: (
                 account == "bot-account" and session == "expected-session"
@@ -2131,13 +2239,21 @@ class BridgeRuntimeTests(unittest.TestCase):
                 with self.assertLogs("ob11-bridge", level="INFO"):
                     asyncio.run(protocol._handle_ob_api(request))
                 self.assertEqual(state_module.sender_instance.calls, [])
-                self.assertEqual(len(state_module._ob_ws.payloads), 1)
+                self.assertEqual(len(state_module._ob_ws.payloads), 2)
                 self.assertEqual(
-                    state_module._ob_ws.payloads[0]["status"],
+                    state_module._ob_ws.payloads[0]["notice_type"],
+                    "akasha_send_result",
+                )
+                self.assertIs(
+                    state_module._ob_ws.payloads[0]["success"],
+                    False,
+                )
+                self.assertEqual(
+                    state_module._ob_ws.payloads[-1]["status"],
                     "failed",
                 )
                 self.assertNotEqual(
-                    state_module._ob_ws.payloads[0]["retcode"],
+                    state_module._ob_ws.payloads[-1]["retcode"],
                     0,
                 )
 
@@ -2149,7 +2265,11 @@ class BridgeRuntimeTests(unittest.TestCase):
         with self.assertLogs("ob11-bridge", level="INFO"):
             asyncio.run(protocol._handle_ob_api(request))
         self.assertEqual(state_module.sender_instance.calls, [])
-        self.assertEqual(state_module._ob_ws.payloads[0]["status"], "failed")
+        self.assertEqual(
+            state_module._ob_ws.payloads[0]["notice_type"],
+            "akasha_send_result",
+        )
+        self.assertEqual(state_module._ob_ws.payloads[-1]["status"], "failed")
 
         state_module.get_private_route = (
             lambda ob_id: route if ob_id == 7 else None
@@ -2176,7 +2296,11 @@ class BridgeRuntimeTests(unittest.TestCase):
         with self.assertLogs("ob11-bridge", level="INFO"):
             asyncio.run(protocol._handle_ob_api(request))
         self.assertEqual(state_module.sender_instance.calls, [])
-        self.assertEqual(state_module._ob_ws.payloads[0]["status"], "failed")
+        self.assertEqual(
+            state_module._ob_ws.payloads[0]["notice_type"],
+            "akasha_send_result",
+        )
+        self.assertEqual(state_module._ob_ws.payloads[-1]["status"], "failed")
 
     def test_group_send_keeps_existing_route_without_contacts_api(self):
         class FakeWebSocket:

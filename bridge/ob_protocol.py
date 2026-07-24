@@ -54,6 +54,24 @@ def _normalize_target_id(value: object) -> int | None:
     return None
 
 
+def _private_failure_identity(target_id: int) -> tuple[str, str, str] | None:
+    getter = getattr(state, "get_private_route_binding", None)
+    if not callable(getter):
+        return None
+    try:
+        binding = getter(target_id)
+    except Exception:
+        return None
+    if not isinstance(binding, dict):
+        return None
+    routing_name = str(binding.get("routing_name") or "").strip()
+    account = str(binding.get("account") or "").strip()
+    session = str(binding.get("session") or "").strip()
+    if not routing_name or not account or not session:
+        return None
+    return routing_name, account, session
+
+
 def _contact_route_names(contact: dict) -> set[str]:
     output = set()
     for key in ("displayName", "remark", "nickname", "alias"):
@@ -63,7 +81,7 @@ def _contact_route_names(contact: dict) -> set[str]:
     return output
 
 
-def _resolve_private_contact(target_id: int) -> str | None:
+def _resolve_private_contact(target_id: int) -> tuple[str, str, str] | None:
     try:
         route = state.get_private_route(target_id)
     except Exception:
@@ -156,7 +174,7 @@ def _resolve_private_contact(target_id: int) -> str | None:
     if target_matches is not True:
         log.warning("[OB11] 私聊联系人目标不匹配")
         return None
-    return routing_name
+    return routing_name, account, session.strip()
 
 
 async def _send_api_response(response_data: dict) -> bool:
@@ -174,6 +192,34 @@ async def _send_api_response(response_data: dict) -> bool:
                 await asyncio.sleep(0.5)
     log.warning("[OB11] WS 未连接，API 响应未发送；继续尝试本地处理")
     return False
+
+
+async def _send_private_send_failure(
+    target_id: int,
+    *,
+    routing_name: str,
+    account: str,
+    session: str,
+) -> bool:
+    """Tell the memory plugin that a generated private reply was not sent."""
+
+    return await _send_api_response(
+        {
+            "time": int(time.time()),
+            "self_id": int(getattr(state, "_self_id_int", 0) or 0),
+            "post_type": "notice",
+            "notice_type": "akasha_send_result",
+            "sub_type": "failed",
+            "user_id": target_id,
+            "akasha_schema": 1,
+            "type": "private",
+            "account": account,
+            "session": session,
+            "routing_name": routing_name,
+            "source_messages": [],
+            "success": False,
+        }
+    )
 
 
 async def _handle_ob_api(data: dict, generation=None):
@@ -214,6 +260,19 @@ async def _handle_ob_api(data: dict, generation=None):
         message = params.get("message", [])
         scope = "group" if is_group else "private"
         if not params_valid or target_id is None or not isinstance(message, list):
+            if not is_group and target_id is not None:
+                failure_identity = await asyncio.to_thread(
+                    _private_failure_identity,
+                    target_id,
+                )
+                if failure_identity is not None:
+                    routing_name, account, session = failure_identity
+                    await _send_private_send_failure(
+                        target_id,
+                        routing_name=routing_name,
+                        account=account,
+                        session=session,
+                    )
             failed_response = {
                 "status": "failed",
                 "retcode": 1400,
@@ -226,11 +285,27 @@ async def _handle_ob_api(data: dict, generation=None):
             _write_outbound_log(scope, contact, "[无效消息]", False)
             return
 
+        private_identity: tuple[str, str, str] | None = None
         if is_group:
             contact = state._ob_id_to_contact.get(target_id, str(target_id))
         else:
-            contact = await asyncio.to_thread(_resolve_private_contact, target_id)
-            if contact is None:
+            private_identity = await asyncio.to_thread(
+                _resolve_private_contact,
+                target_id,
+            )
+            if private_identity is None:
+                failure_identity = await asyncio.to_thread(
+                    _private_failure_identity,
+                    target_id,
+                )
+                if failure_identity is not None:
+                    routing_name, account, session = failure_identity
+                    await _send_private_send_failure(
+                        target_id,
+                        routing_name=routing_name,
+                        account=account,
+                        session=session,
+                    )
                 failed_response = {
                     "status": "failed",
                     "retcode": 1404,
@@ -246,19 +321,21 @@ async def _handle_ob_api(data: dict, generation=None):
                     False,
                 )
                 return
-
-        # A successful ACK means the recipient passed all synchronous preflight.
-        await _send_api_response(resp_data)
+            contact, _, _ = private_identity
 
         # 逐段处理：文字和图片分别发送
+        all_sent = True
+        sendable_segments = 0
         for seg in message:
             if not isinstance(seg, dict):
                 _write_outbound_log(scope, contact, "[无效消息]", False)
+                all_sent = False
                 continue
             seg_type = seg.get("type", "")
             seg_data = seg.get("data", {})
             if not isinstance(seg_type, str):
                 _write_outbound_log(scope, contact, "[无效消息]", False)
+                all_sent = False
                 continue
             if not isinstance(seg_data, dict):
                 invalid_body = {
@@ -268,14 +345,17 @@ async def _handle_ob_api(data: dict, generation=None):
                 }.get(seg_type)
                 if invalid_body:
                     _write_outbound_log(scope, contact, invalid_body, False)
+                all_sent = False
                 continue
 
             if seg_type == "text":
                 text = seg_data.get("text", "")
                 if not isinstance(text, str):
                     _write_outbound_log(scope, contact, "[无效文本]", False)
+                    all_sent = False
                     continue
                 if text:
+                    sendable_segments += 1
                     try:
                         sent = await asyncio.to_thread(
                             sender_instance.send_text,
@@ -284,17 +364,23 @@ async def _handle_ob_api(data: dict, generation=None):
                         )
                     except Exception:
                         _write_outbound_log(scope, contact, text, False)
+                        all_sent = False
                         continue
                     _write_outbound_log(scope, contact, text, sent)
+                    if sent is not True:
+                        all_sent = False
 
             elif seg_type == "image":
                 file_val = seg_data.get("file", "")
                 if not isinstance(file_val, str):
                     _write_outbound_log(scope, contact, "[图片]", False)
+                    all_sent = False
                     continue
                 if not file_val:
                     _write_outbound_log(scope, contact, "[图片]", False)
+                    all_sent = False
                     continue
+                sendable_segments += 1
 
                 img_path = None
                 temporary_image = False
@@ -326,6 +412,7 @@ async def _handle_ob_api(data: dict, generation=None):
 
                 if not img_path:
                     _write_outbound_log(scope, contact, "[图片]", False)
+                    all_sent = False
                     continue
 
                 try:
@@ -338,8 +425,11 @@ async def _handle_ob_api(data: dict, generation=None):
                         )
                     except Exception:
                         _write_outbound_log(scope, contact, "[图片]", False)
+                        all_sent = False
                         continue
                     _write_outbound_log(scope, contact, "[图片]", sent)
+                    if sent is not True:
+                        all_sent = False
                 finally:
                     # 临时文件用完删除
                     if temporary_image:
@@ -349,6 +439,7 @@ async def _handle_ob_api(data: dict, generation=None):
                             pass
 
             elif seg_type == "face":
+                sendable_segments += 1
                 try:
                     sent = await asyncio.to_thread(
                         sender_instance.send_text,
@@ -357,16 +448,38 @@ async def _handle_ob_api(data: dict, generation=None):
                     )
                 except Exception:
                     _write_outbound_log(scope, contact, "[表情]", False)
+                    all_sent = False
                     continue
                 _write_outbound_log(scope, contact, "[表情]", sent)
+                if sent is not True:
+                    all_sent = False
 
             # 其他类型（record, video 等）忽略
+
+        send_succeeded = all_sent and sendable_segments > 0
+        if not send_succeeded and private_identity is not None:
+            routing_name, account, session = private_identity
+            await _send_private_send_failure(
+                target_id,
+                routing_name=routing_name,
+                account=account,
+                session=session,
+            )
+        response = (
+            resp_data
+            if send_succeeded
+            else {
+                "status": "failed",
+                "retcode": 1500,
+                "data": {},
+                **({"echo": echo} if echo else {}),
+            }
+        )
+        await _send_api_response(response)
 
     else:
         await _send_api_response(resp_data)
         log.debug("[OB11] 收到未处理的 API 操作")
-
-    # 注意：API 响应已在函数开头统一发送，此处不再重复
 
 
 def _extract_text(message: list) -> str:

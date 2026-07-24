@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import pathlib
 import sqlite3
@@ -57,7 +58,9 @@ class ContactMemoryTests(unittest.TestCase):
                     created_at=1,
                     expires_at=time.time() + 3600,
                     estimated_tokens=100,
-                    expected_memory_revision=0,
+                    expected_memory_revision=(
+                        await store.contact_memory_revision(contact.id)
+                    ),
                 )
                 connection = sqlite3.connect(store.path)
                 try:
@@ -223,6 +226,276 @@ class ContactMemoryTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_forget_without_qwen_client_preserves_cloud_deletion_ids(self):
+        fake_aiohttp = types.ModuleType("aiohttp")
+        original_aiohttp = sys.modules.get("aiohttp")
+        sys.modules["aiohttp"] = fake_aiohttp
+        try:
+            from akasha_memory.runtime import ContactMemoryRuntime
+        finally:
+            if original_aiohttp is None:
+                sys.modules.pop("aiohttp", None)
+            else:
+                sys.modules["aiohttp"] = original_aiohttp
+
+        class FakeSync:
+            @asynccontextmanager
+            async def exclusive_contact(self, _contact_id):
+                yield
+
+            async def close(self):
+                return None
+
+        class FakeEvent:
+            unified_msg_origin = "aiocqhttp:FriendMessage:123"
+            message_obj = types.SimpleNamespace(
+                raw_message={
+                    "akasha_schema": 1,
+                    "type": "private",
+                    "account": "account",
+                    "session": "session",
+                    "routing_name": "contact",
+                    "source_messages": [],
+                }
+            )
+
+            def is_private_chat(self):
+                return True
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-cloud-forget-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [MemoryMessage("raw:keep", 1, "in", "keep until cloud deletion")],
+                )
+                await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="cloud-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=1,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=(
+                        await store.contact_memory_revision(contact.id)
+                    ),
+                )
+                runtime = ContactMemoryRuntime(
+                    mode="off",
+                    secret_manager=secrets,
+                    store=store,
+                    synchronizer=FakeSync(),
+                    context_builder=ContextBuilder(store),
+                    qwen_sessions=None,
+                )
+
+                self.assertEqual((False, 1), await runtime.forget(FakeEvent()))
+                self.assertTrue(await store.is_contact_tombstoned(contact.id))
+                self.assertEqual(
+                    ["cloud-conversation"],
+                    await store.list_contact_conversations(contact.id),
+                )
+                connection = sqlite3.connect(store.path)
+                try:
+                    message_count = connection.execute(
+                        "SELECT COUNT(*) FROM messages WHERE contact_id = ?",
+                        (contact.id,),
+                    ).fetchone()[0]
+                finally:
+                    connection.close()
+                self.assertEqual(1, message_count)
+
+        asyncio.run(scenario())
+
+    def test_bridge_send_failure_immediately_dirties_contact_session(self):
+        fake_aiohttp = types.ModuleType("aiohttp")
+        original_aiohttp = sys.modules.get("aiohttp")
+        sys.modules["aiohttp"] = fake_aiohttp
+        try:
+            from akasha_memory.runtime import ContactMemoryRuntime
+        finally:
+            if original_aiohttp is None:
+                sys.modules.pop("aiohttp", None)
+            else:
+                sys.modules["aiohttp"] = original_aiohttp
+
+        class FakeSync:
+            @asynccontextmanager
+            async def exclusive_contact(self, _contact_id):
+                yield
+
+            async def close(self):
+                return None
+
+        class FakeEvent:
+            unified_msg_origin = "aiocqhttp:FriendMessage:123"
+            message_obj = types.SimpleNamespace(
+                raw_message={
+                    "akasha_schema": 1,
+                    "type": "private",
+                    "account": "account",
+                    "session": "session",
+                    "routing_name": "contact",
+                    "source_messages": [],
+                    "notice_type": "akasha_send_result",
+                    "success": False,
+                }
+            )
+
+            def is_private_chat(self):
+                return True
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-send-failure-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="cloud-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=1,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                session = await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="unsent-response",
+                    content="must be discarded",
+                )
+                self.assertFalse(session.dirty)
+                runtime = ContactMemoryRuntime(
+                    mode="active",
+                    secret_manager=secrets,
+                    store=store,
+                    synchronizer=FakeSync(),
+                    context_builder=ContextBuilder(store),
+                    qwen_sessions=None,
+                )
+
+                self.assertTrue(await runtime.record_send_failure(FakeEvent()))
+                current = await store.active_qwen_session(contact.id)
+                self.assertIsNotNone(current)
+                self.assertTrue(current.dirty)
+                self.assertEqual(1, await store.contact_memory_revision(contact.id))
+                connection = sqlite3.connect(store.path)
+                try:
+                    pending_count = connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM messages
+                        WHERE contact_id = ?
+                          AND origin = 'generated'
+                          AND pending = 1
+                        """,
+                        (contact.id,),
+                    ).fetchone()[0]
+                finally:
+                    connection.close()
+                self.assertEqual(0, pending_count)
+
+        asyncio.run(scenario())
+
+    def test_external_weflow_turn_invalidates_but_current_bridge_echo_does_not(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-external-turn-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="cloud-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=1,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                session = await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "bridge:current",
+                            100,
+                            "in",
+                            "current prompt",
+                            origin="bridge",
+                            pending=True,
+                        )
+                    ],
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:current",
+                            101,
+                            "in",
+                            "current prompt",
+                            origin="weflow",
+                        )
+                    ],
+                )
+                current = await store.active_qwen_session(contact.id)
+                self.assertFalse(current.dirty)
+                self.assertEqual(0, await store.contact_memory_revision(contact.id))
+
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:manual",
+                            102,
+                            "out",
+                            "manual operator message",
+                            origin="weflow",
+                        )
+                    ],
+                )
+                current = await store.active_qwen_session(contact.id)
+                self.assertTrue(current.dirty)
+                self.assertEqual(1, await store.contact_memory_revision(contact.id))
+
+        asyncio.run(scenario())
+
     def test_split_weflow_output_confirms_pending_generation(self):
         async def scenario():
             with tempfile.TemporaryDirectory(prefix="akasha-memory-split-") as temp:
@@ -241,6 +514,21 @@ class ContactMemoryTests(unittest.TestCase):
                     response_id="resp-split",
                     content="第一句。 第二句。",
                     source_time=100,
+                )
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="split-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=100,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
                 )
                 self.assertEqual([], await store.recent_messages(contact.id))
                 await store.upsert_messages(
@@ -265,6 +553,10 @@ class ContactMemoryTests(unittest.TestCase):
                 resolved, dirty = await store.reconcile_pending_outputs(contact.id)
                 self.assertEqual(1, resolved)
                 self.assertFalse(dirty)
+                self.assertEqual(0, await store.contact_memory_revision(contact.id))
+                self.assertFalse(
+                    (await store.active_qwen_session(contact.id)).dirty
+                )
                 self.assertEqual(
                     ["raw:part-1", "raw:part-2"],
                     [
@@ -617,6 +909,223 @@ class ContactMemoryTests(unittest.TestCase):
                 current = await store.active_qwen_session(contact.id)
                 self.assertEqual("conv-3", current.conversation_id)
                 self.assertTrue(current.dirty)
+
+        asyncio.run(scenario())
+
+    def test_cancelled_qwen_seed_remains_dirty_and_is_not_reused(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class FakeContextBuilder:
+            seed_max_tokens = 10000
+
+            async def build(self, *_args, **_kwargs):
+                return types.SimpleNamespace(
+                    items=[
+                        {"role": "user", "content": f"history-{index}"}
+                        for index in range(21)
+                    ],
+                    estimated_tokens=210,
+                )
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.seed_calls = []
+                self.responses = []
+
+            async def create_conversation(self, *, metadata=None):
+                conversation_id = f"conv-{len(self.created) + 1}"
+                self.created.append(conversation_id)
+                return conversation_id
+
+            async def add_items(self, conversation_id, items):
+                self.seed_calls.append((conversation_id, len(items)))
+                calls_for_conversation = sum(
+                    1 for value, _ in self.seed_calls if value == conversation_id
+                )
+                if conversation_id == "conv-1" and calls_for_conversation == 2:
+                    raise asyncio.CancelledError()
+                return [
+                    f"{conversation_id}-item-{calls_for_conversation}-{index}"
+                    for index in range(len(items))
+                ]
+
+            async def respond(
+                self,
+                *,
+                conversation_id,
+                model,
+                prompt,
+                input_items=None,
+                tools=None,
+                tool_choice="auto",
+                request_max_retries=None,
+            ):
+                self.responses.append(conversation_id)
+                return QwenResult(response_id="response", text="ok")
+
+            async def delete_conversation_fully(self, conversation_id):
+                return None
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-cancel-seed-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                client = FakeClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=FakeContextBuilder(),
+                    client=client,
+                )
+
+                with self.assertRaises(asyncio.CancelledError):
+                    await manager.respond(
+                        contact,
+                        prompt="first",
+                        system_prompt="persona",
+                        request_key="cancelled-request",
+                    )
+
+                incomplete = await store.active_qwen_session(contact.id)
+                self.assertIsNotNone(incomplete)
+                self.assertEqual("conv-1", incomplete.conversation_id)
+                self.assertTrue(incomplete.dirty)
+
+                result = await manager.respond(
+                    contact,
+                    prompt="second",
+                    system_prompt="persona",
+                    request_key="replacement-request",
+                )
+                self.assertEqual("ok", result.text)
+                self.assertEqual(["conv-1", "conv-2"], client.created)
+                self.assertEqual(["conv-2"], client.responses)
+                active = await store.active_qwen_session(contact.id)
+                self.assertIsNotNone(active)
+                self.assertEqual("conv-2", active.conversation_id)
+                self.assertFalse(active.dirty)
+
+        asyncio.run(scenario())
+
+    def test_cancelled_qwen_response_commit_is_dirtied_and_not_reused(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.responses = []
+
+            async def create_conversation(self, *, metadata=None):
+                conversation_id = f"conv-{len(self.created) + 1}"
+                self.created.append(conversation_id)
+                return conversation_id
+
+            async def add_items(self, conversation_id, items):
+                return []
+
+            async def respond(
+                self,
+                *,
+                conversation_id,
+                model,
+                prompt,
+                input_items=None,
+                tools=None,
+                tool_choice="auto",
+                request_max_retries=None,
+            ):
+                self.responses.append(conversation_id)
+                return QwenResult(
+                    response_id=f"response-{len(self.responses)}",
+                    text=f"answer-{len(self.responses)}",
+                )
+
+            async def delete_conversation_fully(self, conversation_id):
+                return None
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-cancel-response-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                client = FakeClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+                update_usage = store.update_qwen_session_usage
+                cancel_first_commit = True
+
+                async def update_then_cancel(*args, **kwargs):
+                    nonlocal cancel_first_commit
+                    await update_usage(*args, **kwargs)
+                    if cancel_first_commit:
+                        cancel_first_commit = False
+                        raise asyncio.CancelledError()
+
+                store.update_qwen_session_usage = update_then_cancel
+                with self.assertRaises(asyncio.CancelledError):
+                    await manager.respond(
+                        contact,
+                        prompt="first",
+                        system_prompt="persona",
+                        request_key="cancelled-response",
+                    )
+
+                incomplete = await store.active_qwen_session(contact.id)
+                self.assertIsNotNone(incomplete)
+                self.assertEqual("conv-1", incomplete.conversation_id)
+                self.assertTrue(incomplete.dirty)
+
+                result = await manager.respond(
+                    contact,
+                    prompt="second",
+                    system_prompt="persona",
+                    request_key="replacement-response",
+                )
+                self.assertEqual("answer-2", result.text)
+                self.assertEqual(["conv-1", "conv-2"], client.created)
+                self.assertEqual(["conv-1", "conv-2"], client.responses)
+                active = await store.active_qwen_session(contact.id)
+                self.assertIsNotNone(active)
+                self.assertEqual("conv-2", active.conversation_id)
+                self.assertFalse(active.dirty)
 
         asyncio.run(scenario())
 

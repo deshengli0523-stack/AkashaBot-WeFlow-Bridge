@@ -164,6 +164,10 @@ _ONEBOT_ID_MAX = (1 << 53) - 1
 _IDENTITY_DB_FILENAME = "bridge_identity.sqlite3"
 _IDENTITY_SCHEMA_VERSION = 2
 _identity_db_lock = threading.RLock()
+# Plain source identities are intentionally process-local. The persistent
+# route table keeps only HMACs, while this binding lets a failed outbound
+# preflight notify AstrBot about the exact private contact that triggered it.
+_private_route_bindings: dict[int, tuple[str, str, str]] = {}
 
 
 def _identity_db_path() -> str:
@@ -460,12 +464,39 @@ def remember_private_route(
                 (ob_id, identity_key, route_name, int(time.time())),
             )
             connection.commit()
+            _private_route_bindings[ob_id] = (
+                account_id,
+                source_id,
+                route_name,
+            )
             return ob_id
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+
+def get_private_route_binding(ob_id: object) -> Optional[dict[str, object]]:
+    if isinstance(ob_id, bool):
+        return None
+    try:
+        normalized_id = int(ob_id)
+    except (TypeError, ValueError):
+        return None
+    if normalized_id <= 0 or normalized_id > _ONEBOT_ID_MAX:
+        return None
+    with _identity_db_lock:
+        binding = _private_route_bindings.get(normalized_id)
+        if binding is None:
+            return None
+        account, session, routing_name = binding
+        return {
+            "ob_id": normalized_id,
+            "account": account,
+            "session": session,
+            "routing_name": routing_name,
+        }
 
 
 def get_private_route(ob_id: object) -> Optional[dict[str, object]]:

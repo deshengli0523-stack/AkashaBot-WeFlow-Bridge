@@ -105,8 +105,13 @@ class ContactMemoryRuntime:
             source_messages=safe_sources,
         )
 
-    async def bind_event(self, event: Any) -> PreparedContact | None:
-        if self.mode == "off":
+    async def bind_event(
+        self,
+        event: Any,
+        *,
+        allow_off: bool = False,
+    ) -> PreparedContact | None:
+        if self.mode == "off" and not allow_off:
             return None
         binding = self.binding_from_event(event)
         if not binding or not binding.unified_origin:
@@ -322,6 +327,15 @@ class ContactMemoryRuntime:
         if prepared and self.qwen_sessions:
             await self.qwen_sessions.mark_dirty(prepared.contact.id)
 
+    async def record_send_failure(self, event: Any) -> bool:
+        prepared = await self.bind_event(event, allow_off=True)
+        if not prepared or prepared.contact.tombstoned_at is not None:
+            return False
+        async with self.synchronizer.exclusive_contact(prepared.contact.id):
+            await self.store.invalidate_unconfirmed_outputs(prepared.contact.id)
+        self._drop_contact_cache(prepared.contact.id)
+        return True
+
     async def archive_fallback_output(
         self,
         contact_key: str,
@@ -344,7 +358,7 @@ class ContactMemoryRuntime:
         )
 
     async def rebuild(self, event: Any) -> int | None:
-        prepared = await self.bind_event(event)
+        prepared = await self.bind_event(event, allow_off=True)
         if not prepared or prepared.contact.tombstoned_at is not None:
             return None
         if not self.qwen_sessions:
@@ -353,7 +367,7 @@ class ContactMemoryRuntime:
         return await self.qwen_sessions.rebuild(prepared.contact.id)
 
     async def forget(self, event: Any) -> tuple[bool, int] | None:
-        prepared = await self.bind_event(event)
+        prepared = await self.bind_event(event, allow_off=True)
         if not prepared:
             return None
         async with self.synchronizer.exclusive_contact(prepared.contact.id):
@@ -361,8 +375,18 @@ class ContactMemoryRuntime:
                 result = await self.qwen_sessions.forget(prepared.contact.id)
             else:
                 await self.store.tombstone_contact(prepared.contact.id)
-                await self.store.forget_contact(prepared.contact.id)
-                result = (True, 0)
+                conversation_ids = await self.store.list_contact_conversations(
+                    prepared.contact.id
+                )
+                if conversation_ids:
+                    # Keep the local conversation IDs and message archive so a
+                    # later retry with a working Qwen client can delete the
+                    # cloud data first. The tombstone already blocks all new
+                    # archive writes and context reuse.
+                    result = (False, len(conversation_ids))
+                else:
+                    await self.store.forget_contact(prepared.contact.id)
+                    result = (True, 0)
         # A tombstoned contact must leave the active request cache even when
         # cloud deletion failed and is waiting for an administrator retry.
         self._drop_contact_cache(prepared.contact.id)
@@ -371,7 +395,7 @@ class ContactMemoryRuntime:
     async def status(self, event: Any | None = None) -> dict[str, Any]:
         contact_id = None
         if event is not None:
-            prepared = await self.bind_event(event)
+            prepared = await self.bind_event(event, allow_off=True)
             contact_id = prepared.contact.id if prepared else None
         result = await self.store.status(contact_id)
         result["contact_tombstoned"] = bool(

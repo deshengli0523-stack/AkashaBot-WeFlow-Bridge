@@ -503,6 +503,7 @@ class MemoryStore:
             if contact_state is None or contact_state["tombstoned_at"] is not None:
                 return 0
             changed = 0
+            external_changed = 0
             now = time.time()
             for message in records:
                 if not message.source_uid or not message.content:
@@ -510,7 +511,10 @@ class MemoryStore:
                 content_digest = _content_hash(message.content)
                 existing = connection.execute(
                     """
-                    SELECT id, origin, pending FROM messages
+                    SELECT
+                        id, source_time, direction, content, message_type,
+                        id_quality, origin, pending
+                    FROM messages
                     WHERE contact_id = ? AND source_uid = ?
                     """,
                     (contact_id, message.source_uid),
@@ -523,6 +527,18 @@ class MemoryStore:
                         # Never downgrade an authoritative WeFlow record to a
                         # provisional bridge/generated copy.
                         continue
+                    authoritative_changed = (
+                        message.origin == "weflow"
+                        and str(existing["origin"]) == "weflow"
+                        and not bool(existing["pending"])
+                        and (
+                            float(existing["source_time"]) != message.source_time
+                            or str(existing["direction"]) != message.direction
+                            or str(existing["content"]) != message.content
+                            or str(existing["message_type"]) != message.message_type
+                            or str(existing["id_quality"]) != message.id_quality
+                        )
+                    )
                     connection.execute(
                         """
                         UPDATE messages SET
@@ -543,6 +559,9 @@ class MemoryStore:
                             int(existing["id"]),
                         ),
                     )
+                    if authoritative_changed:
+                        changed += 1
+                        external_changed += 1
                     continue
 
                 pending = None
@@ -639,8 +658,43 @@ class MemoryStore:
                         now,
                     ),
                 )
-                changed += max(cursor.rowcount, 0)
-            if changed and advance_memory_revision:
+                inserted = max(cursor.rowcount, 0)
+                changed += inserted
+                if inserted and message.origin == "weflow":
+                    defer_split_outgoing = False
+                    if message.direction == "out":
+                        defer_split_outgoing = (
+                            connection.execute(
+                                """
+                                SELECT 1
+                                FROM messages
+                                WHERE contact_id = ?
+                                  AND direction = 'out'
+                                  AND origin = 'generated'
+                                  AND pending = 1
+                                  AND ABS(source_time - ?) <= 900
+                                LIMIT 1
+                                """,
+                                (contact_id, message.source_time),
+                            ).fetchone()
+                            is not None
+                        )
+                    if not defer_split_outgoing:
+                        external_changed += 1
+            if external_changed:
+                connection.execute(
+                    """
+                    UPDATE contacts
+                    SET memory_revision = memory_revision + 1
+                    WHERE id = ?
+                    """,
+                    (contact_id,),
+                )
+                connection.execute(
+                    "UPDATE qwen_sessions SET dirty = 1 WHERE contact_id = ?",
+                    (contact_id,),
+                )
+            elif changed and advance_memory_revision:
                 connection.execute(
                     """
                     UPDATE contacts
@@ -792,6 +846,22 @@ class MemoryStore:
                 """,
                 (contact_id,),
             ).fetchall()
+            latest_incoming_row = connection.execute(
+                """
+                SELECT MAX(source_time)
+                FROM messages
+                WHERE contact_id = ?
+                  AND direction = 'in'
+                  AND origin = 'weflow'
+                  AND pending = 0
+                """,
+                (contact_id,),
+            ).fetchone()
+            latest_incoming = (
+                float(latest_incoming_row[0])
+                if latest_incoming_row and latest_incoming_row[0] is not None
+                else 0.0
+            )
             resolved = 0
             dirty = False
             now = time.time()
@@ -871,8 +941,32 @@ class MemoryStore:
                     now - float(pending["source_time"])
                     >= max(30.0, float(stale_after_seconds))
                 )
-                if (candidates and not partial_prefix) or stale:
+                superseded_by_incoming = (
+                    latest_incoming > float(pending["source_time"])
+                )
+                if (
+                    (candidates and not partial_prefix)
+                    or stale
+                    or superseded_by_incoming
+                ):
+                    connection.execute(
+                        "DELETE FROM messages WHERE id = ?",
+                        (int(pending["id"]),),
+                    )
                     dirty = True
+            if dirty:
+                connection.execute(
+                    "UPDATE qwen_sessions SET dirty = 1 WHERE contact_id = ?",
+                    (contact_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE contacts
+                    SET memory_revision = memory_revision + 1
+                    WHERE id = ?
+                    """,
+                    (contact_id,),
+                )
             return resolved, dirty
 
         return await self._write(operation)
@@ -1064,7 +1158,7 @@ class MemoryStore:
                     contact_id, conversation_id, model, persona_hash,
                     tool_hash, memory_revision, created_at, expires_at,
                     estimated_tokens, last_response_id, last_used_at, dirty
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 1)
                 """,
                 (
                     contact_id,
@@ -1089,10 +1183,54 @@ class MemoryStore:
 
         return await self._write(operation)
 
+    async def activate_qwen_session(
+        self,
+        session_id: int,
+        *,
+        expected_memory_revision: int,
+    ) -> QwenSessionRecord:
+        def operation(connection: sqlite3.Connection) -> QwenSessionRecord:
+            cursor = connection.execute(
+                """
+                UPDATE qwen_sessions
+                SET dirty = 0, last_used_at = ?
+                WHERE id = ?
+                  AND dirty = 1
+                  AND memory_revision = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM contacts
+                      WHERE contacts.id = qwen_sessions.contact_id
+                        AND contacts.tombstoned_at IS NULL
+                        AND contacts.memory_revision = ?
+                  )
+                """,
+                (
+                    time.time(),
+                    session_id,
+                    int(expected_memory_revision),
+                    int(expected_memory_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MemoryRevisionChanged(
+                    "contact history changed while seeding Qwen session"
+                )
+            row = connection.execute(
+                "SELECT * FROM qwen_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if not row:
+                raise sqlite3.DatabaseError("activated Qwen session is missing")
+            return _session_from_row(row)
+
+        return await self._write(operation)
+
     async def update_qwen_session_usage(
         self,
         session_id: int,
         *,
+        request_key: str,
         estimated_tokens: int,
         response_id: str,
         pending_owner: str = "",
@@ -1101,7 +1239,7 @@ class MemoryStore:
         pending_ids = tuple(str(value) for value in pending_call_ids if str(value))
 
         def operation(connection: sqlite3.Connection) -> None:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE qwen_sessions SET
                     estimated_tokens = ?,
@@ -1109,7 +1247,7 @@ class MemoryStore:
                     last_used_at = ?,
                     pending_owner = ?,
                     pending_call_ids_json = ?
-                WHERE id = ?
+                WHERE id = ? AND dirty = 0 AND pending_owner = ?
                 """,
                 (
                     max(0, int(estimated_tokens)),
@@ -1118,8 +1256,11 @@ class MemoryStore:
                     str(pending_owner),
                     json.dumps(pending_ids, ensure_ascii=False),
                     session_id,
+                    str(request_key),
                 ),
             )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Qwen response no longer owns this session")
 
         await self._write(operation)
 
@@ -1178,6 +1319,66 @@ class MemoryStore:
                 (contact_id,),
             )
         )
+
+    async def invalidate_unconfirmed_outputs(self, contact_id: int) -> int:
+        def operation(connection: sqlite3.Connection) -> int:
+            contact_state = connection.execute(
+                "SELECT tombstoned_at FROM contacts WHERE id = ?",
+                (contact_id,),
+            ).fetchone()
+            if contact_state is None or contact_state["tombstoned_at"] is not None:
+                return 0
+            cursor = connection.execute(
+                """
+                DELETE FROM messages
+                WHERE contact_id = ?
+                  AND direction = 'out'
+                  AND origin = 'generated'
+                  AND pending = 1
+                """,
+                (contact_id,),
+            )
+            connection.execute(
+                "UPDATE qwen_sessions SET dirty = 1 WHERE contact_id = ?",
+                (contact_id,),
+            )
+            connection.execute(
+                """
+                UPDATE contacts
+                SET memory_revision = memory_revision + 1
+                WHERE id = ?
+                """,
+                (contact_id,),
+            )
+            return max(cursor.rowcount, 0)
+
+        return await self._write(operation)
+
+    async def fail_qwen_response(
+        self,
+        contact_id: int,
+        session_id: int,
+        *,
+        response_id: str = "",
+    ) -> None:
+        def operation(connection: sqlite3.Connection) -> None:
+            if response_id:
+                connection.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE contact_id = ?
+                      AND source_uid = ?
+                      AND origin = 'generated'
+                      AND pending = 1
+                    """,
+                    (contact_id, f"generated:{response_id}"),
+                )
+            connection.execute(
+                "UPDATE qwen_sessions SET dirty = 1 WHERE id = ?",
+                (session_id,),
+            )
+
+        await self._write(operation)
 
     async def record_qwen_items(
         self,

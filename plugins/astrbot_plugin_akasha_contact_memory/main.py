@@ -225,6 +225,30 @@ class Main(Star):
 
     @filter.event_message_type(
         filter.EventMessageType.PRIVATE_MESSAGE,
+        priority=20_000,
+    )
+    async def handle_bridge_send_result(self, event: AstrMessageEvent) -> None:
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        if (
+            not isinstance(raw, dict)
+            or raw.get("notice_type") != "akasha_send_result"
+        ):
+            return
+        # This bridge-only notice is control traffic, never a user message.
+        event.stop_event()
+        if (
+            self.runtime
+            and raw.get("success") is False
+            and await self.runtime.record_send_failure(event)
+        ):
+            logger.warning(
+                "Akasha 联系人回复未实际发出；"
+                "已将该联系人的云端会话标记为需要重建。"
+            )
+
+    @filter.event_message_type(
+        filter.EventMessageType.PRIVATE_MESSAGE,
         priority=10_000,
     )
     async def route_private_contact(self, event: AstrMessageEvent) -> None:

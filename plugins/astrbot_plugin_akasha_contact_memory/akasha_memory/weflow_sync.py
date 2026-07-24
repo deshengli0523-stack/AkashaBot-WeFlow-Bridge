@@ -309,9 +309,7 @@ class WeFlowSync:
     ) -> tuple[int, int]:
         messages = parse_weflow_messages(records, ordinal_base=ordinal_base)
         imported = await self.store.upsert_messages(contact_id, messages)
-        _, output_diverged = await self.store.reconcile_pending_outputs(contact_id)
-        if output_diverged:
-            await self.store.mark_contact_sessions_dirty(contact_id)
+        await self.store.reconcile_pending_outputs(contact_id)
         state = await self.store.get_sync_state(contact_id)
         cursor_time = float(state["cursor_time"])
         cursor_uid = str(state["cursor_uid"])
