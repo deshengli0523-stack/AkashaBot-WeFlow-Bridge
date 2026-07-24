@@ -13,10 +13,13 @@ Set-StrictMode -Version Latest
 $script:AkashaInstallScriptRoot = $PSScriptRoot
 $script:AkashaInstallDefaultSourceRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $script:AkashaInstallCommonModule = Import-Module (Join-Path $PSScriptRoot 'AkashaBot.Common.psm1') -Force -PassThru
+$script:AkashaInstallRequestedRoot = $InstallRoot
 . (Join-Path $PSScriptRoot 'Start-Services.ps1')
 . (Join-Path $PSScriptRoot 'Initialize-Environments.ps1')
 . (Join-Path $PSScriptRoot 'Initialize-Configuration.ps1')
 . (Join-Path $PSScriptRoot 'Test-Health.ps1')
+$InstallRoot = $script:AkashaInstallRequestedRoot
+Remove-Variable -Name AkashaInstallRequestedRoot -Scope Script
 
 function ConvertFrom-AkashaCodePoints {
   param([Parameter(Mandatory)][int[]]$CodePoints)
