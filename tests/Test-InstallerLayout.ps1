@@ -330,15 +330,16 @@ Assert-Equal $stalledClockResult.Attempts 3 'Readiness polling did not apply its
 Assert-SequenceEqual @($stalledClockHealth.State.Calls) @('health', 'health-delay:11', 'health', 'health-delay:11', 'health') 'Stalled-clock readiness polling did not stop at its defensive attempt bound.'
 
 $payload = @(Get-AkashaInstallPayload)
-Assert-Equal $payload.Count 30 'Installed payload count changed.'
-Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 14 'Bridge payload count changed.'
+Assert-Equal $payload.Count 32 'Installed payload count changed.'
+Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 16 'Bridge payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -like 'scripts\*' }).Count 9 'Script payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -notlike 'bridge\*' -and $_.Source -notlike 'scripts\*' }).Count 7 'Root payload count changed.'
 Assert-True (@($payload | Where-Object { $_.Source -ceq $launchers.Install }).Count -eq 0) 'Install launcher must not be installed.'
 $expectedPayloadSources = @(
   'bridge\bridge_core.py', 'bridge\config.py', 'bridge\main.py', 'bridge\ob_client.py',
   'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\state.py',
-  'bridge\uia_fixed_sender.py', 'bridge\uia_support.py', 'bridge\calibrate_uia_fixed.py', 'bridge\web_panel.py',
+  'bridge\uia_contact_selector.py', 'bridge\uia_fixed_sender.py', 'bridge\uia_support.py',
+  'bridge\windows_ocr_selector.ps1', 'bridge\calibrate_uia_fixed.py', 'bridge\web_panel.py',
   'bridge\config.example.json', 'bridge\requirements.txt', 'bridge\requirements.lock',
   'scripts\AkashaBot.Common.psm1', 'scripts\Test-Prerequisites.ps1',
   'scripts\Initialize-Environments.ps1', 'scripts\Initialize-Configuration.ps1',

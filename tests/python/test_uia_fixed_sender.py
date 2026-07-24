@@ -19,6 +19,7 @@ import uia_fixed_sender as sender_module
 from uia_support import (
     CALIBRATION_INVALID,
     CALIBRATION_WINDOW,
+    CONTACT_SELECTION_FAILED,
     RECALIBRATION_REQUIRED,
     CalibrationError,
     ClientMetrics,
@@ -92,10 +93,27 @@ class FakeDriver:
         self.events.append(("copy_image", image_path))
 
 
+class FakeContactSelector:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def select_contact(self, hwnd, search_point, contact):
+        self.driver.events.append(("select_contact", contact, hwnd))
+
+    def verify_selected_contact(self, hwnd, contact):
+        self.driver.events.append(("verify_contact", contact, hwnd))
+
+
 class UiaFixedSenderTests(unittest.TestCase):
     def setUp(self):
         self.driver = FakeDriver()
         self.sleep_calls = []
+        self.selector_patch = mock.patch.object(
+            sender_module,
+            "OcrContactSelector",
+            side_effect=lambda driver, **_kwargs: FakeContactSelector(driver),
+        )
+        self.selector_patch.start()
         sender_module.state.running = True
         sender_module.state.paused.clear()
         sender_module.state.sender_instance = None
@@ -104,6 +122,7 @@ class UiaFixedSenderTests(unittest.TestCase):
             sender_module.state.current_send_preview = None
 
     def tearDown(self):
+        self.selector_patch.stop()
         sender_module.state.running = False
         sender_module.state.paused.clear()
 
@@ -165,12 +184,14 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("click", "first_result", 101),
+                ("select_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
                 ("copy_text", "private-body"),
+                ("verify_contact", "private-contact", 101),
                 ("hotkey_ctrl", 0x56),
+                ("verify_contact", "private-contact", 101),
                 ("click", "send_button", 101),
             ],
         )
@@ -202,12 +223,14 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("click", "first_result", 101),
+                ("select_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
                 ("copy_image", image_path),
+                ("verify_contact", "private-contact", 101),
                 ("hotkey_ctrl", 0x56),
+                ("verify_contact", "private-contact", 101),
                 ("click", "send_button", 101),
             ],
         )
@@ -263,6 +286,134 @@ class UiaFixedSenderTests(unittest.TestCase):
                     [f"ERROR:weflow-bridge:{RECALIBRATION_REQUIRED}"],
                 )
                 self.assertFalse(any(event[0] == "click" for event in driver.events))
+
+    def test_ocr_selection_failure_never_focuses_input_or_clicks_send(self):
+        class RejectingSelector:
+            def select_contact(self, _hwnd, _search_point, _contact):
+                raise CalibrationError(CONTACT_SELECTION_FAILED)
+
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            contact_selector=RejectingSelector(),
+            sleep_fn=self.sleep_calls.append,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+        )
+
+        with self.assertLogs("weflow-bridge", logging.ERROR) as captured:
+            sent = self._send_text(sender)
+
+        self.assertIs(sent, False)
+        self.assertEqual(
+            captured.output,
+            [f"ERROR:weflow-bridge:{CONTACT_SELECTION_FAILED}"],
+        )
+        self.assertFalse(
+            any(
+                event[:2] in {
+                    ("click", "message_input"),
+                    ("click", "send_button"),
+                }
+                for event in self.driver.events
+            ),
+            self.driver.events,
+        )
+
+    def test_final_title_mismatch_never_sends_or_clears_another_chat(self):
+        class SwitchingSelector:
+            def __init__(self):
+                self.verify_calls = 0
+
+            def select_contact(self, hwnd, _search_point, contact):
+                self_driver.events.append(
+                    ("select_contact", contact, hwnd)
+                )
+
+            def verify_selected_contact(self, hwnd, contact):
+                self.verify_calls += 1
+                self_driver.events.append(
+                    ("verify_contact", contact, hwnd)
+                )
+                if self.verify_calls in {2, 3}:
+                    raise CalibrationError(CONTACT_SELECTION_FAILED)
+
+        self_driver = self.driver
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            contact_selector=SwitchingSelector(),
+            sleep_fn=self.sleep_calls.append,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+        )
+
+        with self.assertLogs("weflow-bridge", logging.ERROR) as captured:
+            sent = self._send_text(sender)
+
+        self.assertIs(sent, False)
+        self.assertEqual(
+            captured.output,
+            [f"ERROR:weflow-bridge:{CONTACT_SELECTION_FAILED}"],
+        )
+        self.assertFalse(
+            any(
+                event[:2] == ("click", "send_button")
+                for event in self.driver.events
+            )
+        )
+        self.assertEqual(
+            [
+                event
+                for event in self.driver.events
+                if event[0] in {"select_contact", "verify_contact"}
+                or event[:2] == ("click", "message_input")
+            ],
+            [
+                ("select_contact", "private-contact", 101),
+                ("click", "message_input", 101),
+                ("verify_contact", "private-contact", 101),
+                ("verify_contact", "private-contact", 101),
+                ("verify_contact", "private-contact", 101),
+                ("select_contact", "private-contact", 101),
+                ("verify_contact", "private-contact", 101),
+                ("click", "message_input", 101),
+            ],
+        )
+
+    def test_pause_after_final_title_check_cancels_without_waiting_or_sending(self):
+        class PauseAfterVerifySelector(FakeContactSelector):
+            def __init__(self, driver):
+                super().__init__(driver)
+                self.verify_calls = 0
+
+            def verify_selected_contact(self, hwnd, contact):
+                super().verify_selected_contact(hwnd, contact)
+                self.verify_calls += 1
+                if self.verify_calls == 2:
+                    sender_module.state.paused.set()
+
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            contact_selector=PauseAfterVerifySelector(self.driver),
+            sleep_fn=self.sleep_calls.append,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+        )
+
+        try:
+            sent = self._send_text(sender)
+        finally:
+            sender_module.state.paused.clear()
+
+        self.assertIs(sent, False)
+        self.assertFalse(
+            any(
+                event[:2] == ("click", "send_button")
+                for event in self.driver.events
+            )
+        )
 
     def test_unclassified_failure_logs_only_generic_code(self):
         sender = self._sender()

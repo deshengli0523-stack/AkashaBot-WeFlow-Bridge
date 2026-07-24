@@ -47,7 +47,8 @@ function Get-AkashaInstallPayload {
   $entries = New-Object System.Collections.Generic.List[object]
   foreach ($name in @(
       'bridge_core.py', 'config.py', 'main.py', 'ob_client.py', 'ob_protocol.py', 'privacy.py',
-      'state.py', 'uia_fixed_sender.py', 'uia_support.py', 'calibrate_uia_fixed.py', 'web_panel.py',
+      'state.py', 'uia_contact_selector.py', 'uia_fixed_sender.py', 'uia_support.py',
+      'windows_ocr_selector.ps1', 'calibrate_uia_fixed.py', 'web_panel.py',
       'config.example.json', 'requirements.txt', 'requirements.lock'
     )) {
     $entries.Add([pscustomobject]@{ Source = Join-Path 'bridge' $name; Destination = Join-Path 'app\bridge' $name })

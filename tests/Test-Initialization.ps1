@@ -1050,12 +1050,32 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
     Assert-True $backupFile.FullName.StartsWith($backupRoot, [System.StringComparison]::OrdinalIgnoreCase) 'A configuration backup escaped Paths.Backups.'
   }
 
+  $repeatConfigPaths = @(
+    (Join-Path $fresh.Paths.AstrBotData 'data\cmd_config.json'),
+    $fresh.Paths.BridgeConfig,
+    $fresh.WeFlowConfigPath
+  )
+  $repeatConfigFingerprints = @{}
+  foreach ($repeatConfigPath in $repeatConfigPaths) {
+    $repeatConfigRaw = [System.IO.File]::ReadAllText($repeatConfigPath, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText(
+      $repeatConfigPath,
+      (" `r`n" + $repeatConfigRaw + "`r`n "),
+      (New-Object System.Text.UTF8Encoding($false))
+    )
+    $repeatConfigFingerprints[$repeatConfigPath] = Get-FileFingerprint $repeatConfigPath
+  }
+  $repeatBackupCount = @(Get-ChildItem -LiteralPath $backupRoot -Recurse -File).Count
   $repeatState = New-AstrBotInitializerState
   Initialize-AkashaConfiguration -Paths $fresh.Paths -WeFlowConfigPath $fresh.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer $repeatState)
   $repeatToken = [string](Get-Content -LiteralPath $fresh.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json).access_token
   Assert-Equal $repeatState.Calls 0 'Repeated configuration invoked AstrBot initializer.'
   Assert-True ($repeatToken -ceq $freshToken) 'Repeated configuration replaced the bridge token.'
   Assert-Equal (Get-FileFingerprint $firstLoginPath) $firstLoginFingerprint 'Repeated configuration replaced FIRST_LOGIN.txt.'
+  foreach ($repeatConfigPath in $repeatConfigPaths) {
+    Assert-Equal (Get-FileFingerprint $repeatConfigPath) $repeatConfigFingerprints[$repeatConfigPath] 'Repeated configuration rewrote a semantically unchanged config file.'
+  }
+  Assert-Equal @(Get-ChildItem -LiteralPath $backupRoot -Recurse -File).Count $repeatBackupCount 'Repeated configuration backed up semantically unchanged config files.'
 
   $existing = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'existing-success'
   Write-ExistingAstrBotFixture $existing.Paths
@@ -1145,7 +1165,7 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   $existingBridgeRollbackBackups = @(Get-ChildItem -LiteralPath $existingBridgeRollback.Paths.Backups -Recurse -File)
   Assert-Equal $existingBridgeRollbackBackups.Count 2 'Existing bridge transaction did not back up both bridge and WeFlow configs.'
 
-  $bridgeRollbackArmIndex = $configurationSource.IndexOf('$bridgeRollbackRequired = -not $freshBridge', [System.StringComparison]::Ordinal)
+  $bridgeRollbackArmIndex = $configurationSource.IndexOf('$bridgeRollbackRequired = (-not $freshBridge) -and $bridgeWriteRequired', [System.StringComparison]::Ordinal)
   $bridgeWriterCallIndex = $configurationSource.IndexOf('-Path $Paths.BridgeConfig -Value $bridge', [System.StringComparison]::Ordinal)
   Assert-True ($bridgeRollbackArmIndex -ge 0 -and $bridgeRollbackArmIndex -lt $bridgeWriterCallIndex) 'Existing bridge rollback responsibility is not armed before the atomic writer call.'
 
@@ -1187,6 +1207,42 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-True ($bridgeCleanupBackupFingerprints -ccontains $bridgeCleanupOriginalFingerprint) 'Bridge cleanup failure transaction did not retain an original bridge backup.'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $bridgeCleanupFailure.Paths.State 'configuration.lock'))) 'Bridge cleanup failure left the transaction lock behind.'
   Assert-Equal @(Get-ChildItem -LiteralPath $bridgeCleanupFailure.Paths.BridgeData -Force -Filter '.config.json.*' -ErrorAction SilentlyContinue).Count 0 'Bridge cleanup failure left atomic JSON artifacts behind.'
+
+  $weFlowCleanupFailure = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'weflow-cleanup-failure-after-replace'
+  $weFlowCleanupOriginalFingerprint = Get-FileFingerprint $weFlowCleanupFailure.WeFlowConfigPath
+  $weFlowCleanupWriterState = [pscustomobject]@{ TargetWasReplaced = $false }
+  $weFlowCleanupFailingWriter = {
+    param([string]$Path, $Value)
+    AkashaBot.Common\Write-JsonAtomic -Path $Path -Value $Value
+    if ([System.IO.Path]::GetFullPath($Path).Equals([System.IO.Path]::GetFullPath($weFlowCleanupFailure.WeFlowConfigPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+      $weFlowCleanupWriterState.TargetWasReplaced = (Get-FileFingerprint $Path) -cne $weFlowCleanupOriginalFingerprint
+      throw 'E_JSON_ATOMIC_CLEANUP: Unable to remove temporary JSON artifacts.'
+    }
+  }.GetNewClosure()
+  Assert-ThrowsExact {
+    Initialize-AkashaConfiguration -Paths $weFlowCleanupFailure.Paths -WeFlowConfigPath $weFlowCleanupFailure.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer (New-AstrBotInitializerState)) -JsonWriter $weFlowCleanupFailingWriter
+  } 'E_CONFIGURATION_WRITE: Configuration files could not be written.' 'Committed WeFlow replacement cleanup failure used the wrong transaction error.'
+  Assert-True $weFlowCleanupWriterState.TargetWasReplaced 'WeFlow cleanup failure injection did not observe a committed replacement.'
+  Assert-Equal (Get-FileFingerprint $weFlowCleanupFailure.WeFlowConfigPath) $weFlowCleanupOriginalFingerprint 'Committed WeFlow replacement was not restored after cleanup failure.'
+
+  $freshBridgeCleanupFailure = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'fresh-bridge-cleanup-failure-after-create'
+  $freshBridgeCleanupWeFlowFingerprint = Get-FileFingerprint $freshBridgeCleanupFailure.WeFlowConfigPath
+  $freshBridgeCleanupWriterState = [pscustomobject]@{ TargetWasCreated = $false }
+  $freshBridgeCleanupFailingWriter = {
+    param([string]$Path, $Value)
+    AkashaBot.Common\Write-JsonAtomic -Path $Path -Value $Value
+    if ([System.IO.Path]::GetFullPath($Path).Equals([System.IO.Path]::GetFullPath($freshBridgeCleanupFailure.Paths.BridgeConfig), [System.StringComparison]::OrdinalIgnoreCase)) {
+      $freshBridgeCleanupWriterState.TargetWasCreated = Test-Path -LiteralPath $Path -PathType Leaf
+      throw 'E_JSON_ATOMIC_CLEANUP: Unable to remove temporary JSON artifacts.'
+    }
+  }.GetNewClosure()
+  Assert-ThrowsExact {
+    Initialize-AkashaConfiguration -Paths $freshBridgeCleanupFailure.Paths -WeFlowConfigPath $freshBridgeCleanupFailure.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer (New-AstrBotInitializerState)) -JsonWriter $freshBridgeCleanupFailingWriter
+  } 'E_CONFIGURATION_WRITE: Configuration files could not be written.' 'Fresh bridge creation cleanup failure used the wrong transaction error.'
+  Assert-True $freshBridgeCleanupWriterState.TargetWasCreated 'Fresh bridge cleanup failure injection did not observe a created target.'
+  Assert-True (-not (Test-Path -LiteralPath $freshBridgeCleanupFailure.Paths.BridgeConfig)) 'Fresh bridge cleanup failure left a partial config file.'
+  Assert-Equal (Get-FileFingerprint $freshBridgeCleanupFailure.WeFlowConfigPath) $freshBridgeCleanupWeFlowFingerprint 'Fresh bridge cleanup failure did not restore WeFlow config.'
+  Assert-True (-not (Test-Path -LiteralPath $freshBridgeCleanupFailure.Paths.AstrBotData)) 'Fresh bridge cleanup failure left fresh AstrBot data.'
 
   $invalidToken = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'invalid-token'
   Write-ExistingAstrBotFixture $invalidToken.Paths
