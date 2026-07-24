@@ -858,6 +858,32 @@ exit 0
   Assert-True ($directOutput -match 'E_SOURCE_PAYLOAD|E_LIFECYCLE_PATH') 'Direct failure did not emit a fixed error code.'
   Assert-True (-not (Test-Path -LiteralPath $directRoot)) 'Direct source failure mutated the install root.'
 
+  $directBoundRoot = Join-Path $fixtureRoot 'direct bound install root'
+  New-Item -ItemType Directory -Force -Path (Join-Path $directBoundRoot 'data\state') | Out-Null
+  [System.IO.File]::WriteAllText(
+    (Join-Path $directBoundRoot 'data\state\processes.json'),
+    ('[' + ($record | ConvertTo-Json -Compress) + ']'),
+    (New-Object System.Text.UTF8Encoding($false))
+  )
+  $directDefaultLocal = Join-Path $fixtureRoot 'isolated direct localappdata'
+  New-Item -ItemType Directory -Force -Path $directDefaultLocal | Out-Null
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'powershell.exe'
+  $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $root 'scripts\Install.ps1') + '" -SourceRoot "' + $root + '" -InstallRoot "' + $directBoundRoot + '" -SkipStart'
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.EnvironmentVariables['LOCALAPPDATA'] = $directDefaultLocal
+  $directProcess = New-Object System.Diagnostics.Process
+  $directProcess.StartInfo = $psi
+  Assert-True $directProcess.Start() 'Direct bound-root installer process did not start.'
+  $directOutput = $directProcess.StandardOutput.ReadToEnd() + $directProcess.StandardError.ReadToEnd()
+  Assert-True $directProcess.WaitForExit(15000) 'Direct bound-root installer process timed out.'
+  Assert-Equal $directProcess.ExitCode 1 'Direct bound-root failure did not map to stable exit code 1.'
+  Assert-True ($directOutput -match 'E_INSTALL_RUNNING') 'Direct installer discarded its explicitly bound InstallRoot.'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $directDefaultLocal 'AkashaBot-WeFlow-Bridge'))) 'Direct installer mutated the default root instead of the explicitly bound root.'
+
   Write-Host 'Installer layout tests: PASS' -ForegroundColor Green
 } finally {
   if (Test-Path -LiteralPath $fixtureRoot) {
