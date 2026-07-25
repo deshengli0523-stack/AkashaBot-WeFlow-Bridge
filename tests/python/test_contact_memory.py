@@ -285,6 +285,9 @@ class ContactMemoryTests(unittest.TestCase):
                     connection.execute(
                         "ALTER TABLE qwen_sessions DROP COLUMN memory_revision"
                     )
+                    connection.execute(
+                        "ALTER TABLE messages DROP COLUMN semantic_content"
+                    )
                     connection.execute("PRAGMA user_version = 4")
                     connection.commit()
                 finally:
@@ -308,15 +311,149 @@ class ContactMemoryTests(unittest.TestCase):
                             "PRAGMA table_info(qwen_sessions)"
                         ).fetchall()
                     }
+                    message_columns = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(messages)"
+                        ).fetchall()
+                    }
                 finally:
                     connection.close()
-                self.assertEqual(5, version)
+                self.assertEqual(6, version)
                 self.assertIn("memory_revision", contact_columns)
                 self.assertIn("memory_revision", session_columns)
+                self.assertIn("semantic_content", message_columns)
                 session = await store.active_qwen_session(contact.id)
                 self.assertIsNotNone(session)
                 self.assertEqual("legacy-conversation", session.conversation_id)
                 self.assertTrue(session.dirty)
+
+        asyncio.run(scenario())
+
+    def test_memory_schema_v5_adds_media_semantics_without_changing_rows(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-v5-") as temp:
+                root = pathlib.Path(temp)
+                store = MemoryStore(root)
+                await store.initialize()
+                secrets = SecretManager(root)
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [MemoryMessage("raw:legacy", 1, "in", "legacy row")],
+                )
+                connection = sqlite3.connect(store.path)
+                try:
+                    connection.execute(
+                        "ALTER TABLE messages DROP COLUMN semantic_content"
+                    )
+                    connection.execute("PRAGMA user_version = 5")
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                await store.initialize()
+                messages = await store.recent_messages(contact.id)
+                self.assertEqual(1, len(messages))
+                self.assertEqual("legacy row", messages[0].content)
+                self.assertIsNone(messages[0].semantic_content)
+                connection = sqlite3.connect(store.path)
+                try:
+                    version = connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                finally:
+                    connection.close()
+                self.assertEqual(6, version)
+
+        asyncio.run(scenario())
+
+    def test_media_semantics_survive_weflow_confirmation_and_rebuild_context(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-media-memory-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:image-1",
+                            10,
+                            "in",
+                            "[图片]",
+                            semantic_content="[图片: 一只白猫坐在窗边]",
+                            origin="bridge",
+                            pending=True,
+                        )
+                    ],
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:image-1",
+                            10,
+                            "in",
+                            "[图片]",
+                            message_type="3",
+                            origin="weflow",
+                        )
+                    ],
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:video-1",
+                            20,
+                            "in",
+                            "[视频]",
+                            message_type="43",
+                            origin="weflow",
+                        )
+                    ],
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:video-1",
+                            20,
+                            "in",
+                            "[视频]",
+                            semantic_content="[视频: 一个人在海边挥手]",
+                            origin="bridge",
+                            pending=True,
+                        )
+                    ],
+                )
+
+                messages = await store.recent_messages(contact.id)
+                self.assertEqual(["[图片]", "[视频]"], [item.content for item in messages])
+                self.assertEqual(
+                    ["[图片: 一只白猫坐在窗边]", "[视频: 一个人在海边挥手]"],
+                    [item.effective_content for item in messages],
+                )
+                self.assertTrue(all(item.origin == "weflow" for item in messages))
+                self.assertTrue(all(not item.pending for item in messages))
+
+                bundle = await ContextBuilder(store).build(contact.id)
+                seeded = "\n".join(str(item["content"]) for item in bundle.items)
+                self.assertIn("一只白猫坐在窗边", seeded)
+                self.assertIn("一个人在海边挥手", seeded)
 
         asyncio.run(scenario())
 

@@ -121,7 +121,7 @@ class QwenSessionManager:
                 metadata={
                     "contact_hmac": contact.contact_hmac,
                     "epoch": str(int(created_at * 1000)),
-                    "schema_version": "5",
+                    "schema_version": "6",
                 }
             )
             session: QwenSessionRecord | None = None

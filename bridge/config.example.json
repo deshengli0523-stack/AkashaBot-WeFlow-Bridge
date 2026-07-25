@@ -30,5 +30,7 @@
   "image_caption_model": "llava:7b",
   "image_caption_api_key": "",
   "image_caption_api_base": "",
-  "image_caption_prompt": "请用中文简短描述这张图片的内容"
+  "image_caption_prompt": "请用中文简短描述这张图片的内容",
+  "video_caption_prompt": "请用中文简洁描述这段视频发生了什么，包括关键人物、动作、场景和屏幕文字",
+  "video_caption_max_mib": 6
 }

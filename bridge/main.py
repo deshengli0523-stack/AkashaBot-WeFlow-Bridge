@@ -27,6 +27,84 @@ log = logging.getLogger("ob11-bridge")
 # ============ 启动 / 停止 ============
 
 
+class LocalHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
+def _process_start_token(pid: int) -> int | None:
+    """Return the Windows creation FILETIME used to detect PID reuse."""
+
+    if pid <= 0 or os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FileTime(ctypes.Structure):
+            _fields_ = [
+                ("low", wintypes.DWORD),
+                ("high", wintypes.DWORD),
+            ]
+
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            created = FileTime()
+            exited = FileTime()
+            kernel = FileTime()
+            user = FileTime()
+            if not ctypes.windll.kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            return (int(created.high) << 32) | int(created.low)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def _legacy_bridge_endpoint_is_live() -> bool:
+    """Verify an old PID-only record through the loopback status endpoint."""
+
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{int(config.WEB_PORT)}/status",
+            timeout=0.5,
+        )
+        payload = response.json() if response.status_code == 200 else None
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("running"), bool)
+            and "ob_connected" in payload
+            and "weflow_connected" in payload
+        )
+    except Exception:
+        return False
+
+
+def _pid_record_is_live(raw_record: str) -> bool:
+    parts = raw_record.strip().split(":", 1)
+    try:
+        pid = int(parts[0])
+    except (TypeError, ValueError):
+        return False
+    if len(parts) == 2:
+        try:
+            expected_start = int(parts[1])
+        except ValueError:
+            return False
+        actual_start = _process_start_token(pid)
+        if actual_start is not None:
+            return actual_start == expected_start
+    return _legacy_bridge_endpoint_is_live()
+
+
 def _start_bridge():
     with state.run_lock:
         if state.running:
@@ -177,8 +255,30 @@ def _bridge_loop(generation: int):
 
 
 def start_web():
-    server = HTTPServer(("127.0.0.1", config.WEB_PORT), WebHandler)
-    log.info(f"Web: http://127.0.0.1:{config.WEB_PORT}")
+    server = None
+    for attempt in range(1, 11):
+        try:
+            server = LocalHTTPServer(
+                ("127.0.0.1", int(config.WEB_PORT)),
+                WebHandler,
+            )
+            break
+        except OSError as error:
+            if attempt >= 10:
+                log.error(
+                    "Bridge Web 面板启动失败: port=%s code=E_BRIDGE_WEB_BIND",
+                    config.WEB_PORT,
+                )
+                raise
+            log.warning(
+                "Bridge Web 端口暂不可用，1 秒后重试: port=%s attempt=%s",
+                config.WEB_PORT,
+                attempt,
+            )
+            time.sleep(1)
+    if server is None:
+        raise RuntimeError("E_BRIDGE_WEB_BIND")
+    log.info("Web: http://127.0.0.1:%s", config.WEB_PORT)
     server.serve_forever()
 
 
@@ -193,32 +293,30 @@ if __name__ == "__main__":
     os.makedirs(STATE_DIR, exist_ok=True)
     PID_FILE = os.path.join(STATE_DIR, "bridge.pid")
 
-    def pid_exists(pid):
-        try:
-            import ctypes
-            from ctypes import wintypes
-            h = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)
-            if h:
-                ctypes.windll.kernel32.CloseHandle(h)
-                return True
-            return False
-        except Exception:
-            return True
-
     if os.path.exists(PID_FILE):
         try:
-            with open(PID_FILE, "r") as f:
-                old_pid = int(f.read().strip())
-            if pid_exists(old_pid):
+            with open(PID_FILE, "r", encoding="utf-8") as f:
+                pid_record = f.read().strip()
+            if _pid_record_is_live(pid_record):
                 log.error("⚠️ bridge.pid 已存在")
                 sys.exit(1)
-            else:
-                os.remove(PID_FILE)
-        except (ValueError, OSError):
             os.remove(PID_FILE)
+            log.warning("已清理失效的 bridge.pid")
+        except OSError:
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
 
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    current_pid = os.getpid()
+    current_start = _process_start_token(current_pid)
+    current_record = (
+        f"{current_pid}:{current_start}"
+        if current_start is not None
+        else str(current_pid)
+    )
+    with open(PID_FILE, "w", encoding="utf-8") as f:
+        f.write(current_record)
 
     try:
         log.info("=" * 50)

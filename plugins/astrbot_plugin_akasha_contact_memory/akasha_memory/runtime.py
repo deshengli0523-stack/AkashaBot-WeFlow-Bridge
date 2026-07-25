@@ -183,12 +183,21 @@ class ContactMemoryRuntime:
                 uid, quality = _bridge_source_uid(source)
                 if not uid or not line:
                     continue
+                raw_content = line
+                semantic_content = None
+                for kind in ("图片", "视频"):
+                    if line.startswith(f"[{kind}:") and line.endswith("]"):
+                        raw_content = f"[{kind}]"
+                        if "内容无法描述" not in line:
+                            semantic_content = line
+                        break
                 messages.append(
                     MemoryMessage(
                         source_uid=uid,
                         source_time=_source_time(source.get("timestamp")) or time.time(),
                         direction="in",
-                        content=line,
+                        content=raw_content,
+                        semantic_content=semantic_content,
                         id_quality=quality,
                         origin="bridge",
                         pending=True,

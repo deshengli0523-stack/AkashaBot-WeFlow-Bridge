@@ -32,11 +32,23 @@ class MemoryMessage:
     source_time: float
     direction: Direction
     content: str
+    semantic_content: str | None = None
     message_type: str = "text"
     id_quality: str = "source"
     origin: str = "weflow"
     pending: bool = False
     id: int | None = None
+
+    @property
+    def effective_content(self) -> str:
+        """Return enriched media text only while raw content is that media."""
+
+        semantic = (self.semantic_content or "").strip()
+        raw = self.content.strip()
+        for kind in ("图片", "视频"):
+            if raw == f"[{kind}]" and semantic.startswith(f"[{kind}:"):
+                return semantic
+        return self.content
 
 
 @dataclass(frozen=True, slots=True)

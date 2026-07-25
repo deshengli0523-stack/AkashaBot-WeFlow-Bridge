@@ -29,7 +29,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def _message_tokens(message: MemoryMessage) -> int:
-    return estimate_tokens(message.content) + 8
+    return estimate_tokens(message.effective_content) + 8
 
 
 def _normalized_text(text: str) -> str:
@@ -53,7 +53,7 @@ def _prompt_terms(prompt: str) -> tuple[str, ...]:
 def _as_item(message: MemoryMessage) -> dict[str, str]:
     return {
         "role": "user" if message.direction == "in" else "assistant",
-        "content": message.content,
+        "content": message.effective_content,
     }
 
 
@@ -92,7 +92,7 @@ class ContextBuilder:
             candidate = output[index]
             if (
                 candidate.direction == "in"
-                and _normalized_text(candidate.content) == normalized_prompt
+                and _normalized_text(candidate.effective_content) == normalized_prompt
             ):
                 del output[index]
                 break
