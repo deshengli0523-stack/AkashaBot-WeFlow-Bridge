@@ -161,17 +161,15 @@ function Invoke-AkashaUiaCalibration {
         }
       }
 
-      $bridgePid = Read-AkashaBridgePid -Path $preflight.BridgePidPath
-      if ($null -ne $bridgePid) {
-        $bridgeIdentity = Read-AkashaCalibrationProcessIdentity -ProcessId ([int]$bridgePid) -ProcessReader $ProcessReader
-        if ($null -ne $bridgeIdentity -and (Test-AkashaCalibrationBridgeIdentity -Paths $paths -Identity $bridgeIdentity)) {
-          throw 'E_UIA_CALIBRATION_BUSY'
-        }
-        if ($null -ne $bridgeIdentity -and
-            (Test-AkashaCalibrationBridgeExecutable -Paths $paths -Identity $bridgeIdentity) -and
-            [string]::IsNullOrWhiteSpace([string]$bridgeIdentity.CommandLine)) {
-          throw 'E_PROCESS_STATE: Unable to verify bridge pid identity.'
-        }
+      $bridgePidState = Resolve-AkashaBridgePidState -Paths $paths -ProcessReader $ProcessReader
+      if ($bridgePidState.Status -ceq 'live') {
+        throw 'E_UIA_CALIBRATION_BUSY'
+      }
+      if ($bridgePidState.Status -ceq 'unverifiable') {
+        throw 'E_PROCESS_STATE: Unable to verify bridge pid identity.'
+      }
+      if (@('missing', 'stale') -cnotcontains [string]$bridgePidState.Status) {
+        throw 'E_PROCESS_STATE: Unable to verify bridge pid identity.'
       }
 
       $preflight = Get-AkashaCalibrationPreflight -Paths $paths

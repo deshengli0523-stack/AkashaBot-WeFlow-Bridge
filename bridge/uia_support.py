@@ -641,6 +641,58 @@ class Win32WeChatDriver:
         self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
+    def click_calibrated_search_result(
+        self,
+        hwnd: int,
+        point: Mapping[str, object],
+    ) -> None:
+        """Click a calibrated result in the bound WeChat process."""
+        try:
+            ratio_x = point["x"]
+            ratio_y = point["y"]
+        except (KeyError, TypeError):
+            raise CalibrationError(CALIBRATION_INVALID) from None
+        if (
+            not _is_finite_number(ratio_x)
+            or not _is_finite_number(ratio_y)
+            or not 0 < ratio_x < 1
+            or not 0 < ratio_y < 1
+        ):
+            raise CalibrationError(CALIBRATION_INVALID)
+        metrics = self.get_client_metrics(hwnd)
+        if (
+            not metrics.visible
+            or not metrics.maximized
+            or metrics.width < 800
+            or metrics.height < 600
+        ):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        bound = self._ensure_bound_window_identity(hwnd)
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        foreground_root = int(
+            self.user32.GetAncestor(foreground, GA_ROOT) or 0
+        )
+        if not foreground_root:
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        foreground_identity = self._query_window_identity(foreground_root)
+        if (
+            foreground_identity.pid != bound.pid
+            or foreground_identity.image != bound.image
+        ):
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        x, y = screen_point_from_ratio(point, metrics)
+        child = int(self.user32.WindowFromPoint(_POINT(x, y)) or 0)
+        root = int(self.user32.GetAncestor(child, GA_ROOT) or 0)
+        if not child or not root or not self.user32.IsWindowVisible(root):
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        target = self._query_window_identity(root)
+        if target.pid != bound.pid or target.image != bound.image:
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        if not self.user32.SetCursorPos(x, y):
+            raise CalibrationError(CONTACT_SELECTION_FAILED)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
     def hotkey_ctrl(self, virtual_key: int) -> None:
         """Press Ctrl with one virtual key and release both keys."""
         self.user32.keybd_event(VK_CONTROL, 0, 0, 0)

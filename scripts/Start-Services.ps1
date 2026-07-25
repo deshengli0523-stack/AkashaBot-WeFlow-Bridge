@@ -400,9 +400,15 @@ function Remove-AkashaBridgePidFile {
 }
 
 function Resolve-AkashaBridgePidState {
-  param([Parameter(Mandatory)]$Paths)
+  param(
+    [Parameter(Mandatory)]$Paths,
+    [scriptblock]$ProcessReader
+  )
 
   Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($Paths.State, $Paths.BridgePid, $Paths.BridgePython)
+  if ($null -eq $ProcessReader) {
+    $ProcessReader = { param([int]$ProcessId) Get-AkashaProcessIdentity -ProcessId $ProcessId }
+  }
   if (-not (Test-Path -LiteralPath $Paths.BridgePid)) {
     return [pscustomobject]@{ Status = 'missing'; Record = $null }
   }
@@ -431,11 +437,19 @@ function Resolve-AkashaBridgePidState {
     $token = $parsedToken
   }
 
-  $identity = Get-AkashaProcessIdentity -ProcessId $processId
-  if ($null -eq $identity) {
+  try {
+    $identities = @(& $ProcessReader $processId)
+  } catch {
+    return [pscustomobject]@{ Status = 'unverifiable'; Record = $null }
+  }
+  if ($identities.Count -eq 0 -or $null -eq $identities[0]) {
     Remove-AkashaBridgePidFile -Paths $Paths -ExpectedContent $raw
     return [pscustomobject]@{ Status = 'stale'; Record = $null }
   }
+  if ($identities.Count -ne 1) {
+    return [pscustomobject]@{ Status = 'unverifiable'; Record = $null }
+  }
+  $identity = $identities[0]
 
   $expectedPath = [System.IO.Path]::GetFullPath($Paths.BridgePython)
   $actualPath = ''

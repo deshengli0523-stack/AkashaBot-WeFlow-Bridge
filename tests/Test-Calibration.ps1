@@ -394,14 +394,19 @@ try {
   Assert-Equal $recordedRunner.Calls 0 'Busy recorded service invoked calibration.'
 
   $bridgePid = New-CalibrationInstallFixture -BaseRoot $fixtureRoot -Name 'bridge-pid' -WithLifecycleDirectories
-  [System.IO.File]::WriteAllText((Join-Path $bridgePid.Paths.State 'bridge.pid'), '54321:987654321', (New-Object System.Text.UTF8Encoding($false)))
-  $bridgeIdentity = [pscustomobject]@{ Pid = 54321; ExecutablePath = $bridgePid.Paths.BridgePython; CommandLine = 'python.exe main.py'; StartTimeUtc = [datetime]::UtcNow }
+  $bridgeStartTime = [datetime]::UtcNow
+  $bridgeToken = $bridgeStartTime.ToFileTimeUtc()
+  $baseInterpreter = (Get-Process -Id $PID).Path
+  $bridgeVenvRoot = Split-Path -Parent (Split-Path -Parent $bridgePid.Paths.BridgePython)
+  [System.IO.File]::WriteAllText((Join-Path $bridgeVenvRoot 'pyvenv.cfg'), ('executable = ' + $baseInterpreter), (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText((Join-Path $bridgePid.Paths.State 'bridge.pid'), ("54321:{0}" -f $bridgeToken), (New-Object System.Text.UTF8Encoding($false)))
+  $bridgeIdentity = [pscustomobject]@{ Pid = 54321; ExecutablePath = $baseInterpreter; CommandLine = 'python.exe main.py'; StartTimeUtc = $bridgeStartTime }
   $bridgeReader = { param([int]$ProcessId) return $bridgeIdentity }.GetNewClosure()
   Assert-ThrowsExact {
     Invoke-AkashaUiaCalibration -InstallRoot $bridgePid.Root -ProcessReader $bridgeReader -Runner (New-TestRunner -State (New-RunnerState -ExitCode 0))
-  } 'E_UIA_CALIBRATION_BUSY' 'Verified tokenized BridgeMain pid did not block calibration.'
+  } 'E_UIA_CALIBRATION_BUSY' 'Verified tokenized base-interpreter BridgeMain pid did not block calibration.'
 
-  $unknownBridgeIdentity = [pscustomobject]@{ Pid = 54321; ExecutablePath = $bridgePid.Paths.BridgePython; CommandLine = ''; StartTimeUtc = [datetime]::UtcNow }
+  $unknownBridgeIdentity = [pscustomobject]@{ Pid = 54321; ExecutablePath = $baseInterpreter; CommandLine = ''; StartTimeUtc = $bridgeStartTime }
   $unknownBridgeReader = { param([int]$ProcessId) return $unknownBridgeIdentity }.GetNewClosure()
   Assert-ThrowsExact {
     Invoke-AkashaUiaCalibration -InstallRoot $bridgePid.Root -ProcessReader $unknownBridgeReader -Runner (New-TestRunner -State (New-RunnerState -ExitCode 0))

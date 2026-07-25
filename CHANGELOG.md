@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.3 - 2026-07-25
+
+- Restore the calibrated first-result step after entering a contact name, while requiring the clicked result surface to belong to the same WeChat process and retaining contact-title verification before message input and final submission.
+- Make `校准.bat` use the same tokenized Bridge PID resolver as start and stop, including Windows virtual environments whose live PID belongs to the base Python interpreter.
+- Raise the punctuation-first reply fallback from a strict 15-character maximum to 25 characters.
+
+### Automated verification
+
+- The fixed four-point send sequence, same-process popup boundary, wrong-process rejection, title-verification failure, base-interpreter calibration lockout, and 25-character segmentation cap are covered by focused regression tests.
+- The unified Windows release gate continues to verify installer preservation, lifecycle safety, calibration, release allowlists, and the complete Python suite.
+
 ## 0.3.2 - 2026-07-25
 
 - Recover automatically when a previous Bridge process has exited but left `data\state\bridge.pid` behind, including the PID-reuse case observed after an update.

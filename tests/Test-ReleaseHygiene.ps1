@@ -779,8 +779,8 @@ foreach ($file in $textFiles) {
 }
 
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
-if ($version -cne '0.3.2') {
-  throw "VERSION must be 0.3.2, found '$version'."
+if ($version -cne '0.3.3') {
+  throw "VERSION must be 0.3.3, found '$version'."
 }
 
 $template = Get-Content -LiteralPath (Join-Path $root 'bridge\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json

@@ -1086,6 +1086,47 @@ class Win32InputAndClipboardTests(unittest.TestCase):
             any(call[0] == "mouse_event" for call in user32.calls)
         )
 
+    def test_calibrated_search_result_allows_same_process_popup(self):
+        user32 = FakeUser32()
+        user32.windows[20] = {
+            "class": "ChangedWeChatPopupClass",
+            "title": "",
+            "visible": True,
+        }
+        user32.pids[20] = 100
+        user32.roots[11] = 20
+        user32.foreground = 20
+
+        self.make_driver(user32=user32).click_calibrated_search_result(
+            10, {"x": 0.2, "y": 0.2}
+        )
+
+        self.assertIn(("SetCursorPos", 420, 230), user32.calls)
+        self.assertEqual(
+            sum(call[0] == "mouse_event" for call in user32.calls),
+            2,
+        )
+
+    def test_calibrated_search_result_rejects_other_process_popup(self):
+        user32 = FakeUser32()
+        user32.windows[20] = {
+            "class": "UnrelatedPopupClass",
+            "title": "",
+            "visible": True,
+        }
+        user32.pids[20] = 200
+        user32.roots[11] = 20
+
+        with self.assertRaises(CalibrationError) as raised:
+            self.make_driver(user32=user32).click_calibrated_search_result(
+                10, {"x": 0.2, "y": 0.2}
+            )
+
+        self.assertEqual(raised.exception.code, CONTACT_SELECTION_FAILED)
+        self.assertFalse(
+            any(call[0] == "mouse_event" for call in user32.calls)
+        )
+
     def test_every_click_revalidates_bound_process_identity(self):
         user32 = FakeUser32()
         kernel32 = FakeKernel32()
