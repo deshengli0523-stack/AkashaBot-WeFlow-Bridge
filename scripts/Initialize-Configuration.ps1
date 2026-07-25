@@ -572,7 +572,7 @@ function Initialize-AkashaConfiguration {
       Set-JsonProperty -Object $segmentedReply -Name 'log_base' -Value 2.6
       Set-JsonProperty -Object $segmentedReply -Name 'words_count_threshold' -Value 2147483647
       Set-JsonProperty -Object $segmentedReply -Name 'split_mode' -Value 'regex'
-      Set-JsonProperty -Object $segmentedReply -Name 'regex' -Value '.{0,14}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,15}'
+      Set-JsonProperty -Object $segmentedReply -Name 'regex' -Value '.{0,24}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,25}'
       Set-JsonProperty -Object $segmentedReply -Name 'split_words' -Value @(
         [string]([char]0x3002),
         [string]([char]0xff1f),

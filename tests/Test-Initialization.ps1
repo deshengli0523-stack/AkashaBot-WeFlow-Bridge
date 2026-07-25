@@ -974,7 +974,7 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval) '0.8,1.8' 'AstrBot segmented interval is wrong.'
   Assert-Equal ([int]$freshAstr.platform_settings.segmented_reply.words_count_threshold) 2147483647 'AstrBot segmented threshold is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.split_mode) 'regex' 'AstrBot segmented split mode is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,14}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,15}' 'AstrBot segmented regex is wrong.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,24}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,25}' 'AstrBot segmented regex is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '\s+' 'AstrBot content cleanup rule is wrong.'
   $segmentPattern = [string]$freshAstr.platform_settings.segmented_reply.regex
   $segmentCleanupPattern = [string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule
@@ -989,8 +989,8 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
     [pscustomobject]@{ Name = 'tabs'; Input = "alpha`tbeta"; Expected = @('alpha', 'beta') },
     [pscustomobject]@{ Name = 'blank lines'; Input = "alpha`r`n`r`nbeta"; Expected = @('alpha', 'beta') },
     [pscustomobject]@{ Name = 'punctuation runs'; Input = ('hello' + $punctuationRun + ' next'); Expected = @(('hello' + $punctuationRun), 'next') },
-    [pscustomobject]@{ Name = 'decimal points'; Input = 'version3.14stable'; Expected = @('version3.14stab', 'le') },
-    [pscustomobject]@{ Name = 'strict fifteen character cap'; Input = 'abcdefghijklmnop'; Expected = @('abcdefghijklmno', 'p') }
+    [pscustomobject]@{ Name = 'decimal points'; Input = 'version3.14stable'; Expected = @('version3.14stable') },
+    [pscustomobject]@{ Name = 'strict twenty-five character cap'; Input = 'abcdefghijklmnopqrstuvwxyz'; Expected = @('abcdefghijklmnopqrstuvwxy', 'z') }
   )
   foreach ($segmentCase in $segmentCases) {
     $actualSegments = @(
@@ -1003,7 +1003,7 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
     )
     Assert-Equal ($actualSegments -join '|') ($segmentCase.Expected -join '|') "AstrBot segmented reply failed the $($segmentCase.Name) case."
     foreach ($actualSegment in $actualSegments) {
-      Assert-True ($actualSegment.Length -le 15) "AstrBot segmented reply exceeded 15 characters in the $($segmentCase.Name) case."
+      Assert-True ($actualSegment.Length -le 25) "AstrBot segmented reply exceeded 25 characters in the $($segmentCase.Name) case."
     }
   }
   Assert-Equal @($freshAstr.platform).Count 1 'AstrBot platform count is wrong.'

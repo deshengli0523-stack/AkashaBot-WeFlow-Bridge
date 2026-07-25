@@ -83,6 +83,10 @@ class FakeDriver:
         name = self._point_names[(point["x"], point["y"])]
         self.events.append(("click", name, hwnd))
 
+    def click_calibrated_search_result(self, hwnd, point):
+        name = self._point_names[(point["x"], point["y"])]
+        self.events.append(("click", name, hwnd))
+
     def hotkey_ctrl(self, virtual_key):
         self.events.append(("hotkey_ctrl", virtual_key))
 
@@ -184,7 +188,8 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("select_contact", "private-contact", 101),
+                ("click", "first_result", 101),
+                ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
@@ -223,7 +228,8 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("select_contact", "private-contact", 101),
+                ("click", "first_result", 101),
+                ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
@@ -287,9 +293,9 @@ class UiaFixedSenderTests(unittest.TestCase):
                 )
                 self.assertFalse(any(event[0] == "click" for event in driver.events))
 
-    def test_ocr_selection_failure_never_focuses_input_or_clicks_send(self):
+    def test_selected_contact_verification_failure_never_focuses_input_or_clicks_send(self):
         class RejectingSelector:
-            def select_contact(self, _hwnd, _search_point, _contact):
+            def verify_selected_contact(self, _hwnd, _contact):
                 raise CalibrationError(CONTACT_SELECTION_FAILED)
 
         sender = sender_module.UiaFixedSender(
@@ -366,18 +372,13 @@ class UiaFixedSenderTests(unittest.TestCase):
             [
                 event
                 for event in self.driver.events
-                if event[0] in {"select_contact", "verify_contact"}
+                if event[0] == "verify_contact"
                 or event[:2] == ("click", "message_input")
             ],
             [
-                ("select_contact", "private-contact", 101),
-                ("click", "message_input", 101),
-                ("verify_contact", "private-contact", 101),
-                ("verify_contact", "private-contact", 101),
-                ("verify_contact", "private-contact", 101),
-                ("select_contact", "private-contact", 101),
                 ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
+                ("verify_contact", "private-contact", 101),
             ],
         )
 
