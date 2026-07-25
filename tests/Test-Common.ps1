@@ -216,6 +216,7 @@ try {
     Backups = Join-Path $expectedRoot 'data\backups'
     InstallLog = Join-Path $expectedRoot 'data\logs\install.log'
     ProcessState = Join-Path $expectedRoot 'data\state\processes.json'
+    BridgePid = Join-Path $expectedRoot 'data\state\bridge.pid'
     InstallState = Join-Path $expectedRoot 'data\state\install.json'
     WeFlowPathState = Join-Path $expectedRoot 'data\state\weflow-path.txt'
   }

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.2 - 2026-07-25
+
+- Recover automatically when a previous Bridge process has exited but left `data\state\bridge.pid` behind, including the PID-reuse case observed after an update.
+- Refuse to overwrite a live or unverifiable Bridge owner, create the Python PID record exclusively, and remove it only when the current process still owns the exact record.
+- Let `停止.bat` verify and stop an orphan Bridge even when `processes.json` is empty, while retaining the existing executable, command-line, and creation-time identity checks.
+- Extend the Bridge startup stability check beyond the previous 300 ms window and write a bounded, credential- and path-redacted `data\logs\bridge-startup.log` when imports or startup fail.
+- Declare Win32 process APIs with pointer-safe signatures so PID creation-time checks remain reliable on 64-bit Windows.
+- Remove the unintended chat pseudonym/metadata-only behavior: local structured `CHAT` records and the loopback Web panel again retain the complete contact, group sender, and message body. API keys, tokens, and configured runtime paths remain filtered.
+
+### Automated verification
+
+- Stale PID recovery, live orphan refusal and stop, delayed startup exit rollback, tokenized PID fail-closed behavior, exclusive PID ownership, ownership-safe cleanup, and complete local chat records are covered by focused regression tests.
+- The unified Windows release gate continues to verify installer preservation, lifecycle readiness, plugin deployment, release allowlists, credential filtering, and the complete Python suite.
+
 ## 0.3.1 - 2026-07-25
 
 - Preserve image and video descriptions in a dedicated SQLite semantic field while retaining WeFlow's authoritative raw media marker, so Qwen session rebuilds no longer lose visual context.

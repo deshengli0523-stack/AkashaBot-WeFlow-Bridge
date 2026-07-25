@@ -139,8 +139,6 @@ SAFE_LOG_WRAPPERS = {
     "bool",
     "chat_record",
     "len",
-    "message_meta",
-    "pseudonym",
     "type",
 }
 LOG_METHODS = {"critical", "debug", "error", "exception", "info", "warning"}
@@ -564,10 +562,8 @@ class BridgeRuntimeTests(unittest.TestCase):
         entrypoint = next(
             node
             for node in tree.body
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "__name__"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_run_main"
         )
         path_assignments = []
         assigned_names = []
@@ -627,7 +623,7 @@ class BridgeRuntimeTests(unittest.TestCase):
                     "weflow_connected": False,
                 }
 
-        requests_module.get = lambda *_args, **_kwargs: FakeStatus()
+        requests_module.get = mock.Mock(return_value=FakeStatus())
         spec = importlib.util.spec_from_file_location(
             "bridge_pid_identity_test",
             BRIDGE / "main.py",
@@ -654,8 +650,76 @@ class BridgeRuntimeTests(unittest.TestCase):
         ):
             self.assertTrue(main_module._pid_record_is_live("123:222"))
             self.assertFalse(main_module._pid_record_is_live("123:111"))
+        requests_module.get.reset_mock()
+        with mock.patch.object(
+            main_module,
+            "_process_start_token",
+            return_value=None,
+        ):
+            self.assertFalse(main_module._pid_record_is_live("123:222"))
+            self.assertEqual(
+                main_module._pid_record_status("123:222"),
+                "unverifiable",
+            )
+        requests_module.get.assert_not_called()
         self.assertTrue(main_module._pid_record_is_live("123"))
+        requests_module.get.assert_called_once()
         self.assertFalse(main_module._pid_record_is_live("not-a-pid"))
+        self.assertFalse(main_module._pid_record_is_live("0"))
+        self.assertFalse(main_module._pid_record_is_live("-1"))
+        self.assertFalse(main_module._pid_record_is_live("123:0"))
+        self.assertEqual(
+            main_module._pid_record_status("not-a-pid"),
+            "unverifiable",
+        )
+
+    def test_bridge_pid_claim_is_exclusive_and_release_requires_ownership(self):
+        state_module = types.ModuleType("state")
+        config_module = types.ModuleType("config")
+        config_module.WEB_PORT = 8766
+        uia_module = types.ModuleType("uia_fixed_sender")
+        uia_module.UiaFixedSender = object
+        ob_client_module = types.ModuleType("ob_client")
+        ob_client_module._run_ob_client = lambda *_args: None
+        bridge_core_module = types.ModuleType("bridge_core")
+        bridge_core_module.WeFlowBridge = object
+        web_panel_module = types.ModuleType("web_panel")
+        web_panel_module.WebHandler = object
+        web_panel_module.PAGE = ""
+        requests_module = types.ModuleType("requests")
+        requests_module.get = mock.Mock()
+
+        spec = importlib.util.spec_from_file_location(
+            "bridge_pid_ownership_test",
+            BRIDGE / "main.py",
+        )
+        main_module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "uia_fixed_sender": uia_module,
+                "ob_client": ob_client_module,
+                "bridge_core": bridge_core_module,
+                "web_panel": web_panel_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(main_module)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = pathlib.Path(temporary) / "bridge.pid"
+            main_module._claim_pid_file(str(pid_path), "123:456")
+            self.assertEqual(pid_path.read_text(encoding="utf-8"), "123:456")
+            with self.assertRaises(FileExistsError):
+                main_module._claim_pid_file(str(pid_path), "222:333")
+
+            pid_path.write_text("222:333", encoding="utf-8")
+            main_module._release_pid_file_if_owned(str(pid_path), "123:456")
+            self.assertTrue(pid_path.is_file())
+            main_module._release_pid_file_if_owned(str(pid_path), "222:333")
+            self.assertFalse(pid_path.exists())
 
     def test_web_panel_reads_complete_structured_chat_records(self):
         private_body = "第一行\n第二行 <script>不能执行</script> " + ("长正文" * 2048)
@@ -1542,19 +1606,19 @@ class BridgeRuntimeTests(unittest.TestCase):
             config_source,
         )
         config_tree = ast.parse(config_source, filename="config.py")
-        privacy_filter_assignment = next(
+        sensitive_filter_assignment = next(
             node
             for node in config_tree.body
             if isinstance(node, ast.Assign)
             and any(
                 isinstance(target, ast.Name)
-                and target.id == "_privacy_filter"
+                and target.id == "_sensitive_value_filter"
                 for target in node.targets
             )
         )
         self.assertNotIn(
             "UIA_FIXED_CALIBRATION",
-            ast.unparse(privacy_filter_assignment.value),
+            ast.unparse(sensitive_filter_assignment.value),
         )
 
         for name in TASK4_RUNTIME_SOURCE_FILES:
@@ -1636,10 +1700,6 @@ class BridgeRuntimeTests(unittest.TestCase):
                 },
             ):
                 spec.loader.exec_module(protocol)
-            privacy = runpy.run_path(str(BRIDGE / "privacy.py"))
-            pseudonym = privacy["pseudonym"]
-            message_meta = privacy["message_meta"]
-
             messages = {
                 "文字": [{"type": "text", "data": {"text": "private-body"}}],
                 "图片": [{"type": "image", "data": {"file": image_path.name}}],
@@ -1662,16 +1722,13 @@ class BridgeRuntimeTests(unittest.TestCase):
                         output = "\n".join(logs.output)
                         self.assertIn('"event":"outbound"', output)
                         self.assertIn('"status":"failed"', output)
-                        self.assertIn(
-                            f'"contact":"{pseudonym("private-contact")}"',
-                            output,
-                        )
+                        self.assertIn('"contact":"private-contact"', output)
                         if label == "文字":
-                            expected_body = message_meta("private-body")
+                            expected_body = "private-body"
                         elif label == "图片":
-                            expected_body = message_meta("[图片]")
+                            expected_body = "[图片]"
                         else:
-                            expected_body = message_meta("[表情]")
+                            expected_body = "[表情]"
                         self.assertIn(
                             f'"body":"{expected_body}"',
                             output,
@@ -1694,16 +1751,13 @@ class BridgeRuntimeTests(unittest.TestCase):
                     output = "\n".join(logs.output)
                     self.assertIn('"event":"outbound"', output)
                     self.assertIn('"status":"sent"', output)
-                    self.assertIn(
-                        f'"contact":"{pseudonym("private-contact")}"',
-                        output,
-                    )
+                    self.assertIn('"contact":"private-contact"', output)
                     if label == "文字":
-                        expected_body = message_meta("private-body")
+                        expected_body = "private-body"
                     elif label == "图片":
-                        expected_body = message_meta("[图片]")
+                        expected_body = "[图片]"
                     else:
-                        expected_body = message_meta("[表情]")
+                        expected_body = "[表情]"
                     self.assertIn(
                         f'"body":"{expected_body}"',
                         output,
@@ -1838,7 +1892,7 @@ class BridgeRuntimeTests(unittest.TestCase):
                     self.assertEqual(len(chat_lines), 1)
                     output = "\n".join(logs.output)
                     self.assertIn('"status":"failed"', output)
-                    self.assertIn('"body":"type=text length=4"', output)
+                    self.assertIn('"body":"[图片]"', output)
                     if file_value:
                         self.assertNotIn(file_value, output)
 
@@ -3009,7 +3063,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual(bridge.add_to_buffer.call_count, 2)
         self.assertEqual(bridge.processed_ids, set())
 
-    def test_inbound_chat_logs_use_pseudonyms_and_body_metadata(self):
+    def test_inbound_chat_logs_keep_complete_contacts_and_bodies(self):
         class FakeTimer:
             def __init__(self, *_args, **_kwargs):
                 self.daemon = False
@@ -3071,26 +3125,23 @@ class BridgeRuntimeTests(unittest.TestCase):
             for line in logs.output
             if "CHAT " in line
         ]
-        privacy = runpy.run_path(str(BRIDGE / "privacy.py"))
-        pseudonym = privacy["pseudonym"]
-        message_meta = privacy["message_meta"]
         self.assertEqual(
             records,
             [
                 {
                     "event": "inbound",
                     "scope": "private",
-                    "contact": pseudonym("联系人甲"),
+                    "contact": "联系人甲",
                     "status": "received",
-                    "body": message_meta("私聊第一行\n私聊第二行🙂"),
+                    "body": "私聊第一行\n私聊第二行🙂",
                 },
                 {
                     "event": "inbound",
                     "scope": "group",
-                    "contact": pseudonym("项目群"),
-                    "sender": pseudonym("群成员乙"),
+                    "contact": "项目群",
+                    "sender": "群成员乙",
                     "status": "received",
-                    "body": message_meta("群消息正文"),
+                    "body": "群消息正文",
                 },
             ],
         )
@@ -3238,20 +3289,12 @@ class BridgeRuntimeTests(unittest.TestCase):
     def test_base64_tempfile_close_failure_retries_and_removes_owned_path(self):
         self._assert_failed_base64_tempfile_stage_is_cleaned("close")
 
-    def test_chat_log_helpers_pseudonymize_names_and_reduce_body_to_metadata(self):
+    def test_chat_log_keeps_complete_chat_while_redacting_credentials(self):
         privacy_path = BRIDGE / "privacy.py"
         self.assertTrue(privacy_path.is_file(), "bridge/privacy.py is missing")
         privacy = runpy.run_path(str(privacy_path))
-        pseudonym = privacy["pseudonym"]
-        message_meta = privacy["message_meta"]
         chat_record = privacy["chat_record"]
         redact_log_text = privacy["redact_log_text"]
-
-        self.assertEqual(pseudonym("Alice"), "id:3bc51062973c")
-        self.assertNotIn("Alice", pseudonym("Alice"))
-        self.assertEqual(message_meta("hello"), "type=text length=5")
-        self.assertEqual(message_meta(""), "type=empty length=0")
-        self.assertEqual(message_meta(None), "type=empty length=0")
 
         encoded = chat_record(
             event="inbound",
@@ -3268,10 +3311,10 @@ class BridgeRuntimeTests(unittest.TestCase):
             {
                 "event": "inbound",
                 "scope": "group",
-                "contact": pseudonym("项目群"),
-                "sender": pseudonym("联系人甲"),
+                "contact": "项目群",
+                "sender": "联系人甲",
                 "status": "received",
-                "body": message_meta("第一行\n第二行🙂"),
+                "body": "第一行\n第二行🙂",
             },
         )
 
@@ -3396,10 +3439,10 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertNotIn("\u2029", separator_encoded)
         self.assertEqual(
             json.loads(separator_encoded)["body"],
-            message_meta(separator_body),
+            separator_body,
         )
 
-    def test_chat_log_file_end_to_end_contains_only_pseudonym_and_metadata(self):
+    def test_chat_log_file_end_to_end_keeps_chat_and_redacts_credentials(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             config_path = root / "data" / "config.json"
@@ -3467,20 +3510,15 @@ class BridgeRuntimeTests(unittest.TestCase):
             raw_line = chat_lines[0]
             self.assertNotIn(configured_credential, raw_line)
             self.assertNotIn(configured_image_credential, raw_line)
-            self.assertNotIn(local_path, raw_line)
-            self.assertNotIn("联系人甲", raw_line)
-            self.assertNotIn("正文", raw_line)
-            self.assertNotIn("然后回复", raw_line)
             record = json.loads(raw_line.split("CHAT ", 1)[1])
-            privacy = runpy.run_path(str(BRIDGE / "privacy.py"))
-            self.assertEqual(
-                record["contact"],
-                privacy["pseudonym"]("联系人甲"),
-            )
+            self.assertEqual(record["contact"], "联系人甲")
             self.assertEqual(
                 record["body"],
-                privacy["message_meta"](chat_body),
+                chat_body.replace(configured_credential, "[REDACTED]"),
             )
+            self.assertIn(local_path, record["body"])
+            self.assertIn("正文", record["body"])
+            self.assertIn("然后回复", record["body"])
 
     def test_source_logs_use_chat_records_and_exclude_raw_paths_and_exceptions(self):
         legacy_markers = (
@@ -3530,8 +3568,6 @@ class BridgeRuntimeTests(unittest.TestCase):
         safe_logs = {
             "message length": 'log.info("%s", len(body))',
             "exception type": 'log.info("%s", type(error).__name__)',
-            "message metadata": 'log.info("%s", message_meta(text))',
-            "contact pseudonym": 'log.info("%s", pseudonym(contact))',
             "structured chat record": (
                 'log.info("%s", chat_record(event="inbound", scope="private", '
                 'contact=contact, body=body, status="received"))'

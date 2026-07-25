@@ -258,6 +258,7 @@ function Get-AkashaLifecyclePreflight {
       $Paths.State,
       $Paths.Logs,
       $Paths.ProcessState,
+      $Paths.BridgePid,
       $Paths.WeFlowPathState,
       $Paths.Bridge,
       $Paths.BridgePython,
@@ -376,6 +377,141 @@ function Test-AkashaCommandIdentity {
     }
     default { return $false }
   }
+}
+
+function Remove-AkashaBridgePidFile {
+  param(
+    [Parameter(Mandatory)]$Paths,
+    [Parameter(Mandatory)][string]$ExpectedContent
+  )
+
+  Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($Paths.State, $Paths.BridgePid)
+  try {
+    if (-not (Test-Path -LiteralPath $Paths.BridgePid)) { return }
+    if (-not (Test-Path -LiteralPath $Paths.BridgePid -PathType Leaf)) {
+      throw 'invalid pid path'
+    }
+    $current = (Get-Content -LiteralPath $Paths.BridgePid -Raw -Encoding UTF8 -ErrorAction Stop).Trim()
+    if ($current -cne $ExpectedContent) { throw 'pid state changed' }
+    Remove-Item -LiteralPath $Paths.BridgePid -Force -ErrorAction Stop
+  } catch {
+    throw 'E_PROCESS_STATE: Unable to clear stale bridge pid state.'
+  }
+}
+
+function Resolve-AkashaBridgePidState {
+  param([Parameter(Mandatory)]$Paths)
+
+  Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($Paths.State, $Paths.BridgePid, $Paths.BridgePython)
+  if (-not (Test-Path -LiteralPath $Paths.BridgePid)) {
+    return [pscustomobject]@{ Status = 'missing'; Record = $null }
+  }
+  if (-not (Test-Path -LiteralPath $Paths.BridgePid -PathType Leaf)) {
+    throw 'E_PROCESS_STATE: Invalid bridge pid state.'
+  }
+
+  try {
+    $raw = (Get-Content -LiteralPath $Paths.BridgePid -Raw -Encoding UTF8 -ErrorAction Stop).Trim()
+  } catch {
+    throw 'E_PROCESS_STATE: Invalid bridge pid state.'
+  }
+  if ($raw -notmatch '^(?<pid>[1-9][0-9]*)(?::(?<token>[1-9][0-9]*))?$') {
+    throw 'E_PROCESS_STATE: Invalid bridge pid state.'
+  }
+  $processId = 0
+  if (-not [int]::TryParse($Matches['pid'], [ref]$processId)) {
+    throw 'E_PROCESS_STATE: Invalid bridge pid state.'
+  }
+  $token = $null
+  if (-not [string]::IsNullOrEmpty($Matches['token'])) {
+    $parsedToken = [long]0
+    if (-not [long]::TryParse($Matches['token'], [ref]$parsedToken)) {
+      throw 'E_PROCESS_STATE: Invalid bridge pid state.'
+    }
+    $token = $parsedToken
+  }
+
+  $identity = Get-AkashaProcessIdentity -ProcessId $processId
+  if ($null -eq $identity) {
+    Remove-AkashaBridgePidFile -Paths $Paths -ExpectedContent $raw
+    return [pscustomobject]@{ Status = 'stale'; Record = $null }
+  }
+
+  $expectedPath = [System.IO.Path]::GetFullPath($Paths.BridgePython)
+  $actualPath = ''
+  try {
+    if (-not [string]::IsNullOrWhiteSpace([string]$identity.ExecutablePath)) {
+      $actualPath = [System.IO.Path]::GetFullPath([string]$identity.ExecutablePath)
+    }
+  } catch {
+    $actualPath = ''
+  }
+  if ([string]::IsNullOrWhiteSpace($actualPath)) {
+    return [pscustomobject]@{ Status = 'unverifiable'; Record = $null }
+  }
+  if ($null -ne $token) {
+    $actualToken = [long]0
+    try { $actualToken = $identity.StartTimeUtc.ToFileTimeUtc() } catch {
+      return [pscustomobject]@{ Status = 'unverifiable'; Record = $null }
+    }
+    if ($actualToken -ne [long]$token) {
+      Remove-AkashaBridgePidFile -Paths $Paths -ExpectedContent $raw
+      return [pscustomobject]@{ Status = 'stale'; Record = $null }
+    }
+    if (-not $actualPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $venvRoot = Split-Path -Parent (Split-Path -Parent $Paths.BridgePython)
+      $venvConfig = Join-Path $venvRoot 'pyvenv.cfg'
+      Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($venvRoot, $venvConfig)
+      $runtimePathMatches = $false
+      if (Test-Path -LiteralPath $venvConfig -PathType Leaf) {
+        try {
+          $venvText = Get-Content -LiteralPath $venvConfig -Raw -Encoding UTF8 -ErrorAction Stop
+          if ($venvText -match '(?im)^\s*executable\s*=\s*(?<path>[^\r\n]+?)\s*$') {
+            $runtimePath = [System.IO.Path]::GetFullPath($Matches['path'].Trim())
+            $runtimePathMatches = (
+              (Test-AkashaCanonicalExternalExecutable -Path $runtimePath) -and
+              $actualPath.Equals($runtimePath, [System.StringComparison]::OrdinalIgnoreCase)
+            )
+          }
+        } catch {
+          $runtimePathMatches = $false
+        }
+      }
+      if (-not $runtimePathMatches) {
+        Remove-AkashaBridgePidFile -Paths $Paths -ExpectedContent $raw
+        return [pscustomobject]@{ Status = 'stale'; Record = $null }
+      }
+      if ([string]::IsNullOrWhiteSpace([string]$identity.CommandLine)) {
+        return [pscustomobject]@{ Status = 'unverifiable'; Record = $null }
+      }
+      if (-not (Test-AkashaCommandIdentity -CommandKind 'BridgeMain' -CommandLine ([string]$identity.CommandLine))) {
+        Remove-AkashaBridgePidFile -Paths $Paths -ExpectedContent $raw
+        return [pscustomobject]@{ Status = 'stale'; Record = $null }
+      }
+    }
+  } else {
+    if (-not $actualPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+      Remove-AkashaBridgePidFile -Paths $Paths -ExpectedContent $raw
+      return [pscustomobject]@{ Status = 'stale'; Record = $null }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$identity.CommandLine)) {
+      return [pscustomobject]@{ Status = 'unverifiable'; Record = $null }
+    }
+    if (-not (Test-AkashaCommandIdentity -CommandKind 'BridgeMain' -CommandLine ([string]$identity.CommandLine))) {
+      Remove-AkashaBridgePidFile -Paths $Paths -ExpectedContent $raw
+      return [pscustomobject]@{ Status = 'stale'; Record = $null }
+    }
+  }
+
+  $record = [pscustomobject][ordered]@{
+    Name = 'bridge'
+    Pid = $processId
+    ExecutablePath = $actualPath
+    StartTimeUtc = $identity.StartTimeUtc.ToString('o')
+    Owned = $true
+    CommandKind = 'BridgeMain'
+  }
+  return [pscustomobject]@{ Status = 'live'; Record = $record }
 }
 
 function New-AkashaProcessRecord {
@@ -661,11 +797,20 @@ function Start-AkashaOwnedProcess {
 }
 
 function Assert-AkashaProcessStayedRunning {
-  param([Parameter(Mandatory)][System.Diagnostics.Process]$Process, [Parameter(Mandatory)][string]$Name)
+  param(
+    [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+    [Parameter(Mandatory)][string]$Name,
+    [ValidateRange(100, 10000)][int]$DelayMilliseconds = 300
+  )
 
-  Start-Sleep -Milliseconds 300
+  Start-Sleep -Milliseconds $DelayMilliseconds
   $Process.Refresh()
-  if ($Process.HasExited) { throw "E_SERVICE_EXITED: $Name exited immediately after launch." }
+  if ($Process.HasExited) {
+    if ($Name -ceq 'bridge') {
+      throw 'E_SERVICE_EXITED: bridge exited during startup; inspect data\logs\bridge-startup.log and bridge.log.'
+    }
+    throw "E_SERVICE_EXITED: $Name exited immediately after launch."
+  }
 }
 
 function Start-AkashaServices {
@@ -732,6 +877,14 @@ function Start-AkashaServices {
     if ($existing.Count -ne $baseline.Count) {
       Write-AkashaProcessState -Path $paths.ProcessState -Paths $paths -Records $baseline
     }
+    $bridgePidState = Resolve-AkashaBridgePidState -Paths $paths
+    if ([string]$bridgePidState.Status -ceq 'stale') {
+      Write-AkashaLifecycleLog -Paths $paths -Level 'info' -Message 'stale name=bridge-pid'
+    } elseif ([string]$bridgePidState.Status -ceq 'live') {
+      throw 'E_ALREADY_RUNNING: Bridge is already running.'
+    } elseif ([string]$bridgePidState.Status -ceq 'unverifiable') {
+      throw 'E_PROCESS_STATE: Unable to verify bridge pid identity.'
+    }
 
     $started = New-Object System.Collections.Generic.List[object]
     $records = @($baseline)
@@ -786,7 +939,7 @@ function Start-AkashaServices {
       $bridgeEntry.Record = $bridgeRecord
       $records += $bridgeRecord
       Write-AkashaProcessState -Path $paths.ProcessState -Paths $paths -Records $records
-      Assert-AkashaProcessStayedRunning -Process $bridgeProcess -Name 'bridge'
+      Assert-AkashaProcessStayedRunning -Process $bridgeProcess -Name 'bridge' -DelayMilliseconds 1500
 
       Write-AkashaLifecycleLog -Paths $paths -Level 'info' -Message 'Lifecycle start completed; services=3.'
     } catch {

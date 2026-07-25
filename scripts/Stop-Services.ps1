@@ -180,7 +180,7 @@ function Test-AkashaStopIdentity {
 function Get-AkashaStopPreflight {
   param([Parameter(Mandatory)]$Paths)
 
-  Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($Paths.State, $Paths.Logs, $Paths.ProcessState, $Paths.BridgePython, $Paths.AstrBotPython)
+  Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($Paths.State, $Paths.Logs, $Paths.ProcessState, $Paths.BridgePid, $Paths.BridgePython, $Paths.AstrBotPython)
 }
 
 function Get-AkashaStopWeFlowDiscovery {
@@ -243,11 +243,6 @@ function Stop-AkashaServices {
     Get-AkashaStopPreflight -Paths $paths
     Write-AkashaLifecycleLog -Paths $paths -Level 'info' -Message 'Lifecycle stop requested.'
     $records = @(Read-AkashaProcessState -Path $paths.ProcessState -Paths $paths)
-    if ($records.Count -eq 0) {
-      Write-AkashaProcessState -Path $paths.ProcessState -Paths $paths -Records @()
-      return
-    }
-
     Write-AkashaProcessState -Path $paths.ProcessState -Paths $paths -Records $records
     $remaining = @($records)
     $events = New-Object System.Collections.Generic.List[string]
@@ -305,6 +300,47 @@ function Stop-AkashaServices {
         $events.Add("stop name=$($record.Name)")
       } finally {
         if ($null -ne $identity -and $null -ne $identity.Lease) { $identity.Lease.Dispose() }
+      }
+    }
+
+    $bridgePidState = Resolve-AkashaBridgePidState -Paths $paths
+    if ([string]$bridgePidState.Status -ceq 'stale') {
+      $events.Add('stale name=bridge-pid')
+    } elseif ([string]$bridgePidState.Status -ceq 'unverifiable') {
+      $identityRefused = $true
+      $events.Add('refused name=bridge-pid')
+    } elseif ([string]$bridgePidState.Status -ceq 'live') {
+      $bridgeIdentity = $null
+      try {
+        $bridgeIdentity = Get-AkashaStopProcessIdentity -ProcessId ([int]$bridgePidState.Record.Pid)
+        if ($null -eq $bridgeIdentity) {
+          $bridgePidState = Resolve-AkashaBridgePidState -Paths $paths
+          if ([string]$bridgePidState.Status -ceq 'stale' -or
+              [string]$bridgePidState.Status -ceq 'missing') {
+            $events.Add('stale name=bridge-pid')
+          } else {
+            $identityRefused = $true
+            $events.Add('refused name=bridge-pid')
+          }
+        } elseif (-not (Test-AkashaStopIdentity -Record $bridgePidState.Record -Identity $bridgeIdentity)) {
+          $identityRefused = $true
+          $events.Add('refused name=bridge-pid')
+        } else {
+          try {
+            Get-AkashaStopPreflight -Paths $paths
+            if (-not $bridgeIdentity.Lease.TerminateAndWait(5000)) { throw 'timeout' }
+            $remaining = @($remaining | Where-Object { [int]$_.Pid -ne [int]$bridgePidState.Record.Pid })
+            Write-AkashaProcessState -Path $paths.ProcessState -Paths $paths -Records $remaining
+            $afterStop = Resolve-AkashaBridgePidState -Paths $paths
+            if ([string]$afterStop.Status -notin @('missing', 'stale')) { throw 'pid cleanup failed' }
+            $events.Add('stop name=bridge-pid')
+          } catch {
+            $identityRefused = $true
+            $events.Add('refused name=bridge-pid')
+          }
+        }
+      } finally {
+        if ($null -ne $bridgeIdentity -and $null -ne $bridgeIdentity.Lease) { $bridgeIdentity.Lease.Dispose() }
       }
     }
 

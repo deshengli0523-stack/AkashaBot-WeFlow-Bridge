@@ -1,4 +1,3 @@
-import hashlib
 import json
 import re
 
@@ -72,18 +71,6 @@ _PATH_TEXT_BOUNDARY_PREFIXES = (
     "帮我",
     "告诉我",
 )
-
-
-def pseudonym(value: object) -> str:
-    text = "" if value is None else str(value)
-    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
-    return f"id:{digest}"
-
-
-def message_meta(content: object) -> str:
-    text = "" if content is None else str(content)
-    kind = "empty" if not text else "text"
-    return f"type={kind} length={len(text)}"
 
 
 def redact_log_text(value: object, *, redact_paths: bool = True) -> str:
@@ -200,16 +187,16 @@ def chat_record(
     status: str,
     sender: object = "",
 ) -> str:
-    """Return one JSON audit line without contact names or chat content."""
+    """Return one complete local-only JSON chat record for the Web panel."""
     payload = {
         "event": str(event),
         "scope": str(scope),
-        "contact": pseudonym(contact),
+        "contact": "" if contact is None else str(contact),
     }
     if sender not in (None, ""):
-        payload["sender"] = pseudonym(sender)
+        payload["sender"] = str(sender)
     payload["status"] = str(status)
-    payload["body"] = message_meta(body)
+    payload["body"] = "" if body is None else str(body)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     for separator in ("\u0085", "\u2028", "\u2029"):
         encoded = encoded.replace(separator, f"\\u{ord(separator):04x}")

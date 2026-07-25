@@ -24,6 +24,7 @@ function Get-AkashaBotPaths {
     Backups = Join-Path $rootPath 'data\backups'
     InstallLog = Join-Path $rootPath 'data\logs\install.log'
     ProcessState = Join-Path $rootPath 'data\state\processes.json'
+    BridgePid = Join-Path $rootPath 'data\state\bridge.pid'
     InstallState = Join-Path $rootPath 'data\state\install.json'
     WeFlowPathState = Join-Path $rootPath 'data\state\weflow-path.txt'
   }

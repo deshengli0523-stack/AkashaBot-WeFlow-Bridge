@@ -128,14 +128,14 @@ class _SensitiveValueFilter(logging.Filter):
         return True
 
 
-_privacy_filter = _SensitiveValueFilter([
+_sensitive_value_filter = _SensitiveValueFilter([
     ACCESS_TOKEN, IMAGE_CAPTION_API_KEY,
     ASTRBOT_ATTACHMENTS, CONFIG_FILE, LOG_DIR,
 ])
 _file_handler = logging.FileHandler(BRIDGE_LOG_FILE, encoding="utf-8")
 _stream_handler = logging.StreamHandler()
-_file_handler.addFilter(_privacy_filter)
-_stream_handler.addFilter(_privacy_filter)
+_file_handler.addFilter(_sensitive_value_filter)
+_stream_handler.addFilter(_sensitive_value_filter)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -147,5 +147,5 @@ logging.basicConfig(
     ],
 )
 for _handler in logging.getLogger().handlers:
-    _handler.addFilter(_privacy_filter)
+    _handler.addFilter(_sensitive_value_filter)
 log = logging.getLogger("ob11-bridge")

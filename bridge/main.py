@@ -7,19 +7,75 @@
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
-
-import requests
-
-import state
-import config
-from uia_fixed_sender import UiaFixedSender
-from ob_client import _run_ob_client
-from bridge_core import WeFlowBridge
-from web_panel import WebHandler, PAGE
 from http.server import HTTPServer
+
+_STARTUP_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\bsk-[A-Za-z0-9._-]{8,}"),
+    re.compile(
+        r"""(?ix)
+        (?:api[\s_-]?key|access[\s_-]?token|password|secret|token)
+        \s*[:=]\s*
+        ["']?[^"',;\s}&]+
+        """
+    ),
+)
+_STARTUP_PATH_PATTERN = re.compile(
+    r"""(?ix)
+    (?:
+        [a-z]:[\\/]
+        |
+        \\\\
+    )
+    [^\r\n]+
+    """
+)
+
+
+def _sanitize_startup_detail(value: object) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    for pattern in _STARTUP_SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    text = _STARTUP_PATH_PATTERN.sub("[REDACTED]", text)
+    return text[:1000]
+
+
+def _write_startup_failure(stage: str, error: BaseException) -> None:
+    """Write one bounded, redacted diagnostic even when normal logging failed."""
+
+    try:
+        log_dir = os.environ.get(
+            "AKASHABOT_LOG_DIR",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "bridge-startup.log")
+        detail = _sanitize_startup_detail(error)
+        with open(path, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                "E_BRIDGE_STARTUP "
+                f"stage={stage} type={type(error).__name__} detail={detail}\n"
+            )
+    except Exception:
+        pass
+
+
+try:
+    import requests
+
+    import state
+    import config
+    from uia_fixed_sender import UiaFixedSender
+    from ob_client import _run_ob_client
+    from bridge_core import WeFlowBridge
+    from web_panel import WebHandler, PAGE
+except Exception as import_error:
+    _write_startup_failure("import", import_error)
+    raise
 
 log = logging.getLogger("ob11-bridge")
 
@@ -46,7 +102,25 @@ def _process_start_token(pid: int) -> int | None:
                 ("high", wintypes.DWORD),
             ]
 
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
             return None
         try:
@@ -54,7 +128,7 @@ def _process_start_token(pid: int) -> int | None:
             exited = FileTime()
             kernel = FileTime()
             user = FileTime()
-            if not ctypes.windll.kernel32.GetProcessTimes(
+            if not kernel32.GetProcessTimes(
                 handle,
                 ctypes.byref(created),
                 ctypes.byref(exited),
@@ -64,7 +138,7 @@ def _process_start_token(pid: int) -> int | None:
                 return None
             return (int(created.high) << 32) | int(created.low)
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)
     except Exception:
         return None
 
@@ -88,21 +162,60 @@ def _legacy_bridge_endpoint_is_live() -> bool:
         return False
 
 
-def _pid_record_is_live(raw_record: str) -> bool:
+def _pid_record_status(raw_record: str) -> str:
+    """Classify an existing record without treating query failure as stale."""
+
     parts = raw_record.strip().split(":", 1)
     try:
         pid = int(parts[0])
     except (TypeError, ValueError):
-        return False
+        return "unverifiable"
+    if pid <= 0:
+        return "unverifiable"
     if len(parts) == 2:
         try:
             expected_start = int(parts[1])
         except ValueError:
-            return False
+            return "unverifiable"
+        if expected_start <= 0:
+            return "unverifiable"
         actual_start = _process_start_token(pid)
-        if actual_start is not None:
-            return actual_start == expected_start
-    return _legacy_bridge_endpoint_is_live()
+        if actual_start is None:
+            return "unverifiable"
+        return "live" if actual_start == expected_start else "stale"
+    return "live" if _legacy_bridge_endpoint_is_live() else "stale"
+
+
+def _pid_record_is_live(raw_record: str) -> bool:
+    return _pid_record_status(raw_record) == "live"
+
+
+def _claim_pid_file(path: str, record: str) -> None:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            descriptor = -1
+            stream.write(record)
+            stream.flush()
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+
+
+def _release_pid_file_if_owned(path: str, record: str) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            current = stream.read().strip()
+        if current == record:
+            os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def _start_bridge():
@@ -284,7 +397,8 @@ def start_web():
 
 # ============ 入口 ============
 
-if __name__ == "__main__":
+
+def _run_main() -> None:
     # 从 config 初始化 state 中需要计算的值
     state._self_id_int = state._wxid_to_int(config.BOT_WXID or "wechat_bot")
     state.group_reply_mode = config.GROUP_REPLY_MODE
@@ -297,16 +411,16 @@ if __name__ == "__main__":
         try:
             with open(PID_FILE, "r", encoding="utf-8") as f:
                 pid_record = f.read().strip()
-            if _pid_record_is_live(pid_record):
+            pid_status = _pid_record_status(pid_record)
+            if pid_status == "live":
                 log.error("⚠️ bridge.pid 已存在")
                 sys.exit(1)
+            if pid_status != "stale":
+                raise RuntimeError("E_BRIDGE_PID_STATE")
             os.remove(PID_FILE)
             log.warning("已清理失效的 bridge.pid")
-        except OSError:
-            try:
-                os.remove(PID_FILE)
-            except OSError:
-                pass
+        except OSError as error:
+            raise RuntimeError("E_BRIDGE_PID_STATE") from error
 
     current_pid = os.getpid()
     current_start = _process_start_token(current_pid)
@@ -315,8 +429,11 @@ if __name__ == "__main__":
         if current_start is not None
         else str(current_pid)
     )
-    with open(PID_FILE, "w", encoding="utf-8") as f:
-        f.write(current_record)
+    try:
+        _claim_pid_file(PID_FILE, current_record)
+    except FileExistsError:
+        log.error("⚠️ bridge.pid 已由另一个进程占用")
+        sys.exit(1)
 
     try:
         log.info("=" * 50)
@@ -326,7 +443,18 @@ if __name__ == "__main__":
         _start_bridge()
         start_web()
     finally:
-        try:
-            os.remove(PID_FILE)
-        except Exception:
-            pass
+        _release_pid_file_if_owned(PID_FILE, current_record)
+
+
+if __name__ == "__main__":
+    try:
+        _run_main()
+    except SystemExit:
+        raise
+    except Exception as startup_error:
+        _write_startup_failure("runtime", startup_error)
+        log.error(
+            "E_BRIDGE_STARTUP: Bridge startup failed; type=%s",
+            type(startup_error).__name__,
+        )
+        raise
