@@ -77,6 +77,10 @@ public static class FixtureSleeper {
         if (File.Exists(Path.Combine(Environment.CurrentDirectory, "exit.fixture"))) {
             return 23;
         }
+        if (File.Exists(Path.Combine(Environment.CurrentDirectory, "delayed-exit.fixture"))) {
+            Thread.Sleep(700);
+            return 24;
+        }
         while (true) { Thread.Sleep(200); }
     }
 }
@@ -134,16 +138,21 @@ function New-InstallFixture {
 }
 
 function Stop-TrackedFixtureProcesses {
-  foreach ($pidValue in @($startedFixturePids)) {
-    $process = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
-    if ($null -eq $process) { continue }
-    $path = ''
-    try { $path = [string]$process.Path } catch { $path = '' }
-    if (-not [string]::IsNullOrWhiteSpace($path) -and
-        [System.IO.Path]::GetFullPath($path).StartsWith([System.IO.Path]::GetFullPath($fixtureRoot), [System.StringComparison]::OrdinalIgnoreCase)) {
-      Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
-      Wait-Process -Id $pidValue -Timeout 5 -ErrorAction SilentlyContinue
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $survivors = 0
+    foreach ($pidValue in @($startedFixturePids)) {
+      $process = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+      if ($null -eq $process) { continue }
+      $path = ''
+      try { $path = [string]$process.Path } catch { $path = '' }
+      if (-not [string]::IsNullOrWhiteSpace($path) -and
+          [System.IO.Path]::GetFullPath($path).StartsWith([System.IO.Path]::GetFullPath($fixtureRoot), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $survivors++
+        Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+      }
     }
+    if ($survivors -eq 0) { return }
+    Start-Sleep -Milliseconds 100
   }
 }
 
@@ -429,6 +438,45 @@ try {
     $busyLock.Dispose()
   }
 
+  $staleBridgePid = New-InstallFixture -Name 'stale-bridge-pid'
+  Set-Content -LiteralPath $staleBridgePid.Paths.BridgePid -Value '2147483647:1' -Encoding ASCII
+  $oldFixtureRecordDirectory = $env:FIXTURE_RECORD_DIR
+  try {
+    $env:FIXTURE_RECORD_DIR = $staleBridgePid.RecordRoot
+    Start-AkashaServices -InstallRoot $staleBridgePid.Root | Out-Null
+    Register-ProcessStatePids -Path $staleBridgePid.Paths.ProcessState
+    Assert-True (-not (Test-Path -LiteralPath $staleBridgePid.Paths.BridgePid)) 'Start did not remove a stale bridge.pid before launch.'
+    Assert-Equal (@(Get-StateRecords -Path $staleBridgePid.Paths.ProcessState).Count) 3 'Stale bridge.pid recovery did not start all services.'
+    Stop-AkashaServices -InstallRoot $staleBridgePid.Root
+  } finally {
+    if ($null -eq $oldFixtureRecordDirectory) { Remove-Item Env:\FIXTURE_RECORD_DIR -ErrorAction SilentlyContinue } else { $env:FIXTURE_RECORD_DIR = $oldFixtureRecordDirectory }
+  }
+
+  $orphanBridgePid = New-InstallFixture -Name 'orphan-bridge-pid'
+  $oldFixtureRecordDirectory = $env:FIXTURE_RECORD_DIR
+  $orphanBridgeProcess = $null
+  try {
+    $env:FIXTURE_RECORD_DIR = $orphanBridgePid.RecordRoot
+    $orphanBridgeProcess = Start-Process -FilePath $orphanBridgePid.Paths.BridgePython -ArgumentList 'main.py' -WorkingDirectory $orphanBridgePid.Paths.Bridge -PassThru -WindowStyle Hidden
+    $startedFixturePids.Add([int]$orphanBridgeProcess.Id)
+    Assert-Equal (@(Wait-FixtureRecords -RecordRoot $orphanBridgePid.RecordRoot -Count 1).Count) 1 'Orphan Bridge fixture did not start.'
+    $orphanToken = $orphanBridgeProcess.StartTime.ToUniversalTime().ToFileTimeUtc()
+    Set-Content -LiteralPath $orphanBridgePid.Paths.BridgePid -Value ("{0}:{1}" -f $orphanBridgeProcess.Id, $orphanToken) -Encoding ASCII
+    Assert-ThrowsLike {
+      Start-AkashaServices -InstallRoot $orphanBridgePid.Root
+    } 'E_ALREADY_RUNNING:*Bridge*' 'Start did not refuse a live Bridge owner found only through bridge.pid.' | Out-Null
+    Assert-Equal (@(Wait-FixtureRecords -RecordRoot $orphanBridgePid.RecordRoot -Count 2).Count) 1 'Live bridge.pid owner check launched another process.'
+    Stop-AkashaServices -InstallRoot $orphanBridgePid.Root
+    Assert-True ($null -eq (Get-Process -Id $orphanBridgeProcess.Id -ErrorAction SilentlyContinue)) 'Stop did not terminate the verified orphan Bridge owner.'
+    Assert-True (-not (Test-Path -LiteralPath $orphanBridgePid.Paths.BridgePid)) 'Stop left the orphan bridge.pid behind.'
+  } finally {
+    if ($null -ne $orphanBridgeProcess -and -not $orphanBridgeProcess.HasExited) {
+      Stop-Process -Id $orphanBridgeProcess.Id -Force -ErrorAction SilentlyContinue
+      Wait-Process -Id $orphanBridgeProcess.Id -Timeout 5 -ErrorAction SilentlyContinue
+    }
+    if ($null -eq $oldFixtureRecordDirectory) { Remove-Item Env:\FIXTURE_RECORD_DIR -ErrorAction SilentlyContinue } else { $env:FIXTURE_RECORD_DIR = $oldFixtureRecordDirectory }
+  }
+
   $earlyExit = New-InstallFixture -Name 'early-exit'
   Set-Content -LiteralPath (Join-Path $earlyExit.Paths.Bridge 'exit.fixture') -Value 'exit' -Encoding ASCII
   $oldFixtureRecordDirectory = $env:FIXTURE_RECORD_DIR
@@ -441,6 +489,22 @@ try {
     Register-FixtureRecordPids -RecordRoot $earlyExit.RecordRoot
     Assert-FixtureRecordProcessesDead -RecordRoot $earlyExit.RecordRoot -Message 'Partial-start rollback left a real process running.'
     Assert-Equal (@(Get-StateRecords -Path $earlyExit.Paths.ProcessState).Count) 0 'Partial-start rollback left success state.'
+  } finally {
+    if ($null -eq $oldFixtureRecordDirectory) { Remove-Item Env:\FIXTURE_RECORD_DIR -ErrorAction SilentlyContinue } else { $env:FIXTURE_RECORD_DIR = $oldFixtureRecordDirectory }
+  }
+
+  $delayedExit = New-InstallFixture -Name 'delayed-exit'
+  Set-Content -LiteralPath (Join-Path $delayedExit.Paths.Bridge 'delayed-exit.fixture') -Value 'exit' -Encoding ASCII
+  $oldFixtureRecordDirectory = $env:FIXTURE_RECORD_DIR
+  try {
+    $env:FIXTURE_RECORD_DIR = $delayedExit.RecordRoot
+    Assert-ThrowsLike {
+      Start-AkashaServices -InstallRoot $delayedExit.Root
+    } 'E_SERVICE_EXITED:*bridge*bridge-startup.log*' 'Delayed bridge exit escaped the startup stability window.' | Out-Null
+    Wait-FixtureRecords -RecordRoot $delayedExit.RecordRoot -Count 3 | Out-Null
+    Register-FixtureRecordPids -RecordRoot $delayedExit.RecordRoot
+    Assert-FixtureRecordProcessesDead -RecordRoot $delayedExit.RecordRoot -Message 'Delayed-exit rollback left a real process running.'
+    Assert-Equal (@(Get-StateRecords -Path $delayedExit.Paths.ProcessState).Count) 0 'Delayed-exit rollback left success state.'
   } finally {
     if ($null -eq $oldFixtureRecordDirectory) { Remove-Item Env:\FIXTURE_RECORD_DIR -ErrorAction SilentlyContinue } else { $env:FIXTURE_RECORD_DIR = $oldFixtureRecordDirectory }
   }

@@ -95,7 +95,9 @@
 
 ## 日志、安全与排障
 
-安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`，稳定身份映射、运行状态和联系人记忆迁移备份位于 `data\state`。联系人消息数据库与本机 DPAPI 密钥封装位于 AstrBot 的 `data\plugin_data\astrbot_plugin_akasha_contact_memory`。`bridge.log` 默认记录私聊联系人、群名与群成员，以及收到的完整正文和 Bot 尝试发送的完整正文；发送记录同时标注 `sent` 或 `failed`。令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
+安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`，稳定身份映射、运行状态和联系人记忆迁移备份位于 `data\state`。如果 Bridge 在完整日志初始化前退出，`data\logs\bridge-startup.log` 会记录一行经过凭据和本机路径脱敏的固定诊断；`启动.bat` 也会直接提示检查这两个日志。联系人消息数据库与本机 DPAPI 密钥封装位于 AstrBot 的 `data\plugin_data\astrbot_plugin_akasha_contact_memory`。`bridge.log` 默认记录私聊联系人、群名与群成员，以及收到的完整正文和 Bot 尝试发送的完整正文；发送记录同时标注 `sent` 或 `failed`。令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
+
+从 `0.3.2` 开始，启动器会在生命周期锁内核验 `data\state\bridge.pid`：已退出进程或 PID 已被复用时自动清理，确有存活 Bridge 时拒绝重复启动，身份无法核验时失败关闭。`停止.bat` 在 `processes.json` 丢失或为空时也会核验并停止属于本安装目录的孤儿 Bridge，不再需要手工删除 PID 文件。
 
 Web 控制面板会从 `bridge.log` 的结构化 `CHAT` 记录中显示最近的完整联系人名称、群名、群成员、收发方向、发送状态和完整正文；不会返回其他运行日志。面板及聊天接口只接受本机回环 Host，不提供跨域读取，并使用文本节点渲染聊天内容。面板内容与 `bridge.log` 同属本机高敏数据。
 
