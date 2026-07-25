@@ -266,6 +266,210 @@ class BridgeRuntimeTests(unittest.TestCase):
         return protocol
 
     @staticmethod
+    def _load_bridge_core(
+        module_name,
+        *,
+        state_module,
+        config_module,
+        requests_module,
+    ):
+        ob_protocol_module = types.ModuleType("ob_protocol")
+        ob_protocol_module.push_event = lambda _event: 1
+        ob_protocol_module.make_message_event = (
+            lambda message_type, user_id, message, **kwargs: {
+                "message_type": message_type,
+                "user_id": user_id,
+                "message": message,
+                **kwargs,
+            }
+        )
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            BRIDGE / "bridge_core.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "ob_protocol": ob_protocol_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(module)
+        return module
+
+    def test_inbound_video_uses_media_processing_thread(self):
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = ""
+        config_module.BUFFER_SECONDS = 5
+        requests_module = types.ModuleType("requests")
+        bridge_core = self._load_bridge_core(
+            "bridge_video_dispatch_test",
+            state_module=state_module,
+            config_module=config_module,
+            requests_module=requests_module,
+        )
+        created = []
+
+        class FakeThread:
+            def __init__(self, *, target, args, daemon):
+                created.append((target, args, daemon))
+
+            def start(self):
+                return None
+
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        with mock.patch.object(bridge_core.threading, "Thread", FakeThread):
+            bridge.add_to_buffer(
+                {
+                    "content": "[视频]",
+                    "sourceName": "private-contact",
+                    "sessionId": "wxid-contact",
+                    "sessionType": "private",
+                    "rawid": "video-server-id",
+                    "timestamp": 100,
+                }
+            )
+        self.assertEqual(1, len(created))
+        self.assertEqual("process_video_message", created[0][0].__name__)
+        self.assertEqual("video-server-id", created[0][1][0]["rawid"])
+        self.assertTrue(created[0][2])
+        self.assertEqual({}, bridge.pending_buffers)
+
+    def test_video_fetch_matches_server_id_and_caption_uses_video_url(self):
+        with tempfile.TemporaryDirectory(prefix="akasha-video-") as temp:
+            state_module = types.ModuleType("state")
+            state_module.group_reply_mode = "all"
+            config_module = types.ModuleType("config")
+            local_credential = "local-" + "weflow-" + "credential"
+            visual_credential = "visual-" + "api-" + "credential"
+            config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+            config_module.ACCESS_TOKEN = local_credential
+            config_module.ASTRBOT_ATTACHMENTS = temp
+            config_module.VIDEO_CAPTION_MAX_MIB = 6
+            config_module.IMAGE_CAPTION_PROVIDER = "openai"
+            config_module.IMAGE_CAPTION_API_KEY = visual_credential
+            config_module.IMAGE_CAPTION_API_BASE = (
+                "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            )
+            config_module.IMAGE_CAPTION_MODEL = "qwen3.7-plus"
+            config_module.VIDEO_CAPTION_PROMPT = "describe this video"
+
+            get_calls = []
+            post_calls = []
+
+            class FakeApiResponse:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return {
+                        "messages": [
+                            {
+                                "serverId": "wrong-id",
+                                "mediaType": "video",
+                                "mediaUrl": "/api/v1/media/wrong.mp4",
+                            },
+                            {
+                                "serverId": "target-id",
+                                "mediaType": "video",
+                                "mediaUrl": "/api/v1/media/target.mp4",
+                            },
+                        ]
+                    }
+
+            class FakeDownloadResponse:
+                status_code = 200
+                headers = {
+                    "Content-Type": "video/mp4",
+                    "Content-Length": "12",
+                }
+
+                @staticmethod
+                def iter_content(chunk_size):
+                    self.assertEqual(1024 * 1024, chunk_size)
+                    return iter((b"video-bytes",))
+
+                @staticmethod
+                def close():
+                    return None
+
+            class FakeCaptionResponse:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return {
+                        "choices": [
+                            {"message": {"content": "一个人在海边挥手"}}
+                        ]
+                    }
+
+            def fake_get(url, **kwargs):
+                get_calls.append((url, kwargs))
+                if url.endswith("/api/v1/messages"):
+                    return FakeApiResponse()
+                self.assertEqual(
+                    "http://127.0.0.1:5031/api/v1/media/target.mp4",
+                    url,
+                )
+                return FakeDownloadResponse()
+
+            def fake_post(url, **kwargs):
+                post_calls.append((url, kwargs))
+                return FakeCaptionResponse()
+
+            requests_module = types.ModuleType("requests")
+            requests_module.get = fake_get
+            requests_module.post = fake_post
+            requests_module.Timeout = TimeoutError
+            bridge_core = self._load_bridge_core(
+                "bridge_video_caption_test",
+                state_module=state_module,
+                config_module=config_module,
+                requests_module=requests_module,
+            )
+
+            video_path = bridge_core.WeFlowBridge(
+                sender=None
+            )._fetch_wechat_video(
+                {
+                    "sessionId": "wxid-contact",
+                    "rawid": "target-id",
+                    "timestamp": 100,
+                }
+            )
+            self.assertIsNotNone(video_path)
+            self.assertEqual(b"video-bytes", pathlib.Path(video_path).read_bytes())
+            self.assertEqual(
+                "Bearer " + local_credential,
+                get_calls[1][1]["headers"]["Authorization"],
+            )
+            self.assertNotIn(local_credential, get_calls[1][0])
+
+            caption = bridge_core.caption_video_via_openai(video_path)
+            self.assertEqual("一个人在海边挥手", caption)
+            payload = post_calls[0][1]["json"]
+            self.assertEqual("qwen3.7-plus", payload["model"])
+            video_item = payload["messages"][0]["content"][1]
+            self.assertEqual("video_url", video_item["type"])
+            self.assertEqual(2, video_item["fps"])
+            self.assertTrue(
+                video_item["video_url"]["url"].startswith(
+                    "data:video/mp4;base64,"
+                )
+            )
+            self.assertNotIn(
+                local_credential,
+                json.dumps(payload, ensure_ascii=False),
+            )
+
+    @staticmethod
     def _configure_verified_private_route(
         state_module,
         config_module,
@@ -325,6 +529,8 @@ class BridgeRuntimeTests(unittest.TestCase):
                 (BRIDGE / "config.example.json").read_text(encoding="utf-8")
             )
             template["access_token"] = "test-token"
+            template["web_port"] = "8766"
+            template["video_caption_max_mib"] = 50
             config_path.write_text(json.dumps(template), encoding="utf-8")
             environment = os.environ.copy()
             environment["AKASHABOT_CONFIG_PATH"] = str(config_path)
@@ -335,7 +541,10 @@ class BridgeRuntimeTests(unittest.TestCase):
                     sys.executable,
                     "-c",
                     "import config; print(config.CONFIG_FILE); "
-                    "print(config.BRIDGE_LOG_FILE)",
+                    "print(config.BRIDGE_LOG_FILE); "
+                    "print(type(config.WEB_PORT).__name__); "
+                    "print(config.WEB_PORT); "
+                    "print(config.VIDEO_CAPTION_MAX_MIB)",
                 ],
                 cwd=BRIDGE,
                 env=environment,
@@ -344,8 +553,9 @@ class BridgeRuntimeTests(unittest.TestCase):
                 check=True,
             )
             lines = result.stdout.strip().splitlines()
-            self.assertEqual(pathlib.Path(lines[-2]), config_path)
-            self.assertEqual(pathlib.Path(lines[-1]), log_dir / "bridge.log")
+            self.assertEqual(pathlib.Path(lines[-5]), config_path)
+            self.assertEqual(pathlib.Path(lines[-4]), log_dir / "bridge.log")
+            self.assertEqual(lines[-3:], ["int", "8766", "6"])
             self.assertTrue((log_dir / "bridge.log").is_file())
 
     def test_state_pid_path_is_derived_from_environment_directory(self):
@@ -390,6 +600,62 @@ class BridgeRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 pathlib.Path(namespace["PID_FILE"]), state_dir / "bridge.pid"
             )
+
+    def test_bridge_pid_record_rejects_pid_reuse_and_verifies_legacy_owner(self):
+        state_module = types.ModuleType("state")
+        config_module = types.ModuleType("config")
+        config_module.WEB_PORT = 8766
+        uia_module = types.ModuleType("uia_fixed_sender")
+        uia_module.UiaFixedSender = object
+        ob_client_module = types.ModuleType("ob_client")
+        ob_client_module._run_ob_client = lambda *_args: None
+        bridge_core_module = types.ModuleType("bridge_core")
+        bridge_core_module.WeFlowBridge = object
+        web_panel_module = types.ModuleType("web_panel")
+        web_panel_module.WebHandler = object
+        web_panel_module.PAGE = ""
+        requests_module = types.ModuleType("requests")
+
+        class FakeStatus:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "running": True,
+                    "ob_connected": False,
+                    "weflow_connected": False,
+                }
+
+        requests_module.get = lambda *_args, **_kwargs: FakeStatus()
+        spec = importlib.util.spec_from_file_location(
+            "bridge_pid_identity_test",
+            BRIDGE / "main.py",
+        )
+        main_module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "uia_fixed_sender": uia_module,
+                "ob_client": ob_client_module,
+                "bridge_core": bridge_core_module,
+                "web_panel": web_panel_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(main_module)
+
+        with mock.patch.object(
+            main_module,
+            "_process_start_token",
+            return_value=222,
+        ):
+            self.assertTrue(main_module._pid_record_is_live("123:222"))
+            self.assertFalse(main_module._pid_record_is_live("123:111"))
+        self.assertTrue(main_module._pid_record_is_live("123"))
+        self.assertFalse(main_module._pid_record_is_live("not-a-pid"))
 
     def test_web_panel_reads_complete_structured_chat_records(self):
         private_body = "第一行\n第二行 <script>不能执行</script> " + ("长正文" * 2048)
@@ -520,9 +786,10 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertNotIn("Access-Control-Allow-Origin", source)
         main_source = (BRIDGE / "main.py").read_text(encoding="utf-8")
         self.assertIn(
-            'HTTPServer(("127.0.0.1", config.WEB_PORT), WebHandler)',
+            '("127.0.0.1", int(config.WEB_PORT))',
             main_source,
         )
+        self.assertIn("allow_reuse_address = True", main_source)
 
     def test_web_panel_chat_history_rejects_nonlocal_requests_and_fixed_read_errors(
         self,
@@ -1121,6 +1388,7 @@ class BridgeRuntimeTests(unittest.TestCase):
                         access_key: original_access_value,
                         image_key: original_image_value,
                         "buffer_seconds": 5,
+                        "video_caption_max_mib": 50,
                         "uia_fixed_calibration": calibration,
                     }
                 ),
@@ -1146,6 +1414,10 @@ class BridgeRuntimeTests(unittest.TestCase):
                 get_response["data"]["uia_fixed_pre_send_delay"],
                 10.0,
             )
+            self.assertEqual(
+                get_response["data"]["video_caption_max_mib"],
+                6,
+            )
 
             post_response = self._invoke_web_handler(
                 panel,
@@ -1169,9 +1441,13 @@ class BridgeRuntimeTests(unittest.TestCase):
                 {
                     access_key: replacement_access_value,
                     image_key: replacement_image_value,
+                    "video_caption_max_mib": 4,
                 },
             )
             replaced = json.loads(config_path.read_text(encoding="utf-8"))
+            refreshed_response = self._invoke_web_handler(
+                panel, "do_GET", "/api/config"
+            )
 
         self.assertEqual(post_response, {"data": {"ok": True}, "code": 200})
         self.assertEqual(
@@ -1183,6 +1459,11 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual(saved[image_key], original_image_value)
         self.assertEqual(replaced[access_key], replacement_access_value)
         self.assertEqual(replaced[image_key], replacement_image_value)
+        self.assertEqual(replaced["video_caption_max_mib"], 4)
+        self.assertEqual(
+            refreshed_response["data"]["video_caption_max_mib"],
+            4,
+        )
         self.assertEqual(replaced["uia_fixed_calibration"], calibration)
 
     def test_task5_config_errors_return_fixed_codes_without_local_paths(self):

@@ -533,12 +533,14 @@ function renderConfigForm(cfg) {
       {key:'uia_fixed_pre_paste_preview_delay', label:'粘贴前预览(秒)', type:'number', ph:'1'},
       {key:'uia_fixed_pre_send_delay', label:'粘贴后发送前等待(秒)', type:'number', ph:'10'},
     ]},
-    {title:'图片描述', fields:[
+    {title:'图片与视频描述', fields:[
       {key:'image_caption_provider', label:'描述服务', type:'select', opts:[{v:'ollama',l:'Ollama 本地'},{v:'openai',l:'OpenAI 兼容'}]},
-      {key:'image_caption_model', label:'模型名', type:'text', ph:'kimi-k2.6 / llava:7b'},
+      {key:'image_caption_model', label:'模型名', type:'text', ph:'qwen3.7-plus / llava:7b'},
       {key:'image_caption_api_key', label:'API Key', type:'password', ph:'sk-xxx (OpenAI模式时)'},
-      {key:'image_caption_api_base', label:'API 地址', type:'text', ph:'https://api.moonshot.cn/v1'},
-      {key:'image_caption_prompt', label:'描述提示词', type:'textarea', ph:'请用中文描述...'},
+      {key:'image_caption_api_base', label:'API 地址', type:'text', ph:'https://dashscope.aliyuncs.com/compatible-mode/v1'},
+      {key:'image_caption_prompt', label:'图片提示词', type:'textarea', ph:'请用中文描述图片...'},
+      {key:'video_caption_prompt', label:'视频提示词', type:'textarea', ph:'请用中文描述视频...'},
+      {key:'video_caption_max_mib', label:'视频上限(MiB)', type:'number', ph:'6'},
     ]},
     {title:'Ollama（使用本地模式时）', fields:[
       {key:'ollama_base_url', label:'Ollama 地址', type:'text', ph:'http://127.0.0.1:61000'},
@@ -646,6 +648,24 @@ def _public_config(value: dict[str, object]) -> dict[str, object]:
         "uia_fixed_pre_send_delay",
         config.UIA_FIXED_PRE_SEND_DELAY,
     )
+    public.setdefault(
+        "video_caption_prompt",
+        getattr(
+            config,
+            "VIDEO_CAPTION_PROMPT",
+            "请用中文简洁描述这段视频发生了什么，包括关键人物、动作、场景和屏幕文字",
+        ),
+    )
+    raw_video_limit = public.get("video_caption_max_mib", 6)
+    try:
+        normalized_video_limit = (
+            6 if isinstance(raw_video_limit, bool) else int(raw_video_limit)
+        )
+    except (TypeError, ValueError):
+        normalized_video_limit = 6
+    if not 1 <= normalized_video_limit <= 6:
+        normalized_video_limit = 6
+    public["video_caption_max_mib"] = normalized_video_limit
     return public
 
 
@@ -674,6 +694,15 @@ def _merge_public_config(
             ):
                 raise ValueError("invalid UIA review delay")
             field_value = float(field_value)
+        if key == "video_caption_max_mib":
+            if (
+                isinstance(field_value, bool)
+                or not isinstance(field_value, (int, float))
+                or not float(field_value).is_integer()
+                or not 1 <= int(field_value) <= 6
+            ):
+                raise ValueError("invalid video caption size")
+            field_value = int(field_value)
         if key in _SECRET_CONFIG_KEYS:
             if not isinstance(field_value, str) or not field_value.strip():
                 continue

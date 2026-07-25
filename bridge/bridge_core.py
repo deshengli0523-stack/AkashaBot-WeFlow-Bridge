@@ -14,10 +14,12 @@ import logging
 import os
 import queue
 import re
+import tempfile
 import threading
 import time
 from collections import defaultdict
 from datetime import datetime
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -209,6 +211,13 @@ class WeFlowBridge:
             # 图片消息：下载 → ollama 描述 → 注入缓冲区
             threading.Thread(
                 target=self.process_image_message,
+                args=(data,),
+                daemon=True,
+            ).start()
+            return
+        if content == "[视频]":
+            threading.Thread(
+                target=self.process_video_message,
                 args=(data,),
                 daemon=True,
             ).start()
@@ -540,6 +549,265 @@ class WeFlowBridge:
             log.error("获取微信图片异常")
             return None
 
+    def _fetch_wechat_video(self, data: dict) -> str | None:
+        """按 SSE 原始消息 ID 从 WeFlow 精确导出并受限下载视频。"""
+
+        session_id = _text_value(data.get("sessionId"))
+        if not session_id:
+            return None
+        raw_id = _text_value(data.get("rawid"))
+        timestamp = _source_timestamp(data.get("timestamp"))
+        numeric_time = (
+            float(timestamp)
+            if isinstance(timestamp, (int, float))
+            else 0.0
+        )
+        delta = 2000 if numeric_time > 10_000_000_000 else 2
+        params = {
+            "access_token": config.ACCESS_TOKEN,
+            "talker": session_id,
+            "media": "true",
+            "image": "false",
+            "voice": "false",
+            "video": "true",
+            "emoji": "false",
+            "limit": 20,
+        }
+        if numeric_time:
+            params["start"] = numeric_time - delta
+            params["end"] = numeric_time + delta
+
+        part_path = ""
+        final_path = ""
+        download = None
+        try:
+            response = requests.get(
+                f"{config.WE_FLOW_BASE_URL}/api/v1/messages",
+                params=params,
+                headers={"Authorization": f"Bearer {config.ACCESS_TOKEN}"},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                log.warning("WeFlow 视频消息查询失败: status=%s", response.status_code)
+                return None
+            payload = response.json()
+            messages = (
+                payload
+                if isinstance(payload, list)
+                else payload.get("messages", payload.get("data", []))
+            )
+            if not isinstance(messages, list):
+                return None
+            video_rows = [
+                item
+                for item in messages
+                if isinstance(item, dict)
+                and item.get("mediaType") == "video"
+                and item.get("mediaUrl")
+            ]
+            selected = None
+            if raw_id:
+                selected = next(
+                    (
+                        item
+                        for item in video_rows
+                        if _text_value(item.get("serverId")) == raw_id
+                    ),
+                    None,
+                )
+            else:
+                timed = []
+                for item in video_rows:
+                    item_time = _source_timestamp(
+                        item.get("createTime") or item.get("timestamp")
+                    )
+                    if not isinstance(item_time, (int, float)):
+                        continue
+                    if numeric_time and abs(float(item_time) - numeric_time) > delta:
+                        continue
+                    if bool(item.get("isSend")):
+                        continue
+                    if _text_value(item.get("localType")) not in ("", "43"):
+                        continue
+                    timed.append(item)
+                if len(timed) == 1:
+                    selected = timed[0]
+            if selected is None:
+                log.warning("WeFlow 未返回可唯一匹配的视频媒体")
+                return None
+
+            media_url = _text_value(selected.get("mediaUrl"))
+            absolute_url = urljoin(
+                config.WE_FLOW_BASE_URL.rstrip("/") + "/",
+                media_url,
+            )
+            base_parts = urlsplit(config.WE_FLOW_BASE_URL)
+            media_parts = urlsplit(absolute_url)
+            if (
+                media_parts.scheme not in ("http", "https")
+                or media_parts.hostname != base_parts.hostname
+                or media_parts.port != base_parts.port
+            ):
+                log.warning("拒绝非 WeFlow 本地来源的视频 URL")
+                return None
+
+            download = requests.get(
+                absolute_url,
+                headers={"Authorization": f"Bearer {config.ACCESS_TOKEN}"},
+                stream=True,
+                timeout=(5, 60),
+            )
+            if download.status_code != 200:
+                log.warning("WeFlow 视频下载失败: status=%s", download.status_code)
+                return None
+            content_type = (
+                _text_value(download.headers.get("Content-Type"))
+                .split(";", 1)[0]
+                .lower()
+            )
+            if content_type not in ("video/mp4", "application/octet-stream"):
+                log.warning("拒绝非 MP4 视频响应")
+                return None
+            maximum = int(config.VIDEO_CAPTION_MAX_MIB) * 1024 * 1024
+            raw_length = _text_value(download.headers.get("Content-Length"))
+            if raw_length:
+                try:
+                    if int(raw_length) > maximum:
+                        log.warning("视频超过描述大小上限")
+                        return None
+                except ValueError:
+                    return None
+
+            save_root = config.ASTRBOT_ATTACHMENTS or tempfile.gettempdir()
+            save_dir = os.path.join(save_root, "wechat_videos")
+            os.makedirs(save_dir, exist_ok=True)
+            identity = "\0".join((session_id, raw_id, str(timestamp)))
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            final_path = os.path.join(save_dir, f"wechat_{digest}.mp4")
+            part_path = final_path + ".part"
+            total = 0
+            with open(part_path, "wb") as output:
+                for chunk in download.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > maximum:
+                        raise ValueError("video too large")
+                    output.write(chunk)
+            if total <= 0:
+                return None
+            os.replace(part_path, final_path)
+            part_path = ""
+            log.info("✅ 微信视频已临时下载: bytes=%d", total)
+            return final_path
+        except ValueError:
+            log.warning("视频超过描述大小上限或响应无效")
+            return None
+        except requests.Timeout:
+            log.warning("获取微信视频超时")
+            return None
+        except Exception:
+            log.warning("获取微信视频异常")
+            return None
+        finally:
+            if download is not None:
+                close = getattr(download, "close", None)
+                if callable(close):
+                    close()
+            if part_path:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+
+    def _enqueue_video_caption(self, data: dict, caption_text: str) -> None:
+        """把一条视频语义作为文本消息送入既有缓冲链。"""
+
+        session_id = _text_value(data.get("sessionId"))
+        source_name = _text_value(data.get("sourceName")) or "未知"
+        group_name = _text_value(data.get("groupName"))
+        is_group = (
+            data.get("sessionType", "") == "group"
+            or bool(group_name)
+            or "@chatroom" in session_id
+        )
+        talker_id = _text_value(data.get("talkerId")) or session_id
+        media_text = f"[视频: {caption_text}]"
+        with self.buffer_lock:
+            if is_group and state.group_reply_mode == "batch" and group_name:
+                base_name = re.sub(r"\s*\(\d+\)\s*$", "", group_name).strip()
+                buffer_key = f"__batch__{base_name}"
+                rendered = (
+                    f'成员"{source_name}"在群"{group_name}"中对你说：{media_text}'
+                )
+            else:
+                buffer_key = talker_id
+                rendered = media_text
+
+            if buffer_key in self.pending_buffers:
+                entry = self.pending_buffers[buffer_key]
+                entry["messages"].insert(0, rendered)
+                _insert_source_message_ref(entry, data, 0)
+                self._schedule_buffer_locked(buffer_key, 2)
+                return
+
+            self.pending_buffers[buffer_key] = {
+                "messages": [rendered],
+                "timer": None,
+                "timer_version": 0,
+                "processing": False,
+                "contact": group_name if is_group and group_name else source_name,
+                "is_group": is_group,
+                "source_name": source_name,
+                "session_id_data": session_id,
+                "group_name": group_name if is_group else "",
+                "sender_in_group": source_name if is_group else "",
+                "source_messages": [_source_message_ref(data, 1)],
+            }
+            timer_delay = 5 if is_group and state.group_reply_mode == "batch" else 2
+            timer = threading.Timer(
+                timer_delay,
+                lambda v=1, sid=buffer_key: self.process_sender(sid, v),
+            )
+            timer.daemon = True
+            timer.start()
+            self.pending_buffers[buffer_key]["timer"] = timer
+            self.pending_buffers[buffer_key]["timer_version"] = 1
+
+    def process_video_message(self, data: dict) -> None:
+        """从 WeFlow 取视频，经视觉模型转述后注入既有文本链。"""
+
+        if not self._active():
+            return
+        session_id = _text_value(data.get("sessionId"))
+        group_name = _text_value(data.get("groupName"))
+        is_group = (
+            data.get("sessionType", "") == "group"
+            or bool(group_name)
+            or "@chatroom" in session_id
+        )
+        if not is_group and not session_id:
+            log.warning("跳过缺少稳定 sessionId 的私聊视频消息")
+            return
+
+        video_path = self._fetch_wechat_video(data)
+        try:
+            caption = caption_video_via_openai(video_path) if video_path else None
+            caption_text = (
+                " ".join(caption.split())
+                if caption
+                else "（视频内容无法描述）"
+            )
+            if not self._active():
+                return
+            self._enqueue_video_caption(data, caption_text)
+        finally:
+            if video_path:
+                try:
+                    os.remove(video_path)
+                except OSError:
+                    pass
+
     def process_image_message(self, data):
         """处理图片消息：从 WeFlow 取图 → ollama 描述 → 注入缓冲区"""
         if not self._active():
@@ -571,7 +839,7 @@ class WeFlowBridge:
             if image_path:
                 caption = caption_image_via_ollama(image_path)
 
-            caption_text = caption if caption else None
+            caption_text = " ".join(caption.split()) if caption else None
             if caption_text:
                 log.info("📝 图片描述完成: characters=%d", len(caption_text))
             else:
@@ -714,4 +982,58 @@ def caption_image_via_ollama(image_path: str) -> str | None:
         log.warning(f"图片描述超时 (30s)")
     except Exception:
         log.warning("图片描述失败")
+    return None
+
+
+def caption_video_via_openai(video_path: str) -> str | None:
+    """用 OpenAI 兼容多模态接口将本地 MP4 转述为短文本。"""
+
+    if (
+        not video_path
+        or config.IMAGE_CAPTION_PROVIDER != "openai"
+        or not config.IMAGE_CAPTION_API_KEY
+    ):
+        log.warning("视频描述需要已配置的 OpenAI 兼容视觉服务")
+        return None
+    try:
+        import base64
+
+        with open(video_path, "rb") as video_file:
+            video_b64 = base64.b64encode(video_file.read()).decode("ascii")
+        response = requests.post(
+            f"{config.IMAGE_CAPTION_API_BASE.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config.IMAGE_CAPTION_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config.IMAGE_CAPTION_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": config.VIDEO_CAPTION_PROMPT},
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": f"data:video/mp4;base64,{video_b64}"
+                            },
+                            "fps": 2,
+                        },
+                    ],
+                }],
+                "max_tokens": 500,
+            },
+            timeout=(10, 180),
+        )
+        if response.status_code != 200:
+            log.warning("视频描述服务返回 HTTP %s", response.status_code)
+            return None
+        caption = response.json()["choices"][0]["message"]["content"].strip()
+        if caption:
+            log.info("🎬 视频描述完成: characters=%d", len(caption))
+            return caption
+    except requests.Timeout:
+        log.warning("视频描述超时")
+    except Exception:
+        log.warning("视频描述失败")
     return None

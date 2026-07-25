@@ -54,6 +54,17 @@ def _bounded_float(name: str, default: float, maximum: float) -> float:
     return value
 
 
+def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw_value = config.get(name, default)
+    if isinstance(raw_value, bool):
+        return default
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return value if minimum <= value <= maximum else default
+
+
 WE_FLOW_BASE_URL = config["weflow_base_url"]
 ACCESS_TOKEN = config["access_token"]
 ASTRBOT_ATTACHMENTS = config.get("astrbot_attachments", "")
@@ -67,7 +78,7 @@ UIA_FIXED_PRE_SEND_DELAY = _bounded_float(
     "uia_fixed_pre_send_delay", 10.0, 60.0
 )
 BUFFER_SECONDS = config.get("buffer_seconds", 5)
-WEB_PORT = config.get("web_port", 8766)
+WEB_PORT = _bounded_int("web_port", 8766, 1024, 65535)
 GROUP_REPLY_MODE = config.get("group_reply_mode", "mention")  # "mention" / "all"
 
 # AstrBot OneBot 连接配置（bridge 作为 WebSocket 客户端连 AstrBot 的 aiocqhttp 服务端）
@@ -79,6 +90,11 @@ IMAGE_CAPTION_MODEL = config.get("image_caption_model", "llava:7b")
 IMAGE_CAPTION_API_KEY = config.get("image_caption_api_key", "")
 IMAGE_CAPTION_API_BASE = config.get("image_caption_api_base", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 IMAGE_CAPTION_PROMPT = config.get("image_caption_prompt", "请用中文简短描述这张图片的内容")
+VIDEO_CAPTION_PROMPT = config.get(
+    "video_caption_prompt",
+    "请用中文简洁描述这段视频发生了什么，包括关键人物、动作、场景和屏幕文字",
+)
+VIDEO_CAPTION_MAX_MIB = _bounded_int("video_caption_max_mib", 6, 1, 6)
 
 # Ollama 图片描述配置（provider=ollama 时使用）
 OLLAMA_BASE_URL = config.get("ollama_base_url", "http://127.0.0.1:61000")

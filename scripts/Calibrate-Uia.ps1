@@ -47,8 +47,11 @@ function Read-AkashaBridgePid {
   }
   try {
     $value = (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop).Trim()
+    if ($value -notmatch '^(?<pid>[1-9][0-9]*)(?::[1-9][0-9]*)?$') {
+      throw 'invalid bridge pid'
+    }
     $processId = 0
-    if ($value -notmatch '^[1-9][0-9]*$' -or -not [int]::TryParse($value, [ref]$processId)) {
+    if (-not [int]::TryParse($Matches['pid'], [ref]$processId)) {
       throw 'invalid bridge pid'
     }
     return $processId

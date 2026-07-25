@@ -12,9 +12,9 @@ from typing import Any, TypeVar
 from .models import ContactRecord, MemoryMessage, QwenSessionRecord
 
 _T = TypeVar("_T")
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
-_SCHEMA_V5 = """
+_SCHEMA_V6 = """
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY,
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS messages (
     source_time REAL NOT NULL,
     direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
     content TEXT NOT NULL,
+    semantic_content TEXT,
     message_type TEXT NOT NULL DEFAULT 'text',
     content_hash TEXT NOT NULL,
     id_quality TEXT NOT NULL DEFAULT 'source',
@@ -90,12 +91,14 @@ CREATE TABLE IF NOT EXISTS qwen_items (
     created_at REAL NOT NULL,
     UNIQUE(session_id, item_id)
 );
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 COMMIT;
 """
 
-_MIGRATE_V1_TO_V5 = """
+_MIGRATE_V1_TO_V6 = """
 BEGIN IMMEDIATE;
+ALTER TABLE messages
+    ADD COLUMN semantic_content TEXT;
 ALTER TABLE contacts
     ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE contacts
@@ -109,12 +112,14 @@ ALTER TABLE qwen_sessions
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 COMMIT;
 """
 
-_MIGRATE_V2_TO_V5 = """
+_MIGRATE_V2_TO_V6 = """
 BEGIN IMMEDIATE;
+ALTER TABLE messages
+    ADD COLUMN semantic_content TEXT;
 ALTER TABLE contacts
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sync_state
@@ -126,12 +131,14 @@ ALTER TABLE qwen_sessions
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 COMMIT;
 """
 
-_MIGRATE_V3_TO_V5 = """
+_MIGRATE_V3_TO_V6 = """
 BEGIN IMMEDIATE;
+ALTER TABLE messages
+    ADD COLUMN semantic_content TEXT;
 ALTER TABLE contacts
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE qwen_sessions
@@ -141,18 +148,28 @@ ALTER TABLE qwen_sessions
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 COMMIT;
 """
 
-_MIGRATE_V4_TO_V5 = """
+_MIGRATE_V4_TO_V6 = """
 BEGIN IMMEDIATE;
+ALTER TABLE messages
+    ADD COLUMN semantic_content TEXT;
 ALTER TABLE contacts
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
+COMMIT;
+"""
+
+_MIGRATE_V5_TO_V6 = """
+BEGIN IMMEDIATE;
+ALTER TABLE messages
+    ADD COLUMN semantic_content TEXT;
+PRAGMA user_version = 6;
 COMMIT;
 """
 
@@ -199,6 +216,11 @@ def _message_from_row(row: sqlite3.Row) -> MemoryMessage:
         source_time=float(row["source_time"]),
         direction=str(row["direction"]),  # type: ignore[arg-type]
         content=str(row["content"]),
+        semantic_content=(
+            str(row["semantic_content"])
+            if row["semantic_content"] is not None
+            else None
+        ),
         message_type=str(row["message_type"]),
         id_quality=str(row["id_quality"]),
         origin=str(row["origin"]),
@@ -323,15 +345,17 @@ class MemoryStore:
                 finally:
                     backup.close()
             if current == 0:
-                connection.executescript(_SCHEMA_V5)
+                connection.executescript(_SCHEMA_V6)
             elif current == 1:
-                connection.executescript(_MIGRATE_V1_TO_V5)
+                connection.executescript(_MIGRATE_V1_TO_V6)
             elif current == 2:
-                connection.executescript(_MIGRATE_V2_TO_V5)
+                connection.executescript(_MIGRATE_V2_TO_V6)
             elif current == 3:
-                connection.executescript(_MIGRATE_V3_TO_V5)
+                connection.executescript(_MIGRATE_V3_TO_V6)
             elif current == 4:
-                connection.executescript(_MIGRATE_V4_TO_V5)
+                connection.executescript(_MIGRATE_V4_TO_V6)
+            elif current == 5:
+                connection.executescript(_MIGRATE_V5_TO_V6)
             else:
                 raise sqlite3.DatabaseError(
                     f"no migration path from memory schema {current}"
@@ -512,8 +536,8 @@ class MemoryStore:
                 existing = connection.execute(
                     """
                     SELECT
-                        id, source_time, direction, content, message_type,
-                        id_quality, origin, pending
+                        id, source_time, direction, content, semantic_content,
+                        message_type, id_quality, origin, pending
                     FROM messages
                     WHERE contact_id = ? AND source_uid = ?
                     """,
@@ -524,9 +548,44 @@ class MemoryStore:
                         str(existing["origin"]) == "weflow"
                         and message.origin != "weflow"
                     ):
-                        # Never downgrade an authoritative WeFlow record to a
-                        # provisional bridge/generated copy.
+                        semantic = (message.semantic_content or "").strip()
+                        if (
+                            semantic
+                            and not existing["semantic_content"]
+                            and MemoryMessage(
+                                source_uid=message.source_uid,
+                                source_time=message.source_time,
+                                direction=message.direction,
+                                content=str(existing["content"]),
+                                semantic_content=semantic,
+                            ).effective_content
+                            == semantic
+                        ):
+                            connection.execute(
+                                """
+                                UPDATE messages SET semantic_content = ?
+                                WHERE id = ?
+                                """,
+                                (semantic, int(existing["id"])),
+                            )
                         continue
+                    semantic_content = message.semantic_content
+                    if message.origin == "weflow" and semantic_content is None:
+                        candidate = (
+                            str(existing["semantic_content"])
+                            if existing["semantic_content"] is not None
+                            else None
+                        )
+                        if candidate:
+                            probe = MemoryMessage(
+                                source_uid=message.source_uid,
+                                source_time=message.source_time,
+                                direction=message.direction,
+                                content=message.content,
+                                semantic_content=candidate,
+                            )
+                            if probe.effective_content == candidate:
+                                semantic_content = candidate
                     authoritative_changed = (
                         message.origin == "weflow"
                         and str(existing["origin"]) == "weflow"
@@ -543,14 +602,16 @@ class MemoryStore:
                         """
                         UPDATE messages SET
                             source_time = ?, direction = ?, content = ?,
-                            message_type = ?, content_hash = ?, id_quality = ?,
-                            origin = ?, pending = ?
+                            semantic_content = ?, message_type = ?,
+                            content_hash = ?, id_quality = ?, origin = ?,
+                            pending = ?
                         WHERE id = ?
                         """,
                         (
                             message.source_time,
                             message.direction,
                             message.content,
+                            semantic_content,
                             message.message_type,
                             content_digest,
                             message.id_quality,
@@ -568,7 +629,7 @@ class MemoryStore:
                 if message.origin == "weflow":
                     pending = connection.execute(
                         """
-                        SELECT id, id_quality FROM messages
+                        SELECT id, id_quality, semantic_content FROM messages
                         WHERE contact_id = ?
                           AND direction = ?
                           AND pending = 1
@@ -596,7 +657,8 @@ class MemoryStore:
                             """
                             UPDATE messages SET
                                 source_uid = ?, source_time = ?, content = ?,
-                                message_type = ?, id_quality = ?,
+                                semantic_content = ?, message_type = ?,
+                                content_hash = ?, id_quality = ?,
                                 origin = 'weflow', pending = 0
                             WHERE id = ?
                             """,
@@ -604,7 +666,13 @@ class MemoryStore:
                                 message.source_uid,
                                 message.source_time,
                                 message.content,
+                                (
+                                    message.semantic_content
+                                    if message.semantic_content is not None
+                                    else pending["semantic_content"]
+                                ),
                                 message.message_type,
+                                content_digest,
                                 message.id_quality,
                                 int(pending["id"]),
                             ),
@@ -640,9 +708,9 @@ class MemoryStore:
                     """
                     INSERT OR IGNORE INTO messages(
                         contact_id, source_uid, source_time, direction,
-                        content, message_type, content_hash, id_quality,
-                        origin, pending, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        content, semantic_content, message_type, content_hash,
+                        id_quality, origin, pending, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         contact_id,
@@ -650,6 +718,7 @@ class MemoryStore:
                         message.source_time,
                         message.direction,
                         message.content,
+                        message.semantic_content,
                         message.message_type,
                         content_digest,
                         message.id_quality,
@@ -776,14 +845,19 @@ class MemoryStore:
         safe_limit = max(1, min(int(limit), 500))
 
         def operation(connection: sqlite3.Connection) -> list[MemoryMessage]:
-            clauses = " OR ".join("content LIKE ?" for _ in cleaned)
+            clauses = " OR ".join(
+                "(content LIKE ? OR semantic_content LIKE ?)"
+                for _ in cleaned
+            )
             params: list[Any] = [
                 contact_id,
                 float(before_source_time),
                 float(before_source_time),
                 before_source_uid,
             ]
-            params.extend(f"%{term}%" for term in cleaned)
+            for term in cleaned:
+                pattern = f"%{term}%"
+                params.extend((pattern, pattern))
             params.append(safe_limit)
             rows = connection.execute(
                 f"""

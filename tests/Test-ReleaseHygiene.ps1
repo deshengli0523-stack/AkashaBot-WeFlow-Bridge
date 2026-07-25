@@ -779,8 +779,8 @@ foreach ($file in $textFiles) {
 }
 
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
-if ($version -cne '0.3.0') {
-  throw "VERSION must be 0.3.0, found '$version'."
+if ($version -cne '0.3.1') {
+  throw "VERSION must be 0.3.1, found '$version'."
 }
 
 $template = Get-Content -LiteralPath (Join-Path $root 'bridge\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -801,6 +801,12 @@ $expectedImageCaptionPrompt = -join @(
 )
 if ([string]$template.image_caption_prompt -cne $expectedImageCaptionPrompt) {
   throw 'Bridge template image_caption_prompt must match the documented UTF-8 text.'
+}
+if ([int]$template.video_caption_max_mib -ne 6) {
+  throw 'Bridge template video_caption_max_mib must be 6.'
+}
+if ([string]::IsNullOrWhiteSpace([string]$template.video_caption_prompt)) {
+  throw 'Bridge template video_caption_prompt must not be empty.'
 }
 $calibration = $template.uia_fixed_calibration
 if ($calibration.completed -ne $false -or $null -ne $calibration.reference) {

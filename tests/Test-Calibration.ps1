@@ -394,12 +394,12 @@ try {
   Assert-Equal $recordedRunner.Calls 0 'Busy recorded service invoked calibration.'
 
   $bridgePid = New-CalibrationInstallFixture -BaseRoot $fixtureRoot -Name 'bridge-pid' -WithLifecycleDirectories
-  [System.IO.File]::WriteAllText((Join-Path $bridgePid.Paths.State 'bridge.pid'), '54321', (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText((Join-Path $bridgePid.Paths.State 'bridge.pid'), '54321:987654321', (New-Object System.Text.UTF8Encoding($false)))
   $bridgeIdentity = [pscustomobject]@{ Pid = 54321; ExecutablePath = $bridgePid.Paths.BridgePython; CommandLine = 'python.exe main.py'; StartTimeUtc = [datetime]::UtcNow }
   $bridgeReader = { param([int]$ProcessId) return $bridgeIdentity }.GetNewClosure()
   Assert-ThrowsExact {
     Invoke-AkashaUiaCalibration -InstallRoot $bridgePid.Root -ProcessReader $bridgeReader -Runner (New-TestRunner -State (New-RunnerState -ExitCode 0))
-  } 'E_UIA_CALIBRATION_BUSY' 'Verified BridgeMain pid did not block calibration.'
+  } 'E_UIA_CALIBRATION_BUSY' 'Verified tokenized BridgeMain pid did not block calibration.'
 
   $unknownBridgeIdentity = [pscustomobject]@{ Pid = 54321; ExecutablePath = $bridgePid.Paths.BridgePython; CommandLine = ''; StartTimeUtc = [datetime]::UtcNow }
   $unknownBridgeReader = { param([int]$ProcessId) return $unknownBridgeIdentity }.GetNewClosure()

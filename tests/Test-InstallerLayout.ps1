@@ -875,10 +875,16 @@ exit 0
   $psi.CreateNoWindow = $true
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
-  $psi.EnvironmentVariables['LOCALAPPDATA'] = $directDefaultLocal
   $directProcess = New-Object System.Diagnostics.Process
   $directProcess.StartInfo = $psi
-  Assert-True $directProcess.Start() 'Direct bound-root installer process did not start.'
+  $originalLocalAppData = $env:LOCALAPPDATA
+  try {
+    $env:LOCALAPPDATA = $directDefaultLocal
+    $directStarted = $directProcess.Start()
+  } finally {
+    $env:LOCALAPPDATA = $originalLocalAppData
+  }
+  Assert-True $directStarted 'Direct bound-root installer process did not start.'
   $directOutput = $directProcess.StandardOutput.ReadToEnd() + $directProcess.StandardError.ReadToEnd()
   Assert-True $directProcess.WaitForExit(15000) 'Direct bound-root installer process timed out.'
   Assert-Equal $directProcess.ExitCode 1 'Direct bound-root failure did not map to stable exit code 1.'

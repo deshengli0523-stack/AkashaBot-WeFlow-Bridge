@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 - 2026-07-25
+
+- Preserve image and video descriptions in a dedicated SQLite semantic field while retaining WeFlow's authoritative raw media marker, so Qwen session rebuilds no longer lose visual context.
+- Add inbound WeChat video understanding through the configured OpenAI-compatible visual provider. Video export is matched to the exact WeFlow `serverId`, downloaded only from the configured local WeFlow origin with Bearer authentication, limited to 6 MiB for Base64 API compatibility, and deleted after transcription.
+- Keep failed media descriptions as ordinary media markers instead of durable semantic memory, and use enriched media text consistently for token estimates, relevant-history retrieval, and rebuilt Qwen context.
+- Upgrade existing contact-memory databases in place from schema 5 to schema 6 without changing confirmed message rows or copying API credentials.
+- Prevent stale `bridge.pid` files from blocking startup after Windows reuses a PID by binding ownership to the process creation time; legacy PID-only records are verified through the bridge status endpoint before reuse.
+- Normalize legacy string-valued Web panel ports, allow safe loopback socket reuse, and retry a temporarily unavailable port before emitting the fixed `E_BRIDGE_WEB_BIND` diagnostic.
+
+### Automated verification
+
+- Media confirmation, pre-existing authoritative rows, schema migration, rebuilt context, exact video matching, local credential boundaries, and Qwen `video_url` request construction are covered by focused tests.
+- The unified Windows release gate continues to verify installer preservation, lifecycle readiness, plugin deployment, privacy allowlists, and the complete Python suite.
+
 ## 0.3.0 - 2026-07-24
 
 - Add an installer-managed AstrBot 4.26.6 plugin that permanently archives private WeChat history in local SQLite and isolates memory by the stable `(WeChat account, sessionId)` identity rather than nickname.
