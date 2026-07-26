@@ -194,7 +194,6 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
                 ("copy_text", "private-body"),
-                ("verify_contact", "private-contact", 101),
                 ("hotkey_ctrl", 0x56),
                 ("verify_contact", "private-contact", 101),
                 ("click", "send_button", 101),
@@ -373,12 +372,27 @@ class UiaFixedSenderTests(unittest.TestCase):
                 event
                 for event in self.driver.events
                 if event[0] == "verify_contact"
-                or event[:2] == ("click", "message_input")
+                or (
+                    event[0] == "click"
+                    and event[1] in {
+                        "search_box",
+                        "first_result",
+                        "message_input",
+                    }
+                )
             ],
             [
+                ("click", "search_box", 101),
+                ("click", "first_result", 101),
                 ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("verify_contact", "private-contact", 101),
+                ("verify_contact", "private-contact", 101),
+                ("click", "search_box", 101),
+                ("click", "first_result", 101),
+                ("verify_contact", "private-contact", 101),
+                ("verify_contact", "private-contact", 101),
+                ("click", "message_input", 101),
             ],
         )
 
@@ -785,6 +799,83 @@ class UiaFixedSenderTests(unittest.TestCase):
 
         self.assertEqual(exercise(), "")
         self.assertEqual(exercise("user-owned"), "user-owned")
+
+    def test_text_clipboard_remains_available_for_delayed_target_read(self):
+        clipboard_value = {"value": ""}
+        delayed_reads = []
+        paste_injected = {"value": False}
+        clipboard = types.ModuleType("pyperclip")
+        clipboard.copy = lambda value: clipboard_value.__setitem__(
+            "value", value
+        )
+        clipboard.paste = lambda: clipboard_value["value"]
+
+        class DelayedReadDriver(FakeDriver):
+            def hotkey_ctrl(self, virtual_key):
+                super().hotkey_ctrl(virtual_key)
+                if virtual_key == sender_module.VK_V:
+                    paste_injected["value"] = True
+
+        driver = DelayedReadDriver()
+
+        def deterministic_sleep(seconds):
+            self.sleep_calls.append(seconds)
+            if paste_injected["value"] and seconds >= 0.50:
+                delayed_reads.append(clipboard_value["value"])
+                paste_injected["value"] = False
+
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=driver,
+            sleep_fn=deterministic_sleep,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+        )
+
+        with mock.patch.dict(sys.modules, {"pyperclip": clipboard}):
+            self.assertTrue(sender._paste_text("delayed-body"))
+
+        self.assertEqual(delayed_reads, ["delayed-body"])
+        self.assertEqual(clipboard_value["value"], "")
+        self.assertIn(0.50, self.sleep_calls)
+
+    def test_cancel_after_body_copy_prevents_body_paste_and_send(self):
+        sender = self._sender()
+        clipboard_value = {"value": ""}
+        clipboard = types.ModuleType("pyperclip")
+
+        def copy_text(value):
+            clipboard_value["value"] = value
+            self.driver.events.append(("copy_text", value))
+            if value == "private-body":
+                cancel_event = sender_module.state.current_send_cancel_event
+                self.assertIsNotNone(cancel_event)
+                cancel_event.set()
+
+        clipboard.copy = copy_text
+        clipboard.paste = lambda: clipboard_value["value"]
+
+        with mock.patch.object(
+            sender_module,
+            "validate_runtime_metrics",
+            side_effect=self._runtime_validation,
+        ), mock.patch.dict(sys.modules, {"pyperclip": clipboard}):
+            sent = sender.send_text("private-contact", "private-body")
+
+        self.assertFalse(sent)
+        self.assertEqual(
+            sum(
+                event == ("hotkey_ctrl", sender_module.VK_V)
+                for event in self.driver.events
+            ),
+            1,
+        )
+        self.assertFalse(
+            any(
+                event[:2] == ("click", "send_button")
+                for event in self.driver.events
+            )
+        )
 
     def test_cancel_while_paused_drops_only_current_fifo_item(self):
         sender = sender_module.UiaFixedSender(

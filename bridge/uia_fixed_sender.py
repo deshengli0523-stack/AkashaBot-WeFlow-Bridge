@@ -102,7 +102,7 @@ class UiaFixedSender:
             if before_paste is not None and before_paste() is not True:
                 return False
             self.driver.hotkey_ctrl(VK_V)
-            self._pause(0.05)
+            self._pause(0.50)
             return True
         finally:
             try:
@@ -227,10 +227,6 @@ class UiaFixedSender:
                 if not self._wait_until_resumed(cancel_event):
                     return False
                 def before_text_paste() -> bool:
-                    self.contact_selector.verify_selected_contact(
-                        hwnd,
-                        contact,
-                    )
                     return bool(
                         self._send_active(cancel_event)
                         and not state.paused.is_set()
