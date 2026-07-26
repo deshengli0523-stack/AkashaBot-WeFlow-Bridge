@@ -127,11 +127,12 @@ class UiaFixedSender:
         self._pause(0.05)
         self._paste_text(contact)
         self._pause(0.45)
-        self.contact_selector.select_contact(
+        self.driver.click_calibrated_search_result(
             hwnd,
-            self.calibration["points"]["search_box"],
-            contact,
+            self.calibration["points"]["first_result"],
         )
+        self._pause(0.45)
+        self.contact_selector.verify_selected_contact(hwnd, contact)
 
     def _focus_and_clear_input(self, hwnd: int) -> None:
         self._click(hwnd, "message_input")

@@ -97,15 +97,22 @@ class QwenSessionManager:
     ) -> QwenSessionRecord:
         system_tokens = estimate_tokens(system_prompt) + (8 if system_prompt else 0)
         for attempt in range(3):
-            memory_revision = await self.store.contact_memory_revision(contact.id)
-            bundle = await self.context_builder.build(
-                contact.id,
-                current_prompt=current_prompt,
-                exclude_source_uids=exclude_source_uids,
-                token_budget=max(
+            memory_revision, recent_message_limit = (
+                await self.store.contact_seed_state(contact.id)
+            )
+            build_options = {
+                "current_prompt": current_prompt,
+                "exclude_source_uids": exclude_source_uids,
+                "token_budget": max(
                     1000,
                     self.context_builder.seed_max_tokens - system_tokens,
                 ),
+            }
+            if recent_message_limit:
+                build_options["recent_message_limit"] = recent_message_limit
+            bundle = await self.context_builder.build(
+                contact.id,
+                **build_options,
             )
             seed_items: list[dict[str, str]] = []
             if system_prompt.strip():

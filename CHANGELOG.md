@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.6 - 2026-07-26
+
+- Use the calibrated first search result for uniquely designed contact remarks,
+  then retain the exact chat-title verification before body input and final
+  submission.
+- Exclude the Windows title bar from the chat-title OCR capture and upscale the
+  remaining title row two times, preventing a visible correct contact title
+  from being rejected as empty OCR output.
+- After an actual send failure, persist a one-shot rebuild limit of the most
+  recent 20 messages. The limited rebuild excludes summaries and older semantic
+  retrieval, and returns to the normal policy after the replacement session is
+  successfully activated.
+
+### Automated and live verification
+
+- The unified Windows release gate passes all PowerShell suites and 192 Python
+  tests.
+- A real private-chat reply rebuilt from 21 seed items and sent two independent
+  FIFO segments successfully, with no UIA error or failed outbound item.
+
 ## 0.3.5 - 2026-07-26
 
 - Select the exact OCR-matched contact/result instead of clicking the calibrated

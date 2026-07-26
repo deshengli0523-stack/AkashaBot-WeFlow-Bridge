@@ -23,8 +23,10 @@ _CONTACTS_SECTION = "".join(chr(value) for value in (0x8054, 0x7CFB, 0x4EBA))
 _FEATURES_SECTION = "".join(chr(value) for value in (0x529F, 0x80FD))
 _TITLE_LEFT_RATIO = 0.18
 _TITLE_RIGHT_RATIO = 0.55
+_TITLE_TOP_RATIO = 0.035
 _TITLE_HEIGHT_RATIO = 0.09
 _TITLE_MIN_HEIGHT = 96
+_TITLE_CAPTURE_SCALE = 2
 
 
 class OcrContactSelector:
@@ -43,6 +45,7 @@ class OcrContactSelector:
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
         self.subprocess_run = subprocess_run
+        self._uses_default_capture = capture_fn is None
         self.capture_fn = capture_fn or self._capture_png_bytes
         self.selection_timeout = max(1.0, float(selection_timeout))
         self.script_path = Path(
@@ -67,8 +70,8 @@ class OcrContactSelector:
         raise CalibrationError(CONTACT_SELECTION_FAILED)
 
     @staticmethod
-    def _capture_png_bytes(rect: ScreenRect) -> bytes:
-        from PIL import ImageGrab
+    def _capture_png_bytes(rect: ScreenRect, *, scale: int = 1) -> bytes:
+        from PIL import Image, ImageGrab
 
         buffer = io.BytesIO()
         try:
@@ -77,6 +80,13 @@ class OcrContactSelector:
                 all_screens=True,
             )
             try:
+                if scale > 1:
+                    resized = image.resize(
+                        (image.width * scale, image.height * scale),
+                        Image.Resampling.LANCZOS,
+                    )
+                    image.close()
+                    image = resized
                 image.save(buffer, format="PNG")
             finally:
                 image.close()
@@ -101,7 +111,13 @@ class OcrContactSelector:
         ):
             self._fail()
         try:
-            image_bytes = self.capture_fn(rect)
+            if mode == "title" and self._uses_default_capture:
+                image_bytes = self._capture_png_bytes(
+                    rect,
+                    scale=_TITLE_CAPTURE_SCALE,
+                )
+            else:
+                image_bytes = self.capture_fn(rect)
         except Exception:
             self._fail()
         if (
@@ -211,7 +227,7 @@ class OcrContactSelector:
         metrics = self.driver.get_client_metrics(main_hwnd)
         header = ScreenRect(
             metrics.left + round(metrics.width * _TITLE_LEFT_RATIO),
-            metrics.top,
+            metrics.top + round(metrics.height * _TITLE_TOP_RATIO),
             metrics.left + round(metrics.width * _TITLE_RIGHT_RATIO),
             metrics.top
             + max(

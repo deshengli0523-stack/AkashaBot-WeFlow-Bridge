@@ -12,9 +12,10 @@ from typing import Any, TypeVar
 from .models import ContactRecord, MemoryMessage, QwenSessionRecord
 
 _T = TypeVar("_T")
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
+SEND_FAILURE_REBUILD_MESSAGE_LIMIT = 20
 
-_SCHEMA_V6 = """
+_SCHEMA_V7 = """
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY,
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     routing_name TEXT NOT NULL DEFAULT '',
     aliases_json TEXT NOT NULL DEFAULT '[]',
     memory_revision INTEGER NOT NULL DEFAULT 0,
+    next_seed_recent_limit INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     tombstoned_at REAL
@@ -91,11 +93,11 @@ CREATE TABLE IF NOT EXISTS qwen_items (
     created_at REAL NOT NULL,
     UNIQUE(session_id, item_id)
 );
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 COMMIT;
 """
 
-_MIGRATE_V1_TO_V6 = """
+_MIGRATE_V1_TO_V7 = """
 BEGIN IMMEDIATE;
 ALTER TABLE messages
     ADD COLUMN semantic_content TEXT;
@@ -103,6 +105,8 @@ ALTER TABLE contacts
     ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE contacts
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE contacts
+    ADD COLUMN next_seed_recent_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sync_state
     ADD COLUMN backfill_end_time REAL NOT NULL DEFAULT 0;
 ALTER TABLE qwen_sessions
@@ -112,16 +116,18 @@ ALTER TABLE qwen_sessions
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 COMMIT;
 """
 
-_MIGRATE_V2_TO_V6 = """
+_MIGRATE_V2_TO_V7 = """
 BEGIN IMMEDIATE;
 ALTER TABLE messages
     ADD COLUMN semantic_content TEXT;
 ALTER TABLE contacts
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE contacts
+    ADD COLUMN next_seed_recent_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sync_state
     ADD COLUMN backfill_end_time REAL NOT NULL DEFAULT 0;
 ALTER TABLE qwen_sessions
@@ -131,16 +137,18 @@ ALTER TABLE qwen_sessions
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 COMMIT;
 """
 
-_MIGRATE_V3_TO_V6 = """
+_MIGRATE_V3_TO_V7 = """
 BEGIN IMMEDIATE;
 ALTER TABLE messages
     ADD COLUMN semantic_content TEXT;
 ALTER TABLE contacts
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE contacts
+    ADD COLUMN next_seed_recent_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE qwen_sessions
     ADD COLUMN pending_owner TEXT NOT NULL DEFAULT '';
 ALTER TABLE qwen_sessions
@@ -148,28 +156,40 @@ ALTER TABLE qwen_sessions
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 COMMIT;
 """
 
-_MIGRATE_V4_TO_V6 = """
+_MIGRATE_V4_TO_V7 = """
 BEGIN IMMEDIATE;
 ALTER TABLE messages
     ADD COLUMN semantic_content TEXT;
 ALTER TABLE contacts
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE contacts
+    ADD COLUMN next_seed_recent_limit INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE qwen_sessions
     ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0;
 UPDATE qwen_sessions SET dirty = 1;
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 COMMIT;
 """
 
-_MIGRATE_V5_TO_V6 = """
+_MIGRATE_V5_TO_V7 = """
 BEGIN IMMEDIATE;
 ALTER TABLE messages
     ADD COLUMN semantic_content TEXT;
-PRAGMA user_version = 6;
+ALTER TABLE contacts
+    ADD COLUMN next_seed_recent_limit INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version = 7;
+COMMIT;
+"""
+
+_MIGRATE_V6_TO_V7 = """
+BEGIN IMMEDIATE;
+ALTER TABLE contacts
+    ADD COLUMN next_seed_recent_limit INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version = 7;
 COMMIT;
 """
 
@@ -345,17 +365,19 @@ class MemoryStore:
                 finally:
                     backup.close()
             if current == 0:
-                connection.executescript(_SCHEMA_V6)
+                connection.executescript(_SCHEMA_V7)
             elif current == 1:
-                connection.executescript(_MIGRATE_V1_TO_V6)
+                connection.executescript(_MIGRATE_V1_TO_V7)
             elif current == 2:
-                connection.executescript(_MIGRATE_V2_TO_V6)
+                connection.executescript(_MIGRATE_V2_TO_V7)
             elif current == 3:
-                connection.executescript(_MIGRATE_V3_TO_V6)
+                connection.executescript(_MIGRATE_V3_TO_V7)
             elif current == 4:
-                connection.executescript(_MIGRATE_V4_TO_V6)
+                connection.executescript(_MIGRATE_V4_TO_V7)
             elif current == 5:
-                connection.executescript(_MIGRATE_V5_TO_V6)
+                connection.executescript(_MIGRATE_V5_TO_V7)
+            elif current == 6:
+                connection.executescript(_MIGRATE_V6_TO_V7)
             else:
                 raise sqlite3.DatabaseError(
                     f"no migration path from memory schema {current}"
@@ -489,10 +511,14 @@ class MemoryStore:
         return await self._read(operation)
 
     async def contact_memory_revision(self, contact_id: int) -> int:
-        def operation(connection: sqlite3.Connection) -> int:
+        revision, _ = await self.contact_seed_state(contact_id)
+        return revision
+
+    async def contact_seed_state(self, contact_id: int) -> tuple[int, int]:
+        def operation(connection: sqlite3.Connection) -> tuple[int, int]:
             row = connection.execute(
                 """
-                SELECT tombstoned_at, memory_revision
+                SELECT tombstoned_at, memory_revision, next_seed_recent_limit
                 FROM contacts
                 WHERE id = ?
                 """,
@@ -500,7 +526,10 @@ class MemoryStore:
             ).fetchone()
             if row is None or row["tombstoned_at"] is not None:
                 raise RuntimeError("contact memory is tombstoned")
-            return int(row["memory_revision"])
+            return (
+                int(row["memory_revision"]),
+                max(0, int(row["next_seed_recent_limit"])),
+            )
 
         return await self._read(operation)
 
@@ -1290,6 +1319,19 @@ class MemoryStore:
                 raise MemoryRevisionChanged(
                     "contact history changed while seeding Qwen session"
                 )
+            connection.execute(
+                """
+                UPDATE contacts
+                SET next_seed_recent_limit = 0
+                WHERE id = (
+                    SELECT contact_id
+                    FROM qwen_sessions
+                    WHERE id = ?
+                )
+                  AND memory_revision = ?
+                """,
+                (session_id, int(expected_memory_revision)),
+            )
             row = connection.execute(
                 "SELECT * FROM qwen_sessions WHERE id = ?",
                 (session_id,),
@@ -1419,10 +1461,11 @@ class MemoryStore:
             connection.execute(
                 """
                 UPDATE contacts
-                SET memory_revision = memory_revision + 1
+                SET memory_revision = memory_revision + 1,
+                    next_seed_recent_limit = ?
                 WHERE id = ?
                 """,
-                (contact_id,),
+                (SEND_FAILURE_REBUILD_MESSAGE_LIMIT, contact_id),
             )
             return max(cursor.rowcount, 0)
 
