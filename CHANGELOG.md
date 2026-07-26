@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.7 - 2026-07-26
+
+- Remove every Windows OCR invocation from the fixed WeChat send path. Text
+  and image sends now use the calibrated first search result directly without
+  running contact-title OCR before input or final submission.
+- Keep the existing global FIFO, one-second pre-paste preview, cancellable
+  three-to-five-second post-paste review, clipboard retention, foreground
+  checks, and calibrated four-point clicks unchanged.
+- When a pasted text item is cancelled, search the configured contact again
+  before clearing its draft, without restoring any OCR dependency.
+
+### Automated and live verification
+
+- All PowerShell release suites and 189 Python tests pass.
+- Real private-chat text paste completed without OCR or UIA errors, and WeFlow
+  confirmed the resulting outbound record with `isSend=1`.
+- Two consecutive two-segment replies completed in strict order with separate
+  seven-to-nine-second UI sends; the contact replied afterward, confirming
+  delivery.
+
 ## 0.3.6 - 2026-07-26
 
 - Use the calibrated first search result for uniquely designed contact remarks,

@@ -7,7 +7,6 @@ import threading
 import time
 
 import state
-from uia_contact_selector import OcrContactSelector
 from uia_support import (
     CALIBRATION_WINDOW,
     CalibrationError,
@@ -55,7 +54,6 @@ class UiaFixedSender:
         self,
         calibration,
         driver=None,
-        contact_selector=None,
         sleep_fn=time.sleep,
         monotonic_fn=time.monotonic,
         pre_paste_preview_delay: float = 1.0,
@@ -65,11 +63,6 @@ class UiaFixedSender:
         self.driver = driver or Win32WeChatDriver()
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
-        self.contact_selector = contact_selector or OcrContactSelector(
-            self.driver,
-            sleep_fn=sleep_fn,
-            monotonic_fn=monotonic_fn,
-        )
         self.pre_paste_preview_delay = max(0.0, float(pre_paste_preview_delay))
         self.pre_send_delay = max(0.0, float(pre_send_delay))
         self._lock = _SHARED_SEND_LOCK
@@ -132,7 +125,6 @@ class UiaFixedSender:
             self.calibration["points"]["first_result"],
         )
         self._pause(0.45)
-        self.contact_selector.verify_selected_contact(hwnd, contact)
 
     def _focus_and_clear_input(self, hwnd: int) -> None:
         self._click(hwnd, "message_input")
@@ -148,7 +140,6 @@ class UiaFixedSender:
     def _send_button_when_foreground(
         self,
         hwnd: int,
-        contact: str,
         lifecycle_event: threading.Event,
     ) -> bool:
         """Keep the FIFO head until a transient foreground loss recovers."""
@@ -177,7 +168,6 @@ class UiaFixedSender:
                 self._pause(0.05)
             if not self._send_active(lifecycle_event):
                 return False
-            self.contact_selector.verify_selected_contact(hwnd, contact)
         return False
 
     def _send_active(self, cancel_event: threading.Event) -> bool:
@@ -230,11 +220,7 @@ class UiaFixedSender:
 
     def _discard_pasted_text(self, hwnd: int, contact: str) -> None:
         try:
-            try:
-                self.contact_selector.verify_selected_contact(hwnd, contact)
-            except Exception:
-                self._select_contact(hwnd, contact)
-            self.contact_selector.verify_selected_contact(hwnd, contact)
+            self._select_contact(hwnd, contact)
             self._focus_and_clear_input(hwnd)
         except Exception:
             log.warning("[UIA_FIXED] cancelled text could not be cleared")
@@ -291,12 +277,10 @@ class UiaFixedSender:
                     return False
                 if not self._wait_until_resumed(cancel_event):
                     return False
-                self.contact_selector.verify_selected_contact(hwnd, contact)
                 if not state.try_commit_send(cancel_event):
                     return False
                 if not self._send_button_when_foreground(
                     hwnd,
-                    contact,
                     cancel_event,
                 ):
                     return False
@@ -334,7 +318,6 @@ class UiaFixedSender:
                 self._pause(0.20)
                 if not self._wait_until_resumed(lifecycle_event):
                     return False
-                self.contact_selector.verify_selected_contact(hwnd, contact)
                 if (
                     not self._send_active(lifecycle_event)
                     or state.paused.is_set()
@@ -349,7 +332,6 @@ class UiaFixedSender:
                     "pasted_waiting",
                 ):
                     return False
-                self.contact_selector.verify_selected_contact(hwnd, contact)
                 if (
                     not self._send_active(lifecycle_event)
                     or state.paused.is_set()
@@ -357,7 +339,6 @@ class UiaFixedSender:
                     return False
                 if not self._send_button_when_foreground(
                     hwnd,
-                    contact,
                     lifecycle_event,
                 ):
                     return False
