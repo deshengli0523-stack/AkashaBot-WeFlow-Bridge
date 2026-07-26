@@ -211,10 +211,10 @@ jobs:
     }
   }
 
-  Assert-AkashaContains -Text $changelog -Expected '## 0.3.4 - 2026-07-26' -Context 'CHANGELOG.md'
+  Assert-AkashaContains -Text $changelog -Expected '## 0.3.5 - 2026-07-26' -Context 'CHANGELOG.md'
   $version = (Read-AkashaUtf8Strict -Path (Join-Path $root 'VERSION')).Trim()
-  if ($version -cne '0.3.4') {
-    throw "Documentation/layout gate: VERSION must be 0.3.4, found '$version'."
+  if ($version -cne '0.3.5') {
+    throw "Documentation/layout gate: VERSION must be 0.3.5, found '$version'."
   }
 
   foreach ($relativeLink in @('INSTALL.md', 'SECURITY.md')) {

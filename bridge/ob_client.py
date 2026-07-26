@@ -68,15 +68,16 @@ async def _ob_client_main(generation):
                             break
                 ka_task = asyncio.create_task(_keepalive())
                 try:
-                    # 持续接收 API 请求（异步处理，不阻塞）
+                    # 按 WebSocket 到达顺序逐条处理。每个发送请求必须
+                    # 完成全部 UIA 段后，下一个请求才可触碰微信窗口。
                     async for raw in ws:
                         if not state.is_generation_running(generation):
                             break
                         try:
                             data = json.loads(raw)
-                            # 用 create_task 异步处理，不阻塞消息循环
-                            asyncio.create_task(
-                                _handle_ob_api(data, generation=generation)
+                            await _handle_ob_api(
+                                data,
+                                generation=generation,
                             )
                         except json.JSONDecodeError:
                             log.warning(f"[OB11] 收到无效 JSON")

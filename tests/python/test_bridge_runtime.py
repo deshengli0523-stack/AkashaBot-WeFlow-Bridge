@@ -984,7 +984,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         config_module.BRIDGE_LOG_FILE = str(log_path)
         config_module.UIA_FIXED_CALIBRATION = calibration
         config_module.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = 1.0
-        config_module.UIA_FIXED_PRE_SEND_DELAY = 10.0
+        config_module.UIA_FIXED_PRE_SEND_DELAY = 5.0
         config_module.WEB_PORT = 8766
 
         spec = importlib.util.spec_from_file_location(
@@ -1059,7 +1059,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         config_module = types.ModuleType("config")
         config_module.UIA_FIXED_CALIBRATION = {}
         config_module.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = 1.0
-        config_module.UIA_FIXED_PRE_SEND_DELAY = 10.0
+        config_module.UIA_FIXED_PRE_SEND_DELAY = 5.0
         config_module.ACCESS_TOKEN = "fixture"
         config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
         config_module.WEB_PORT = 8766
@@ -1265,7 +1265,7 @@ class BridgeRuntimeTests(unittest.TestCase):
             },
         )
         self.assertEqual(template.get("uia_fixed_pre_paste_preview_delay"), 1.0)
-        self.assertEqual(template.get("uia_fixed_pre_send_delay"), 10.0)
+        self.assertEqual(template.get("uia_fixed_pre_send_delay"), 5.0)
         legacy_keys = {
             "send_method",
             "weflow_send_api",
@@ -1476,7 +1476,7 @@ class BridgeRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(
                 get_response["data"]["uia_fixed_pre_send_delay"],
-                10.0,
+                5.0,
             )
             self.assertEqual(
                 get_response["data"]["video_caption_max_mib"],
@@ -1630,6 +1630,28 @@ class BridgeRuntimeTests(unittest.TestCase):
         for name in TASK4_REMOVED_SOURCE_FILES:
             with self.subTest(file=name):
                 self.assertFalse((BRIDGE / name).exists())
+
+    def test_ob_client_awaits_api_requests_in_websocket_arrival_order(self):
+        source = (BRIDGE / "ob_client.py").read_text(encoding="utf-8")
+        tree = ast.parse(source, filename="ob_client.py")
+        awaited_handlers = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and _call_name(node.value.func) == "_handle_ob_api"
+        ]
+        detached_handlers = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and _call_name(node.func) == "create_task"
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and _call_name(node.args[0].func) == "_handle_ob_api"
+        ]
+        self.assertEqual(len(awaited_handlers), 1)
+        self.assertEqual(detached_handlers, [])
 
     def test_task4_dependencies_keep_only_supported_sender_runtime_packages(self):
         expected_requirements = {

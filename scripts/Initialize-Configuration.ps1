@@ -642,6 +642,7 @@ function Initialize-AkashaConfiguration {
         Set-JsonProperty -Object $bridge -Name 'bot_wxid' -Value ''
         Set-JsonProperty -Object $bridge -Name 'weflow_base_url' -Value 'http://127.0.0.1:5031'
         Set-JsonProperty -Object $bridge -Name 'astrbot_ob_url' -Value 'ws://127.0.0.1:11229/ws'
+        Set-JsonProperty -Object $bridge -Name 'uia_fixed_pre_send_delay' -Value 5.0
       } else {
         Assert-AkashaConfigurationTargetPath -Paths $Paths -Snapshot $pathSnapshot -Candidate $Paths.BridgeConfig
         $bridge = Read-AkashaConfigurationJson -Path $Paths.BridgeConfig
@@ -653,6 +654,17 @@ function Initialize-AkashaConfiguration {
         $token = if ($null -eq $tokenProperty) { '' } else { [string]$tokenProperty.Value }
         if ($token -cnotmatch '^[0-9a-f]{64}$') {
           throw 'E_BRIDGE_TOKEN: Existing bridge token is missing or invalid.'
+        }
+        $preSendDelayProperty = $bridge.PSObject.Properties['uia_fixed_pre_send_delay']
+        $preSendDelayIsLegacyDefault = (
+          $null -ne $preSendDelayProperty -and
+          $null -ne $preSendDelayProperty.Value -and
+          $preSendDelayProperty.Value -is [System.ValueType] -and
+          $preSendDelayProperty.Value -isnot [bool] -and
+          [double]$preSendDelayProperty.Value -eq 10.0
+        )
+        if ($null -eq $preSendDelayProperty -or $preSendDelayIsLegacyDefault) {
+          Set-JsonProperty -Object $bridge -Name 'uia_fixed_pre_send_delay' -Value 5.0
         }
         if ($null -eq $bridge.PSObject.Properties['uia_fixed_calibration']) {
           Set-JsonProperty -Object $bridge -Name 'uia_fixed_calibration' -Value $calibrationTemplateProperty.Value
