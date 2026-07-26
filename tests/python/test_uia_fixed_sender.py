@@ -172,7 +172,23 @@ class UiaFixedSenderTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, CALIBRATION_INVALID)
 
-    def test_text_send_uses_preflight_then_exact_fixed_four_point_sequence(self):
+    def test_default_post_paste_delay_range_is_three_to_five_seconds(self):
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            sleep_fn=self.sleep_calls.append,
+        )
+
+        self.assertEqual(sender.pre_send_delay, 5.0)
+        with mock.patch.object(
+            sender_module.random,
+            "uniform",
+            return_value=4.25,
+        ) as uniform:
+            self.assertEqual(sender._next_pre_send_delay(), 4.25)
+        uniform.assert_called_once_with(3.0, 5.0)
+
+    def test_text_send_uses_exact_ocr_contact_selection(self):
         sender = self._sender()
 
         sent = self._send_text(sender)
@@ -188,8 +204,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("click", "first_result", 101),
-                ("verify_contact", "private-contact", 101),
+                ("select_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
@@ -201,8 +216,8 @@ class UiaFixedSenderTests(unittest.TestCase):
         )
         self.assertTrue(self.sleep_calls, "fake sleep boundary was not exercised")
 
-    def test_image_send_uses_same_four_points_and_pastes_at_message_input(self):
-        sender = self._sender()
+    def test_image_send_uses_exact_ocr_contact_selection(self):
+        sender = self._sender(pre_send_delay=5)
         with tempfile.TemporaryDirectory() as temporary:
             image_path = str(pathlib.Path(temporary) / "private-image-path.png")
             pathlib.Path(image_path).write_bytes(b"fake-driver-does-not-open-this")
@@ -213,10 +228,22 @@ class UiaFixedSenderTests(unittest.TestCase):
                 side_effect=self._runtime_validation,
             ), self._clipboard_boundary(
                 lambda value: self.driver.events.append(("copy_text", value))
-            ):
+            ), mock.patch.object(
+                sender,
+                "_wait_for_review",
+                return_value=True,
+            ) as review, mock.patch.object(
+                sender_module.random,
+                "uniform",
+                return_value=4.0,
+            ) as uniform:
                 sent = sender.send_image("private-contact", image_path)
 
         self.assertIs(sent, True)
+        self.assertEqual(review.call_count, 1)
+        self.assertEqual(review.call_args.args[0], 4)
+        self.assertEqual(review.call_args.args[2], "pasted_waiting")
+        uniform.assert_called_once_with(3.0, 5.0)
         self.assertEqual(
             self.driver.events,
             [
@@ -227,8 +254,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("click", "first_result", 101),
-                ("verify_contact", "private-contact", 101),
+                ("select_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
@@ -238,6 +264,57 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("verify_contact", "private-contact", 101),
                 ("click", "send_button", 101),
             ],
+        )
+
+    def test_transient_foreground_loss_at_submit_retains_queue_head(self):
+        class InterruptedDriver(FakeDriver):
+            def __init__(self):
+                super().__init__()
+                self.submit_interrupted = False
+                self.recovery_checks = 0
+
+            def click_ratio(self, hwnd, point):
+                name = self._point_names[(point["x"], point["y"])]
+                if name == "send_button" and not self.submit_interrupted:
+                    self.events.append(("click_blocked", name, hwnd))
+                    self.submit_interrupted = True
+                    self.metrics = valid_metrics(foreground=False)
+                    raise CalibrationError(CALIBRATION_WINDOW)
+                super().click_ratio(hwnd, point)
+
+            def get_client_metrics(self, hwnd):
+                self.events.append(("get_metrics", hwnd))
+                if self.submit_interrupted:
+                    self.recovery_checks += 1
+                    if self.recovery_checks >= 2:
+                        self.metrics = valid_metrics(foreground=True)
+                return self.metrics
+
+        driver = InterruptedDriver()
+        self.driver = driver
+        sender = self._sender(driver)
+
+        with self.assertLogs("weflow-bridge", logging.WARNING) as captured:
+            sent = self._send_text(sender)
+
+        self.assertIs(sent, True, driver.events)
+        self.assertEqual(
+            captured.output,
+            [
+                "WARNING:weflow-bridge:[UIA_FIXED] foreground lost "
+                "before submit; queue head retained"
+            ],
+        )
+        self.assertLess(
+            driver.events.index(("click_blocked", "send_button", 101)),
+            driver.events.index(("click", "send_button", 101)),
+        )
+        self.assertEqual(
+            sum(
+                event == ("copy_text", "private-body")
+                for event in driver.events
+            ),
+            1,
         )
 
     def test_invalid_window_state_or_size_never_reaches_mouse_actions(self):
@@ -294,6 +371,9 @@ class UiaFixedSenderTests(unittest.TestCase):
 
     def test_selected_contact_verification_failure_never_focuses_input_or_clicks_send(self):
         class RejectingSelector:
+            def select_contact(self, _hwnd, _search_point, _contact):
+                raise CalibrationError(CONTACT_SELECTION_FAILED)
+
             def verify_selected_contact(self, _hwnd, _contact):
                 raise CalibrationError(CONTACT_SELECTION_FAILED)
 
@@ -340,7 +420,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                 self_driver.events.append(
                     ("verify_contact", contact, hwnd)
                 )
-                if self.verify_calls in {2, 3}:
+                if self.verify_calls in {1, 2}:
                     raise CalibrationError(CONTACT_SELECTION_FAILED)
 
         self_driver = self.driver
@@ -372,25 +452,23 @@ class UiaFixedSenderTests(unittest.TestCase):
                 event
                 for event in self.driver.events
                 if event[0] == "verify_contact"
+                or event[0] == "select_contact"
                 or (
                     event[0] == "click"
                     and event[1] in {
                         "search_box",
-                        "first_result",
                         "message_input",
                     }
                 )
             ],
             [
                 ("click", "search_box", 101),
-                ("click", "first_result", 101),
-                ("verify_contact", "private-contact", 101),
+                ("select_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("verify_contact", "private-contact", 101),
                 ("verify_contact", "private-contact", 101),
                 ("click", "search_box", 101),
-                ("click", "first_result", 101),
-                ("verify_contact", "private-contact", 101),
+                ("select_contact", "private-contact", 101),
                 ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
             ],
@@ -405,7 +483,7 @@ class UiaFixedSenderTests(unittest.TestCase):
             def verify_selected_contact(self, hwnd, contact):
                 super().verify_selected_contact(hwnd, contact)
                 self.verify_calls += 1
-                if self.verify_calls == 2:
+                if self.verify_calls == 1:
                     sender_module.state.paused.set()
 
         sender = sender_module.UiaFixedSender(
@@ -461,7 +539,7 @@ class UiaFixedSenderTests(unittest.TestCase):
         )
         self.assertEqual(self.driver.events, [])
 
-    def test_each_sender_instance_serializes_complete_send_actions(self):
+    def test_all_sender_instances_share_one_complete_send_queue(self):
         first_entered = threading.Event()
         release_first = threading.Event()
         second_attempted = threading.Event()
@@ -481,7 +559,8 @@ class UiaFixedSenderTests(unittest.TestCase):
 
         driver = BlockingDriver()
         self.driver = driver
-        sender = self._sender(driver)
+        first_sender = self._sender(driver)
+        second_sender = self._sender(driver)
 
         results = []
         failures = []
@@ -497,11 +576,11 @@ class UiaFixedSenderTests(unittest.TestCase):
 
             def run_second():
                 second_attempted.set()
-                run(lambda: sender.send_image("second", image_path))
+                run(lambda: second_sender.send_image("second", image_path))
 
             first = threading.Thread(
                 target=run,
-                args=(lambda: sender.send_text("first", "one"),),
+                args=(lambda: first_sender.send_text("first", "one"),),
             )
             second = threading.Thread(
                 target=run_second,
@@ -520,7 +599,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                     second.join(0.05)
                     self.assertTrue(
                         second.is_alive(),
-                        "image send completed while text send held the instance lock",
+                        "image send completed while text send held the global queue",
                     )
                     self.assertEqual(driver.find_calls, 1)
                 finally:
@@ -533,6 +612,14 @@ class UiaFixedSenderTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(results, [True, True])
         self.assertEqual(driver.find_calls, 2)
+        self.assertEqual(
+            [
+                event[1]
+                for event in driver.events
+                if event[0] == "select_contact"
+            ],
+            ["first", "second"],
+        )
 
     def test_preview_is_visible_before_ui_and_stale_cancel_cannot_hit_next(self):
         sender = sender_module.UiaFixedSender(

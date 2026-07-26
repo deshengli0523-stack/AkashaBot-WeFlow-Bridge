@@ -2,12 +2,14 @@
 
 import logging
 import os
+import random
 import threading
 import time
 
 import state
 from uia_contact_selector import OcrContactSelector
 from uia_support import (
+    CALIBRATION_WINDOW,
     CalibrationError,
     Win32WeChatDriver,
     validate_calibration,
@@ -57,7 +59,7 @@ class UiaFixedSender:
         sleep_fn=time.sleep,
         monotonic_fn=time.monotonic,
         pre_paste_preview_delay: float = 1.0,
-        pre_send_delay: float = 10.0,
+        pre_send_delay: float = 5.0,
     ):
         self.calibration = validate_calibration(calibration)
         self.driver = driver or Win32WeChatDriver()
@@ -72,6 +74,14 @@ class UiaFixedSender:
         self.pre_send_delay = max(0.0, float(pre_send_delay))
         self._lock = _SHARED_SEND_LOCK
         self._stopped = threading.Event()
+
+    def _next_pre_send_delay(self) -> float:
+        """Sample a two-second review range ending at the configured maximum."""
+        maximum = self.pre_send_delay
+        if maximum < 3.0:
+            return maximum
+        minimum = maximum - 2.0
+        return random.uniform(minimum, maximum)
 
     def stop_pending(self) -> None:
         """Prevent this sender generation from resuming after a later restart."""
@@ -117,12 +127,11 @@ class UiaFixedSender:
         self._pause(0.05)
         self._paste_text(contact)
         self._pause(0.45)
-        self.driver.click_calibrated_search_result(
+        self.contact_selector.select_contact(
             hwnd,
-            self.calibration["points"]["first_result"],
+            self.calibration["points"]["search_box"],
+            contact,
         )
-        self._pause(0.75)
-        self.contact_selector.verify_selected_contact(hwnd, contact)
 
     def _focus_and_clear_input(self, hwnd: int) -> None:
         self._click(hwnd, "message_input")
@@ -134,6 +143,41 @@ class UiaFixedSender:
     def _send_button(self, hwnd: int) -> None:
         self._click(hwnd, "send_button")
         self._pause(0.20)
+
+    def _send_button_when_foreground(
+        self,
+        hwnd: int,
+        contact: str,
+        lifecycle_event: threading.Event,
+    ) -> bool:
+        """Keep the FIFO head until a transient foreground loss recovers."""
+        while self._send_active(lifecycle_event):
+            try:
+                self._send_button(hwnd)
+                return True
+            except CalibrationError as caught:
+                if caught.code != CALIBRATION_WINDOW:
+                    raise
+                log.warning(
+                    "[UIA_FIXED] foreground lost before submit; "
+                    "queue head retained"
+                )
+            while self._send_active(lifecycle_event):
+                metrics = self.driver.get_client_metrics(hwnd)
+                if (
+                    not metrics.visible
+                    or not metrics.maximized
+                    or metrics.width < 800
+                    or metrics.height < 600
+                ):
+                    raise CalibrationError(CALIBRATION_WINDOW)
+                if metrics.foreground:
+                    break
+                self._pause(0.05)
+            if not self._send_active(lifecycle_event):
+                return False
+            self.contact_selector.verify_selected_contact(hwnd, contact)
+        return False
 
     def _send_active(self, cancel_event: threading.Event) -> bool:
         return bool(
@@ -239,7 +283,7 @@ class UiaFixedSender:
                     return False
                 pasted = True
                 if not self._wait_for_review(
-                    self.pre_send_delay,
+                    self._next_pre_send_delay(),
                     cancel_event,
                     "pasted_waiting",
                 ):
@@ -249,8 +293,13 @@ class UiaFixedSender:
                 self.contact_selector.verify_selected_contact(hwnd, contact)
                 if not state.try_commit_send(cancel_event):
                     return False
+                if not self._send_button_when_foreground(
+                    hwnd,
+                    contact,
+                    cancel_event,
+                ):
+                    return False
                 committed = True
-                self._send_button(hwnd)
                 return True
             except Exception as caught:
                 self._log_failure(caught)
@@ -293,7 +342,11 @@ class UiaFixedSender:
                 self.driver.hotkey_ctrl(VK_V)
                 self._pause(0.50)
                 pasted = True
-                if not self._wait_until_resumed(lifecycle_event):
+                if not self._wait_for_review(
+                    self._next_pre_send_delay(),
+                    lifecycle_event,
+                    "pasted_waiting",
+                ):
                     return False
                 self.contact_selector.verify_selected_contact(hwnd, contact)
                 if (
@@ -301,8 +354,13 @@ class UiaFixedSender:
                     or state.paused.is_set()
                 ):
                     return False
+                if not self._send_button_when_foreground(
+                    hwnd,
+                    contact,
+                    lifecycle_event,
+                ):
+                    return False
                 committed = True
-                self._send_button(hwnd)
                 return True
             except Exception as caught:
                 self._log_failure(caught)

@@ -75,7 +75,7 @@ UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = _bounded_float(
     "uia_fixed_pre_paste_preview_delay", 1.0, 10.0
 )
 UIA_FIXED_PRE_SEND_DELAY = _bounded_float(
-    "uia_fixed_pre_send_delay", 10.0, 60.0
+    "uia_fixed_pre_send_delay", 5.0, 60.0
 )
 BUFFER_SECONDS = config.get("buffer_seconds", 5)
 WEB_PORT = _bounded_int("web_port", 8766, 1024, 65535)

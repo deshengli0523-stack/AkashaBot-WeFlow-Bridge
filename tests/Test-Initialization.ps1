@@ -1084,6 +1084,7 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   $existingBridgeBefore = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
   $existingCalibration = New-CompletedCalibrationFixture
   Set-JsonProperty -Object $existingBridgeBefore -Name 'uia_fixed_calibration' -Value $existingCalibration
+  Set-JsonProperty -Object $existingBridgeBefore -Name 'uia_fixed_pre_send_delay' -Value 10.0
   Set-JsonProperty -Object $existingBridgeBefore -Name 'unknown_nonlegacy_field' -Value 'preserve-me'
   Write-JsonAtomic -Path $existing.Paths.BridgeConfig -Value $existingBridgeBefore
   $existingCalibrationJson = $existingCalibration | ConvertTo-Json -Depth 10 -Compress
@@ -1093,10 +1094,16 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal $existingState.Calls 0 'Existing AstrBot invoked the initializer.'
   $existingBridgeAfter = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-True ([string]$existingBridgeAfter.access_token -ceq $existingToken) 'Existing valid bridge token changed.'
+  Assert-Equal ([double]$existingBridgeAfter.uia_fixed_pre_send_delay) 5.0 'Existing bridge post-paste delay maximum was not migrated to five seconds.'
   Assert-Equal ([string]$existingBridgeAfter.unknown_nonlegacy_field) 'preserve-me' 'Existing unknown non-legacy bridge field was lost.'
   Assert-Equal ($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress) $existingCalibrationJson 'Existing schema 1 calibration was not preserved exactly.'
   $existingCalibrationBytesAfter = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress)))
   Assert-Equal $existingCalibrationBytesAfter $existingCalibrationBytes 'Existing schema 1 calibration was not byte-equivalent after update.'
+  Set-JsonProperty -Object $existingBridgeAfter -Name 'uia_fixed_pre_send_delay' -Value 25.0
+  Write-JsonAtomic -Path $existing.Paths.BridgeConfig -Value $existingBridgeAfter
+  Initialize-AkashaConfiguration -Paths $existing.Paths -WeFlowConfigPath $existing.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer $existingState)
+  $existingBridgeCustomDelay = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-Equal ([double]$existingBridgeCustomDelay.uia_fixed_pre_send_delay) 25.0 'Existing custom bridge pre-send delay was not preserved.'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $existing.Paths.AstrBotData 'FIRST_LOGIN.txt'))) 'Existing AstrBot received a new FIRST_LOGIN.txt.'
   $existingAstr = Get-Content -LiteralPath (Join-Path $existing.Paths.AstrBotData 'data\cmd_config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-Equal ([string]$existingAstr.preserve_fixture) 'astr-keep' 'Existing AstrBot root field was lost.'

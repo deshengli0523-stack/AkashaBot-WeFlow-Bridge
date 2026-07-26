@@ -531,7 +531,7 @@ function renderConfigForm(cfg) {
       {key:'group_reply_mode', label:'群聊回复模式', type:'select', opts:[{v:'mention',l:'仅@回复'},{v:'all',l:'全部回复'},{v:'batch',l:'批处理'}]},
       {key:'web_port', label:'Web 面板端口', type:'number', ph:'8766'},
       {key:'uia_fixed_pre_paste_preview_delay', label:'粘贴前预览(秒)', type:'number', ph:'1'},
-      {key:'uia_fixed_pre_send_delay', label:'粘贴后发送前等待(秒)', type:'number', ph:'10'},
+      {key:'uia_fixed_pre_send_delay', label:'随机发送等待上限(秒，下限少2秒)', type:'number', ph:'5'},
     ]},
     {title:'图片与视频描述', fields:[
       {key:'image_caption_provider', label:'描述服务', type:'select', opts:[{v:'ollama',l:'Ollama 本地'},{v:'openai',l:'OpenAI 兼容'}]},

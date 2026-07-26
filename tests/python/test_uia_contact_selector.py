@@ -178,8 +178,28 @@ exit 0
             ["search", "search", "title"],
         )
         self.assertEqual(
+            [call[2] for call in selector.ocr_calls[:2]],
+            ["联系人", "联系人"],
+        )
+        self.assertEqual(
             selector.ocr_calls[-1][3],
             ScreenRect(461, 0, 1408, 123),
+        )
+
+    def test_file_transfer_helper_is_selected_from_features_section(self):
+        driver = FakeDriver()
+        selector = SequencedSelector(driver, [(200, 200), (201, 201)])
+
+        selector.select_contact(10, SEARCH_POINT, "文件传输助手")
+
+        self.assertIn(("click_popup", 10, 20, (271, 296)), driver.calls)
+        self.assertEqual(
+            [call[0] for call in selector.ocr_calls],
+            ["search", "search", "title"],
+        )
+        self.assertEqual(
+            [call[2] for call in selector.ocr_calls[:2]],
+            ["功能", "功能"],
         )
 
     def test_moving_async_results_are_not_clicked_until_stable(self):

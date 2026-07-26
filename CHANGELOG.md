@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.5 - 2026-07-26
+
+- Select the exact OCR-matched contact/result instead of clicking the calibrated
+  fixed first-result coordinate. This prevents WeChat's similarly placed chat
+  history result from opening a modal and aborting the body-paste stage.
+- Keep the existing per-segment FIFO and cancellable review behavior unchanged:
+  text and image items across all contacts share one strict queue, and each
+  successful paste waits a newly sampled three to five seconds before its own
+  send action.
+- If another window briefly takes the foreground at the final submit boundary,
+  retain the current FIFO head and send it after WeChat returns instead of
+  dropping it and advancing to the next item.
+
+### Automated verification
+
+- Text and image sends use the exact OCR contact selector.
+- Consecutive segments and different-contact sends remain serialized and
+  receive their own three-to-five-second post-paste delay.
+- A transient foreground loss at the send-button boundary cannot skip the
+  current queue item.
+
 ## 0.3.4 - 2026-07-26
 
 - Remove the redundant contact-title OCR check between focusing the message input and injecting `Ctrl+V`; the selected contact is still verified immediately after selection and again before final submission.
