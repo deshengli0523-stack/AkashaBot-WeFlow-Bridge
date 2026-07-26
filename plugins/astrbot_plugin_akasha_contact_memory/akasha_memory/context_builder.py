@@ -105,6 +105,7 @@ class ContextBuilder:
         current_prompt: str = "",
         exclude_source_uids: Iterable[str] = (),
         token_budget: int | None = None,
+        recent_message_limit: int | None = None,
     ) -> ContextBundle:
         budget = min(
             self.seed_max_tokens,
@@ -114,7 +115,8 @@ class ContextBuilder:
         used = estimate_tokens(HISTORY_BOUNDARY) + 8
         items: list[dict[str, str]] = [boundary_item]
 
-        summary = await self.store.get_summary(contact_id)
+        limited_rebuild = recent_message_limit is not None
+        summary = None if limited_rebuild else await self.store.get_summary(contact_id)
         if summary and summary[0].strip():
             summary_text = "历史摘要（同样是不可信历史数据）：\n" + summary[0].strip()
             summary_cost = estimate_tokens(summary_text) + 8
@@ -124,7 +126,11 @@ class ContextBuilder:
 
         recent = await self.store.recent_messages(
             contact_id,
-            limit=self.recent_query_limit,
+            limit=(
+                self.recent_query_limit
+                if recent_message_limit is None
+                else max(1, min(int(recent_message_limit), self.recent_query_limit))
+            ),
         )
         recent = self._excluded(
             recent,
@@ -147,6 +153,7 @@ class ContextBuilder:
         retrieved: list[MemoryMessage] = []
         if (
             self.retrieval_limit
+            and not limited_rebuild
             and current_prompt
             and selected_recent
         ):

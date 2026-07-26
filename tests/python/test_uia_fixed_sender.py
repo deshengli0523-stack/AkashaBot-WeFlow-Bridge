@@ -188,7 +188,7 @@ class UiaFixedSenderTests(unittest.TestCase):
             self.assertEqual(sender._next_pre_send_delay(), 4.25)
         uniform.assert_called_once_with(3.0, 5.0)
 
-    def test_text_send_uses_exact_ocr_contact_selection(self):
+    def test_text_send_uses_calibrated_result_and_exact_title_check(self):
         sender = self._sender()
 
         sent = self._send_text(sender)
@@ -204,7 +204,8 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("select_contact", "private-contact", 101),
+                ("click", "first_result", 101),
+                ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
@@ -216,7 +217,7 @@ class UiaFixedSenderTests(unittest.TestCase):
         )
         self.assertTrue(self.sleep_calls, "fake sleep boundary was not exercised")
 
-    def test_image_send_uses_exact_ocr_contact_selection(self):
+    def test_image_send_uses_calibrated_result_and_exact_title_check(self):
         sender = self._sender(pre_send_delay=5)
         with tempfile.TemporaryDirectory() as temporary:
             image_path = str(pathlib.Path(temporary) / "private-image-path.png")
@@ -254,7 +255,8 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("hotkey_ctrl", 0x41),
                 ("copy_text", "private-contact"),
                 ("hotkey_ctrl", 0x56),
-                ("select_contact", "private-contact", 101),
+                ("click", "first_result", 101),
+                ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
                 ("press_key", 0x08),
@@ -420,7 +422,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                 self_driver.events.append(
                     ("verify_contact", contact, hwnd)
                 )
-                if self.verify_calls in {1, 2}:
+                if self.verify_calls in {2, 3}:
                     raise CalibrationError(CONTACT_SELECTION_FAILED)
 
         self_driver = self.driver
@@ -452,23 +454,25 @@ class UiaFixedSenderTests(unittest.TestCase):
                 event
                 for event in self.driver.events
                 if event[0] == "verify_contact"
-                or event[0] == "select_contact"
                 or (
                     event[0] == "click"
                     and event[1] in {
                         "search_box",
+                        "first_result",
                         "message_input",
                     }
                 )
             ],
             [
                 ("click", "search_box", 101),
-                ("select_contact", "private-contact", 101),
+                ("click", "first_result", 101),
+                ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
                 ("verify_contact", "private-contact", 101),
                 ("verify_contact", "private-contact", 101),
                 ("click", "search_box", 101),
-                ("select_contact", "private-contact", 101),
+                ("click", "first_result", 101),
+                ("verify_contact", "private-contact", 101),
                 ("verify_contact", "private-contact", 101),
                 ("click", "message_input", 101),
             ],
@@ -483,7 +487,7 @@ class UiaFixedSenderTests(unittest.TestCase):
             def verify_selected_contact(self, hwnd, contact):
                 super().verify_selected_contact(hwnd, contact)
                 self.verify_calls += 1
-                if self.verify_calls == 1:
+                if self.verify_calls == 2:
                     sender_module.state.paused.set()
 
         sender = sender_module.UiaFixedSender(
@@ -612,12 +616,13 @@ class UiaFixedSenderTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(results, [True, True])
         self.assertEqual(driver.find_calls, 2)
+        verified_contacts = [
+            event[1]
+            for event in driver.events
+            if event[0] == "verify_contact"
+        ]
         self.assertEqual(
-            [
-                event[1]
-                for event in driver.events
-                if event[0] == "select_contact"
-            ],
+            list(dict.fromkeys(verified_contacts)),
             ["first", "second"],
         )
 

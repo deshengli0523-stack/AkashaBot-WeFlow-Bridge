@@ -283,6 +283,9 @@ class ContactMemoryTests(unittest.TestCase):
                         "ALTER TABLE contacts DROP COLUMN memory_revision"
                     )
                     connection.execute(
+                        "ALTER TABLE contacts DROP COLUMN next_seed_recent_limit"
+                    )
+                    connection.execute(
                         "ALTER TABLE qwen_sessions DROP COLUMN memory_revision"
                     )
                     connection.execute(
@@ -319,8 +322,9 @@ class ContactMemoryTests(unittest.TestCase):
                     }
                 finally:
                     connection.close()
-                self.assertEqual(6, version)
+                self.assertEqual(7, version)
                 self.assertIn("memory_revision", contact_columns)
+                self.assertIn("next_seed_recent_limit", contact_columns)
                 self.assertIn("memory_revision", session_columns)
                 self.assertIn("semantic_content", message_columns)
                 session = await store.active_qwen_session(contact.id)
@@ -352,6 +356,9 @@ class ContactMemoryTests(unittest.TestCase):
                     connection.execute(
                         "ALTER TABLE messages DROP COLUMN semantic_content"
                     )
+                    connection.execute(
+                        "ALTER TABLE contacts DROP COLUMN next_seed_recent_limit"
+                    )
                     connection.execute("PRAGMA user_version = 5")
                     connection.commit()
                 finally:
@@ -369,7 +376,45 @@ class ContactMemoryTests(unittest.TestCase):
                     ).fetchone()[0]
                 finally:
                     connection.close()
-                self.assertEqual(6, version)
+                self.assertEqual(7, version)
+
+        asyncio.run(scenario())
+
+    def test_memory_schema_v6_adds_one_shot_seed_limit_with_zero_default(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-v6-") as temp:
+                root = pathlib.Path(temp)
+                store = MemoryStore(root)
+                await store.initialize()
+                secrets = SecretManager(root)
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                connection = sqlite3.connect(store.path)
+                try:
+                    connection.execute(
+                        "ALTER TABLE contacts DROP COLUMN next_seed_recent_limit"
+                    )
+                    connection.execute("PRAGMA user_version = 6")
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                await store.initialize()
+                revision, recent_limit = await store.contact_seed_state(contact.id)
+                connection = sqlite3.connect(store.path)
+                try:
+                    version = connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                finally:
+                    connection.close()
+                self.assertEqual(7, version)
+                self.assertEqual(0, revision)
+                self.assertEqual(0, recent_limit)
 
         asyncio.run(scenario())
 
@@ -486,6 +531,60 @@ class ContactMemoryTests(unittest.TestCase):
                 context = "\n".join(str(item["content"]) for item in bundle.items)
                 self.assertIn("only contact A", context)
                 self.assertNotIn("only contact B", context)
+
+        asyncio.run(scenario())
+
+    def test_limited_rebuild_uses_only_twenty_recent_messages(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-limited-seed-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            f"raw:{index:02d}",
+                            float(index),
+                            "in",
+                            f"history-{index:02d}",
+                        )
+                        for index in range(1, 36)
+                    ],
+                )
+                await store.save_summary(
+                    contact.id,
+                    content="summary-must-not-enter-limited-rebuild",
+                    through_message_id=10,
+                )
+
+                bundle = await ContextBuilder(store).build(
+                    contact.id,
+                    current_prompt="history-01",
+                    recent_message_limit=20,
+                )
+                seeded = [
+                    str(item["content"])
+                    for item in bundle.items
+                    if str(item["content"]).startswith("history-")
+                ]
+                self.assertEqual(
+                    [f"history-{index:02d}" for index in range(16, 36)],
+                    seeded,
+                )
+                self.assertEqual(20, bundle.recent_count)
+                self.assertEqual(0, bundle.retrieved_count)
+                self.assertNotIn(
+                    "summary-must-not-enter-limited-rebuild",
+                    "\n".join(str(item["content"]) for item in bundle.items),
+                )
 
         asyncio.run(scenario())
 
@@ -755,6 +854,12 @@ class ContactMemoryTests(unittest.TestCase):
                 self.assertIsNotNone(current)
                 self.assertTrue(current.dirty)
                 self.assertEqual(1, await store.contact_memory_revision(contact.id))
+                reopened = MemoryStore(root)
+                await reopened.initialize()
+                self.assertEqual(
+                    (1, 20),
+                    await reopened.contact_seed_state(contact.id),
+                )
                 connection = sqlite3.connect(store.path)
                 try:
                     pending_count = connection.execute(
@@ -1046,6 +1151,136 @@ class ContactMemoryTests(unittest.TestCase):
                 self.assertIsNone(
                     await runtime.validate_request(event_b, prepared_a.request_key)
                 )
+
+        asyncio.run(scenario())
+
+    def test_send_failure_limits_only_the_next_successful_seed(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.seeded = {}
+                self.responses = 0
+
+            async def create_conversation(self, *, metadata=None):
+                conversation_id = f"conv-{len(self.created) + 1}"
+                self.created.append(conversation_id)
+                self.seeded[conversation_id] = []
+                return conversation_id
+
+            async def add_items(self, conversation_id, items):
+                offset = len(self.seeded[conversation_id])
+                self.seeded[conversation_id].extend(dict(item) for item in items)
+                return [
+                    f"{conversation_id}-item-{offset + index}"
+                    for index in range(len(items))
+                ]
+
+            async def respond(
+                self,
+                *,
+                conversation_id,
+                model,
+                prompt,
+                input_items=None,
+                tools=None,
+                tool_choice="auto",
+                request_max_retries=None,
+            ):
+                self.responses += 1
+                return QwenResult(
+                    response_id=f"response-{self.responses}",
+                    text=f"reply-{self.responses}",
+                )
+
+            async def delete_conversation_fully(self, conversation_id):
+                return None
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(prefix="akasha-memory-seed-once-") as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            f"raw:{index:02d}",
+                            float(index),
+                            "in",
+                            f"history-{index:02d}",
+                        )
+                        for index in range(1, 36)
+                    ],
+                )
+                client = FakeClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+
+                await manager.respond(
+                    contact,
+                    prompt="first",
+                    system_prompt="persona",
+                    request_key="request-1",
+                )
+                await store.invalidate_unconfirmed_outputs(contact.id)
+                failure_revision, rebuild_limit = (
+                    await store.contact_seed_state(contact.id)
+                )
+                self.assertEqual(20, rebuild_limit)
+
+                await manager.respond(
+                    contact,
+                    prompt="second",
+                    system_prompt="persona",
+                    request_key="request-2",
+                )
+                self.assertEqual(
+                    (failure_revision, 0),
+                    await store.contact_seed_state(contact.id),
+                )
+                await store.mark_contact_sessions_dirty(contact.id)
+                await manager.respond(
+                    contact,
+                    prompt="third",
+                    system_prompt="persona",
+                    request_key="request-3",
+                )
+
+                def seeded_history(conversation_id):
+                    return [
+                        str(item["content"])
+                        for item in client.seeded[conversation_id]
+                        if str(item["content"]).startswith("history-")
+                    ]
+
+                self.assertEqual(35, len(seeded_history("conv-1")))
+                self.assertEqual(
+                    [f"history-{index:02d}" for index in range(16, 36)],
+                    seeded_history("conv-2"),
+                )
+                self.assertEqual(35, len(seeded_history("conv-3")))
 
         asyncio.run(scenario())
 

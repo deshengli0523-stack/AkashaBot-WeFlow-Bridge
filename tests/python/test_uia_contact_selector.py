@@ -183,7 +183,7 @@ exit 0
         )
         self.assertEqual(
             selector.ocr_calls[-1][3],
-            ScreenRect(461, 0, 1408, 123),
+            ScreenRect(461, 48, 1408, 123),
         )
 
     def test_file_transfer_helper_is_selected_from_features_section(self):
