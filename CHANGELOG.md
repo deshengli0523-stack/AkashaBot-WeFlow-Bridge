@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.4 - 2026-07-26
+
+- Remove the redundant contact-title OCR check between focusing the message input and injecting `Ctrl+V`; the selected contact is still verified immediately after selection and again before final submission.
+- Keep bot-owned text on the clipboard for 500 ms after `Ctrl+V` before conditionally clearing it, allowing slower WeChat message editors to consume the paste without overwriting newer user clipboard content.
+- Preserve the existing cancellable review window: one second before paste and ten seconds after paste by default, with pause, resume, cancellation, and FIFO behavior unchanged.
+
+### Automated verification
+
+- The send-order regression test requires no OCR between message-input focus and body paste while retaining both safety checks.
+- Deterministic clipboard-delay coverage verifies that a delayed target reads the body before the 500 ms conditional cleanup.
+
 ## 0.3.3 - 2026-07-25
 
 - Restore the calibrated first-result step after entering a contact name, while requiring the clicked result surface to belong to the same WeChat process and retaining contact-title verification before message input and final submission.
