@@ -9,11 +9,12 @@ Web 控制面板模块。
 import json
 import logging
 import math
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
 
 import state
 import config
+from money_service import MoneyRequestError
 from uia_support import CalibrationError, validate_calibration
 
 log = logging.getLogger("ob11-bridge")
@@ -533,6 +534,11 @@ function renderConfigForm(cfg) {
       {key:'uia_fixed_pre_paste_preview_delay', label:'粘贴前预览(秒)', type:'number', ph:'1'},
       {key:'uia_fixed_pre_send_delay', label:'随机发送等待上限(秒，下限少2秒)', type:'number', ph:'5'},
     ]},
+    {title:'红包与转账接收', fields:[
+      {key:'money_receive_enabled', label:'启用接收 Agent', type:'checkbox'},
+      {key:'money_receive_timeout_seconds', label:'单次事务期限(秒)', type:'number', ph:'180'},
+      {key:'money_receipt_poll_seconds', label:'WeFlow 回执轮询(秒)', type:'number', ph:'1'},
+    ]},
     {title:'图片与视频描述', fields:[
       {key:'image_caption_provider', label:'描述服务', type:'select', opts:[{v:'ollama',l:'Ollama 本地'},{v:'openai',l:'OpenAI 兼容'}]},
       {key:'image_caption_model', label:'模型名', type:'text', ph:'qwen3.7-plus / llava:7b'},
@@ -563,6 +569,8 @@ function renderConfigForm(cfg) {
         html += '<textarea id="cfg_' + f.key + '" placeholder="' + escapeHtml(f.ph||'') + '" rows="2">' + safeVal + '</textarea>';
       } else if (f.type === 'number') {
         html += '<input type="number" id="cfg_' + f.key + '" value="' + safeVal + '" placeholder="' + escapeHtml(f.ph||'') + '">';
+      } else if (f.type === 'checkbox') {
+        html += '<input type="checkbox" id="cfg_' + f.key + '"' + (val ? ' checked' : '') + '>';
       } else {
         html += '<input type="' + f.type + '" id="cfg_' + f.key + '" value="' + safeVal + '" placeholder="' + escapeHtml(f.ph||'') + '">';
       }
@@ -581,7 +589,7 @@ function saveConfig() {
   var data = {};
   fields.forEach(function(el){
     var key = el.id.replace('cfg_','');
-    var val = el.value.trim();
+    var val = el.type === 'checkbox' ? el.checked : el.value.trim();
     if ((key === 'access_token' || key === 'image_caption_api_key') && !val) return;
     if (el.type === 'number') val = Number(val) || 0;
     // bot_nicknames: 逗号分隔转数组
@@ -626,6 +634,29 @@ def _sender_status() -> dict[str, object]:
     return {"sender_mode": "uia_fixed", "calibrated": _is_calibrated()}
 
 
+def _money_service():
+    lock = getattr(state, "bridge_lock", None)
+    if lock is None:
+        bridge = getattr(state, "bridge_instance", None)
+        return getattr(bridge, "money_actions", None) if bridge is not None else None
+    with lock:
+        bridge = getattr(state, "bridge_instance", None)
+        return getattr(bridge, "money_actions", None) if bridge is not None else None
+
+
+def _money_request(handler, request):
+    query = parse_qs(request.query, keep_blank_values=True)
+    if set(query) != {"request_id"} or len(query["request_id"]) != 1:
+        raise MoneyRequestError("E_MONEY_REQUEST")
+    authorization = handler.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        raise MoneyRequestError("E_MONEY_CAPABILITY", 403)
+    service = _money_service()
+    if service is None:
+        raise MoneyRequestError("E_MONEY_UNAVAILABLE", 409)
+    return service, query["request_id"][0], authorization[7:]
+
+
 _PRIVATE_CONFIG_KEYS = {
     "uia_fixed_calibration",
     "access_token",
@@ -655,6 +686,18 @@ def _public_config(value: dict[str, object]) -> dict[str, object]:
             "VIDEO_CAPTION_PROMPT",
             "请用中文简洁描述这段视频发生了什么，包括关键人物、动作、场景和屏幕文字",
         ),
+    )
+    public.setdefault(
+        "money_receive_enabled",
+        getattr(config, "MONEY_RECEIVE_ENABLED", True),
+    )
+    public.setdefault(
+        "money_receive_timeout_seconds",
+        getattr(config, "MONEY_RECEIVE_TIMEOUT_SECONDS", 180.0),
+    )
+    public.setdefault(
+        "money_receipt_poll_seconds",
+        getattr(config, "MONEY_RECEIPT_POLL_SECONDS", 1.0),
     )
     raw_video_limit = public.get("video_caption_max_mib", 6)
     try:
@@ -703,6 +746,29 @@ def _merge_public_config(
             ):
                 raise ValueError("invalid video caption size")
             field_value = int(field_value)
+        if key == "money_receive_enabled":
+            if not isinstance(field_value, bool):
+                raise ValueError("invalid money receive flag")
+        if key in {
+            "money_receive_timeout_seconds",
+            "money_receipt_poll_seconds",
+        }:
+            if isinstance(field_value, bool) or not isinstance(
+                field_value,
+                (int, float),
+            ):
+                raise ValueError("invalid money receive timing")
+            minimum, maximum = (
+                (30.0, 600.0)
+                if key == "money_receive_timeout_seconds"
+                else (0.2, 5.0)
+            )
+            if (
+                not math.isfinite(float(field_value))
+                or not minimum <= float(field_value) <= maximum
+            ):
+                raise ValueError("invalid money receive timing")
+            field_value = float(field_value)
         if key in _SECRET_CONFIG_KEYS:
             if not isinstance(field_value, str) or not field_value.strip():
                 continue
@@ -719,6 +785,7 @@ class WebHandler(BaseHTTPRequestHandler):
         if request.path == "/status":
             ob_connected = state._ob_ws is not None and state._ob_ws_ready.is_set()
             weflow_connected = state.bridge_instance is not None and state.bridge_instance._sse_session is not None
+            money_service = _money_service()
             status = {
                 "running": state.running,
                 "paused": state.paused.is_set(),
@@ -726,9 +793,38 @@ class WebHandler(BaseHTTPRequestHandler):
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
                 "send_preview": state.get_send_preview(),
+                "money_receive": (
+                    money_service.public_status()
+                    if money_service is not None
+                    else {"active": False}
+                ),
             }
             status.update(_sender_status())
             self.send_json(status)
+        elif request.path in {
+            "/api/money-action/frame",
+            "/api/money-action/status",
+        }:
+            try:
+                service, request_id, token = _money_request(self, request)
+                if request.path.endswith("/frame"):
+                    payload = service.get_frame(
+                        request_id=request_id,
+                        token=token,
+                    )
+                else:
+                    payload = service.get_status(
+                        request_id=request_id,
+                        token=token,
+                    )
+                self.send_json(payload)
+            except MoneyRequestError as error:
+                self.send_json(
+                    {"error": error.code},
+                    error.http_status,
+                )
+            except Exception:
+                self.send_json({"error": "E_MONEY_REQUEST"}, 500)
         elif request.path == "/api/chat-history":
             try:
                 query = parse_qs(request.query, keep_blank_values=True)
@@ -768,7 +864,25 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "E_LOCAL_ONLY"}, 403)
             return
         request_path = urlsplit(self.path).path
-        if request_path == "/start":
+        if request_path == "/api/money-action/step":
+            try:
+                request = urlsplit(self.path)
+                service, request_id, token = _money_request(self, request)
+                payload = self.read_json_body(16384)
+                if str(payload.get("request_id") or "") != request_id:
+                    raise MoneyRequestError("E_MONEY_REQUEST")
+                result = service.submit_step(token=token, payload=payload)
+                self.send_json(result)
+            except MoneyRequestError as error:
+                self.send_json(
+                    {"error": error.code},
+                    error.http_status,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.send_json({"error": "E_MONEY_ACTION"}, 400)
+            except Exception:
+                self.send_json({"error": "E_MONEY_ACTION"}, 500)
+        elif request_path == "/start":
             from main import _start_bridge
             _start_bridge()
             self.send_json({"ok": True})

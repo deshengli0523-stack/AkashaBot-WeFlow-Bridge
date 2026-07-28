@@ -26,6 +26,7 @@ from uia_support import (  # noqa: E402
     ratio_from_screen_point,
     screen_point_from_ratio,
     validate_calibration,
+    validate_receive_runtime_metrics,
     validate_runtime_metrics,
 )
 
@@ -61,6 +62,7 @@ class FakeUser32:
         self.calls = []
         self.set_cursor_result = 1
         self.set_clipboard_result = 1
+        self.set_foreground_result = 1
 
     def EnumWindows(self, callback, lparam):
         self.calls.append(("EnumWindows",))
@@ -92,6 +94,20 @@ class FakeUser32:
     def GetForegroundWindow(self):
         self.calls.append(("GetForegroundWindow",))
         return self.foreground
+
+    def SetForegroundWindow(self, hwnd):
+        self.calls.append(("SetForegroundWindow", hwnd))
+        if self.set_foreground_result:
+            self.foreground = hwnd
+        return self.set_foreground_result
+
+    def BringWindowToTop(self, hwnd):
+        self.calls.append(("BringWindowToTop", hwnd))
+        return 1
+
+    def AttachThreadInput(self, source, target, attach):
+        self.calls.append(("AttachThreadInput", source, target, bool(attach)))
+        return 1
 
     def GetWindowThreadProcessId(self, hwnd, process_id_pointer):
         pid = self.pids.get(hwnd, 100)
@@ -181,6 +197,10 @@ class FakeKernel32:
             200: r"C:\Program Files\Tencent\Weixin.exe",
         }
         self.process_handles = {}
+
+    def GetCurrentThreadId(self):
+        self.calls.append(("GetCurrentThreadId",))
+        return 200
 
     def GetModuleHandleW(self, module_name):
         self.calls.append(("GetModuleHandleW", module_name))
@@ -586,6 +606,42 @@ class RuntimeMetricsValidationTests(unittest.TestCase):
         self.assertIs(
             validate_runtime_metrics(self.calibration, METRICS), self.calibration
         )
+
+    def test_receive_validation_allows_foreground_money_popup(self):
+        popup = replace(
+            METRICS,
+            width=329,
+            height=539,
+            maximized=False,
+        )
+
+        self.assertIs(
+            validate_receive_runtime_metrics(self.calibration, popup),
+            self.calibration,
+        )
+
+    def test_receive_validation_rejects_background_or_oversized_popup(self):
+        cases = (
+            replace(
+                METRICS,
+                width=329,
+                height=539,
+                maximized=False,
+                foreground=False,
+            ),
+            replace(
+                METRICS,
+                width=800,
+                height=539,
+                maximized=False,
+            ),
+        )
+
+        for metrics in cases:
+            with self.subTest(metrics=metrics):
+                with self.assertRaises(CalibrationError) as raised:
+                    validate_receive_runtime_metrics(self.calibration, metrics)
+                self.assertEqual(raised.exception.code, CALIBRATION_WINDOW)
 
     def test_runtime_validation_requires_a_valid_schema(self):
         with self.assertRaises(CalibrationError) as raised:
@@ -1017,6 +1073,43 @@ class Win32InputAndClipboardTests(unittest.TestCase):
             hook_runner=FakeHookRunner([]),
         )
 
+    def test_receive_activation_brings_only_validated_wechat_to_foreground(self):
+        user32 = FakeUser32()
+        user32.foreground = 99
+
+        self.make_driver(user32=user32).activate_receive_window(10)
+
+        self.assertEqual(user32.foreground, 10)
+        self.assertIn(("BringWindowToTop", 10), user32.calls)
+        self.assertIn(("SetForegroundWindow", 10), user32.calls)
+        attaches = [
+            call
+            for call in user32.calls
+            if call[0] == "AttachThreadInput"
+        ]
+        self.assertEqual(
+            attaches,
+            [
+                ("AttachThreadInput", 200, 1, True),
+                ("AttachThreadInput", 200, 1, False),
+            ],
+        )
+
+    def test_receive_activation_fails_closed_when_foreground_does_not_change(self):
+        user32 = FakeUser32()
+        user32.foreground = 99
+        user32.set_foreground_result = 0
+
+        with self.assertRaises(CalibrationError) as raised:
+            self.make_driver(user32=user32).activate_receive_window(10)
+
+        self.assertEqual(raised.exception.code, CALIBRATION_WINDOW)
+        self.assertEqual(user32.foreground, 99)
+        self.assertIn(
+            ("AttachThreadInput", 200, 1, False),
+            user32.calls,
+        )
+
     def test_click_ratio_does_not_move_or_click_before_window_validation(self):
         user32 = FakeUser32()
         user32.maximized = False
@@ -1055,6 +1148,33 @@ class Win32InputAndClipboardTests(unittest.TestCase):
         )
         self.assertFalse(
             any(call[0] == "SetForegroundWindow" for call in user32.calls)
+        )
+
+    def test_receive_click_allows_validated_foreground_money_popup(self):
+        user32 = FakeUser32()
+        user32.client_rect = (0, 0, 329, 539)
+        user32.window_rects[10] = (90, 40, 439, 599)
+        user32.maximized = False
+        calibration = build_calibration(VALID_POINTS, METRICS)
+
+        self.make_driver(user32=user32).click_receive_ratio(
+            10,
+            {"x": 0.5, "y": 0.5},
+            calibration,
+        )
+
+        input_calls = [
+            call
+            for call in user32.calls
+            if call[0] in {"SetCursorPos", "mouse_event"}
+        ]
+        self.assertEqual(
+            input_calls,
+            [
+                ("SetCursorPos", 264, 320),
+                ("mouse_event", 0x0002, 0, 0, 0, 0),
+                ("mouse_event", 0x0004, 0, 0, 0, 0),
+            ],
         )
 
     def test_click_ratio_stops_when_set_cursor_pos_fails(self):

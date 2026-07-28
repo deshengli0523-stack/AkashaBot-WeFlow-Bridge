@@ -1,6 +1,6 @@
 # AkashaBot WeFlow Bridge
 
-这是一个面向 Windows 的本地桥接与安装项目，让 WeFlow 通过 OneBot v11 与 AstrBot 协作。公开仓库只包含桥接程序、联系人记忆插件源码、安装脚本、测试和公开文档，不包含 WeFlow 安装包、AstrBot 数据、个人配置或用户数据。
+这是一个面向 Windows 的本地桥接与安装项目，让 WeFlow 通过 OneBot v11 与 AstrBot 协作。公开仓库只包含桥接程序、AstrBot 插件源码、安装脚本、测试和公开文档，不包含 WeFlow 安装包、AstrBot 数据、个人配置或用户数据。
 
 ## 安装前准备
 
@@ -63,6 +63,19 @@
 - `/akasha_memory forget CONFIRM`
 
 命令需要 AstrBot 管理员权限。`rebuild` 和 `forget` 必须从目标联系人的 Akasha 私聊会话执行；删除时会先删除云端 items 和 conversation，成功后再删除本地记忆。
+
+## 红包与转账接收
+
+安装器会同时部署 `Akasha 红包与转账接收` 插件。它使用 AstrBot 中选择的多模态 Provider 作为桌面 Agent，不启动第三个 Agent 服务，也不把模型 API Key 复制到桥接配置。请在 AstrBot 插件设置里选择独立的 `vision_provider_id`；留空时会使用当前可用 Provider，但明确排除联系人记忆 Provider。红包与收到的转账都直接进入 Agent 接收流程，不设置金额上限。
+
+WeFlow 推送精确的 `[红包]` 或 `[转账]` 标记后，桥会先在普通发送 FIFO 前建立一个接收屏障。已经进入微信 UI 的当前发送会完整结束；所有尚未开始的文本和图片发送继续按原 FIFO 顺序等待，接收事务优先执行。桥按来源联系人搜索并点击固定首结果，不运行任何 Windows OCR。AstrBot Agent 每一步查看经过验证的前台微信客户区截图，并根据任务携带的联系人名称核对当前聊天标题；不一致时可要求桥重新选择联系人。Agent 只能返回相对坐标点击、`Esc`、重新选择联系人、等待或“已回到正常聊天页”。每一帧都绑定一次性 nonce，动作前会重新截图核对；界面已变化时旧坐标作废，由 Agent 重新观察。
+
+接收事务只有同时满足以下两个条件才算成功并释放 FIFO：
+
+- AstrBot 多模态 Agent 明确确认当前截图已经回到正常聊天页面；
+- WeFlow 出现同一笔收款的成功记录。转账使用同一会话的 `transferid` 与 `transcationid` 复合关联；红包使用同一会话、接收动作之后的“你领取了…红包”系统记录。
+
+任一条件缺失时不会误报成功。Bridge 停止、AstrBot 插件异常、前台窗口失效或默认 180 秒期限到达会把事务标记为失败并释放等待队列，避免永久卡死；多模态调用同样受该剩余期限以及 `provider_timeout_seconds` 限制。人工“暂停”状态与接收屏障彼此独立，事务结束后不会替用户清除暂停。
 
 ## 分段发送与发送审核
 

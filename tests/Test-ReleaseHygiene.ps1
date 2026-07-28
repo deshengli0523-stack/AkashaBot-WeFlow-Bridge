@@ -28,17 +28,17 @@ $expectedPublishFiles = @(
   'bridge/config.example.json',
   'bridge/config.py',
   'bridge/main.py',
+  'bridge/money_action.py',
+  'bridge/money_service.py',
   'bridge/ob_client.py',
   'bridge/ob_protocol.py',
   'bridge/privacy.py',
   'bridge/requirements.lock',
   'bridge/requirements.txt',
   'bridge/state.py',
-  'bridge/uia_contact_selector.py',
   'bridge/uia_fixed_sender.py',
   'bridge/uia_support.py',
   'bridge/web_panel.py',
-  'bridge/windows_ocr_selector.ps1',
   'plugins/astrbot_plugin_akasha_contact_memory/README.md',
   'plugins/astrbot_plugin_akasha_contact_memory/_conf_schema.json',
   'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/__init__.py',
@@ -53,6 +53,10 @@ $expectedPublishFiles = @(
   'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/weflow_sync.py',
   'plugins/astrbot_plugin_akasha_contact_memory/main.py',
   'plugins/astrbot_plugin_akasha_contact_memory/metadata.yaml',
+  'plugins/astrbot_plugin_akasha_money_receiver/__init__.py',
+  'plugins/astrbot_plugin_akasha_money_receiver/_conf_schema.json',
+  'plugins/astrbot_plugin_akasha_money_receiver/main.py',
+  'plugins/astrbot_plugin_akasha_money_receiver/metadata.yaml',
   'scripts/AkashaBot.Common.psm1',
   'scripts/Calibrate-Uia.ps1',
   'scripts/Initialize-Configuration.ps1',
@@ -72,7 +76,9 @@ $expectedPublishFiles = @(
   'tests/Run-All.ps1',
   'tests/python/test_bridge_runtime.py',
   'tests/python/test_contact_memory.py',
-  'tests/python/test_uia_contact_selector.py',
+  'tests/python/test_money_action.py',
+  'tests/python/test_money_plugin.py',
+  'tests/python/test_money_service.py',
   'tests/python/test_uia_calibration.py',
   'tests/python/test_uia_fixed_sender.py',
   'tests/python/test_uia_support.py',
@@ -82,12 +88,12 @@ $expectedPublishFiles = @(
   ((-join @([char]0x5065, [char]0x5EB7, [char]0x68C0, [char]0x67E5)) + '.bat'),
   ((-join @([char]0x6821, [char]0x51C6)) + '.bat')
 )
-if ($expectedPublishFiles.Count -ne 68) {
-  throw "Release allowlist invariant is not 68 files: $($expectedPublishFiles.Count)"
+if ($expectedPublishFiles.Count -ne 74) {
+  throw "Release allowlist invariant is not 74 files: $($expectedPublishFiles.Count)"
 }
 $uniqueExpectedPublishFiles = @($expectedPublishFiles | Sort-Object -Unique)
-if ($uniqueExpectedPublishFiles.Count -ne 68) {
-  throw "Release allowlist must contain 68 unique entries; duplicate entries were found."
+if ($uniqueExpectedPublishFiles.Count -ne 74) {
+  throw "Release allowlist must contain 74 unique entries; duplicate entries were found."
 }
 $publishFiles = @(
   foreach ($entry in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop |
@@ -115,8 +121,8 @@ foreach ($relativePath in $actualPublishFiles) {
   }
 }
 $uniqueActualPublishFiles = @($actualPublishFiles | Sort-Object -Unique)
-if ($actualPublishFiles.Count -ne 68 -or $uniqueActualPublishFiles.Count -ne 68) {
-  throw "Published files must contain exactly 68 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
+if ($actualPublishFiles.Count -ne 74 -or $uniqueActualPublishFiles.Count -ne 74) {
+  throw "Published files must contain exactly 74 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
 }
 
 $bridgeRoot = Join-Path $root 'bridge'
@@ -779,8 +785,8 @@ foreach ($file in $textFiles) {
 }
 
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
-if ($version -cne '0.3.7') {
-  throw "VERSION must be 0.3.7, found '$version'."
+if ($version -cne '0.4.0') {
+  throw "VERSION must be 0.4.0, found '$version'."
 }
 
 $template = Get-Content -LiteralPath (Join-Path $root 'bridge\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -807,6 +813,11 @@ if ([int]$template.video_caption_max_mib -ne 6) {
 }
 if ([string]::IsNullOrWhiteSpace([string]$template.video_caption_prompt)) {
   throw 'Bridge template video_caption_prompt must not be empty.'
+}
+if ($template.money_receive_enabled -ne $true -or
+    [int]$template.money_receive_timeout_seconds -ne 180 -or
+    [int]$template.money_receipt_poll_seconds -ne 1) {
+  throw 'Bridge template money receive defaults are invalid.'
 }
 $calibration = $template.uia_fixed_calibration
 if ($calibration.completed -ne $false -or $null -ne $calibration.reference) {

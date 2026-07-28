@@ -11,7 +11,7 @@ import re
 import sys
 import threading
 import time
-from http.server import HTTPServer
+from http.server import ThreadingHTTPServer
 
 _STARTUP_SECRET_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
@@ -83,8 +83,14 @@ log = logging.getLogger("ob11-bridge")
 # ============ 启动 / 停止 ============
 
 
-class LocalHTTPServer(HTTPServer):
+class LocalHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(30.0)
+        return request, address
 
 
 def _process_start_token(pid: int) -> int | None:
@@ -261,6 +267,11 @@ def _stop_bridge():
 
     # 切断 SSE 长连接，让 _bridge_loop 的 listen_sse() 从阻塞中退出
     with state.bridge_lock:
+        if state.bridge_instance and hasattr(
+            state.bridge_instance,
+            "stop_money_actions",
+        ):
+            state.bridge_instance.stop_money_actions()
         if state.bridge_instance and state.bridge_instance._sse_session:
             try:
                 state.bridge_instance._sse_session.close()
@@ -364,6 +375,8 @@ def _bridge_loop(generation: int):
 
     with state.bridge_lock:
         if state.bridge_instance is bridge:
+            if hasattr(bridge, "stop_money_actions"):
+                bridge.stop_money_actions()
             state.bridge_instance = None
 
 

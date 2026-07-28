@@ -976,6 +976,9 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.split_mode) 'regex' 'AstrBot segmented split mode is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,24}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,25}' 'AstrBot segmented regex is wrong.'
   Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '\s+' 'AstrBot content cleanup rule is wrong.'
+  Assert-True ([bool]$freshBridge.money_receive_enabled) 'Fresh bridge did not enable incoming money handling.'
+  Assert-Equal ([int]$freshBridge.money_receive_timeout_seconds) 180 'Fresh bridge money timeout is wrong.'
+  Assert-Equal ([int]$freshBridge.money_receipt_poll_seconds) 1 'Fresh bridge receipt poll interval is wrong.'
   $segmentPattern = [string]$freshAstr.platform_settings.segmented_reply.regex
   $segmentCleanupPattern = [string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule
   $segmentOptions = [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::Multiline
@@ -1095,6 +1098,9 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   $existingBridgeAfter = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-True ([string]$existingBridgeAfter.access_token -ceq $existingToken) 'Existing valid bridge token changed.'
   Assert-Equal ([double]$existingBridgeAfter.uia_fixed_pre_send_delay) 5.0 'Existing bridge post-paste delay maximum was not migrated to five seconds.'
+  Assert-True ([bool]$existingBridgeAfter.money_receive_enabled) 'Existing bridge did not receive the money feature default.'
+  Assert-Equal ([int]$existingBridgeAfter.money_receive_timeout_seconds) 180 'Existing bridge money timeout default is wrong.'
+  Assert-Equal ([int]$existingBridgeAfter.money_receipt_poll_seconds) 1 'Existing bridge receipt poll default is wrong.'
   Assert-Equal ([string]$existingBridgeAfter.unknown_nonlegacy_field) 'preserve-me' 'Existing unknown non-legacy bridge field was lost.'
   Assert-Equal ($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress) $existingCalibrationJson 'Existing schema 1 calibration was not preserved exactly.'
   $existingCalibrationBytesAfter = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress)))

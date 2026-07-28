@@ -1,0 +1,41 @@
+{
+  "enabled": {
+    "description": "启用红包与转账接收",
+    "type": "bool",
+    "default": true
+  },
+  "vision_provider_id": {
+    "description": "AstrBot 多模态 Provider ID",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "建议选择具备图像理解能力的独立 Provider；留空时使用当前 Provider，但不会使用 Akasha 联系人记忆 Provider。"
+  },
+  "vision_model": {
+    "description": "多模态模型覆盖",
+    "type": "string",
+    "default": "",
+    "hint": "留空时使用所选 Provider 的默认模型。"
+  },
+  "bridge_url": {
+    "description": "本机桥接控制地址",
+    "type": "string",
+    "default": "http://127.0.0.1:8766",
+    "hint": "只允许 http://127.0.0.1 或 http://localhost。"
+  },
+  "max_agent_steps": {
+    "description": "单次接收最多视觉步骤",
+    "type": "int",
+    "default": 12
+  },
+  "provider_timeout_seconds": {
+    "description": "单次多模态调用超时秒数",
+    "type": "float",
+    "default": 60.0
+  },
+  "http_timeout_seconds": {
+    "description": "桥接请求超时秒数",
+    "type": "float",
+    "default": 15.0
+  }
+}
