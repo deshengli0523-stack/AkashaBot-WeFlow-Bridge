@@ -228,6 +228,12 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
 .send-preview.active{display:block}
 .send-preview-title{font-size:12px;font-weight:650;color:#92400e;margin-bottom:7px}
 .send-preview-content{font-size:14px;line-height:1.6;color:#111827;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow-y:auto}
+.send-result{display:none;border:1px solid var(--line);background:var(--soft);border-radius:6px;padding:10px 14px}
+.send-result.active{display:block}
+.send-result.failed{border-color:#fecaca;background:#fef2f2;color:#991b1b}
+.send-result.sent{border-color:#bbf7d0;background:#f0fdf4;color:#166534}
+.send-result-title{font-size:12px;font-weight:650;margin-bottom:4px}
+.send-result-message{font-size:13px;line-height:1.5}
 
 /* ===== 日志 ===== */
 .log-box{flex:1;min-height:100px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;font-size:12px;font-family:'Cascadia Code','Fira Code',monospace;color:#374151;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
@@ -306,6 +312,11 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
     <div class="send-preview" id="sendPreview">
       <div class="send-preview-title" id="sendPreviewTitle">即将粘贴</div>
       <div class="send-preview-content" id="sendPreviewContent"></div>
+    </div>
+
+    <div class="send-result" id="sendResult" role="status" aria-live="polite">
+      <div class="send-result-title" id="sendResultTitle"></div>
+      <div class="send-result-message" id="sendResultMessage"></div>
     </div>
 
     <div class="btn-row">
@@ -425,6 +436,23 @@ function refreshDashboard() {
     }
     document.getElementById('btnCancelCurrent').disabled = visiblePreviewId === null;
 
+    var outcome = s.last_send_result;
+    var resultPanel = document.getElementById('sendResult');
+    if (
+      outcome
+      && (outcome.status === 'failed' || outcome.status === 'sent')
+      && typeof outcome.message === 'string'
+    ) {
+      resultPanel.className = 'send-result active ' + outcome.status;
+      document.getElementById('sendResultTitle').textContent =
+        outcome.status === 'failed' ? '发送失败' : '已提交，等待 WeFlow 确认';
+      document.getElementById('sendResultMessage').textContent = outcome.message;
+    } else {
+      resultPanel.className = 'send-result';
+      document.getElementById('sendResultTitle').textContent = '';
+      document.getElementById('sendResultMessage').textContent = '';
+    }
+
     document.getElementById('btnStart').disabled = s.running;
     document.getElementById('btnStop').disabled = !s.running;
     if (s.paused) {
@@ -533,6 +561,7 @@ function renderConfigForm(cfg) {
       {key:'web_port', label:'Web 面板端口', type:'number', ph:'8766'},
       {key:'uia_fixed_pre_paste_preview_delay', label:'粘贴前预览(秒)', type:'number', ph:'1'},
       {key:'uia_fixed_pre_send_delay', label:'随机发送等待上限(秒，下限少2秒)', type:'number', ph:'5'},
+      {key:'uia_fixed_settle_jitter_max_seconds', label:'点击与粘贴稳定随机间隔上限(秒)', type:'number', ph:'0.25'},
     ]},
     {title:'红包与转账接收', fields:[
       {key:'money_receive_enabled', label:'启用接收 Agent', type:'checkbox'},
@@ -680,6 +709,10 @@ def _public_config(value: dict[str, object]) -> dict[str, object]:
         config.UIA_FIXED_PRE_SEND_DELAY,
     )
     public.setdefault(
+        "uia_fixed_settle_jitter_max_seconds",
+        config.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS,
+    )
+    public.setdefault(
         "video_caption_prompt",
         getattr(
             config,
@@ -721,16 +754,17 @@ def _merge_public_config(
         if key in {
             "uia_fixed_pre_paste_preview_delay",
             "uia_fixed_pre_send_delay",
+            "uia_fixed_settle_jitter_max_seconds",
         }:
             if isinstance(field_value, bool) or not isinstance(
                 field_value, (int, float)
             ):
                 raise ValueError("invalid UIA review delay")
-            maximum = (
-                10.0
-                if key == "uia_fixed_pre_paste_preview_delay"
-                else 60.0
-            )
+            maximum = {
+                "uia_fixed_pre_paste_preview_delay": 10.0,
+                "uia_fixed_pre_send_delay": 60.0,
+                "uia_fixed_settle_jitter_max_seconds": 0.5,
+            }[key]
             if (
                 not math.isfinite(float(field_value))
                 or not 0.0 <= float(field_value) <= maximum
@@ -793,6 +827,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
                 "send_preview": state.get_send_preview(),
+                "last_send_result": state.get_last_send_result(),
                 "money_receive": (
                     money_service.public_status()
                     if money_service is not None
@@ -961,6 +996,14 @@ class WebHandler(BaseHTTPRequestHandler):
                     sender = state.sender_instance
                     if sender is not None:
                         sender.pre_send_delay = delay
+                if "uia_fixed_settle_jitter_max_seconds" in new_cfg:
+                    delay = float(
+                        new_cfg["uia_fixed_settle_jitter_max_seconds"]
+                    )
+                    config.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS = delay
+                    sender = state.sender_instance
+                    if sender is not None:
+                        sender.settle_jitter_max_seconds = delay
 
                 self.send_json({"ok": True})
             except Exception:

@@ -339,6 +339,70 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertTrue(created[0][2])
         self.assertEqual({}, bridge.pending_buffers)
 
+    def test_inbound_sticker_uses_media_processing_thread(self):
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = ""
+        config_module.BUFFER_SECONDS = 5
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "test-token"
+        requests_module = types.ModuleType("requests")
+        requests_module.exceptions = types.SimpleNamespace(
+            ConnectionError=ConnectionError,
+        )
+        bridge_core = self._load_bridge_core(
+            "bridge_sticker_dispatch_test",
+            state_module=state_module,
+            config_module=config_module,
+            requests_module=requests_module,
+        )
+        created = []
+
+        class FakeThread:
+            def __init__(self, *, target, args, daemon):
+                created.append((target, args, daemon))
+
+            def start(self):
+                return None
+
+        sticker = {
+            "content": "[表情]",
+            "sourceName": "private-contact",
+            "sessionId": "wxid-contact",
+            "sessionType": "private",
+            "rawid": "sticker-server-id",
+            "timestamp": 100,
+        }
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def iter_lines(decode_unicode=False):
+                self.assertTrue(decode_unicode)
+                return ["data:" + json.dumps(sticker, ensure_ascii=False)]
+
+        requests_module.get = lambda *_args, **_kwargs: FakeResponse()
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge.start_timestamp = 99
+        self.assertFalse(bridge.should_ignore(sticker))
+        self.assertFalse(
+            bridge_core._is_sticker_message(
+                {"content": "普通 Unicode 表情 😀", "type": 1}
+            )
+        )
+        with mock.patch.object(bridge_core.threading, "Thread", FakeThread):
+            bridge.listen_sse()
+
+        self.assertEqual(1, len(created))
+        self.assertEqual("process_sticker_message", created[0][0].__name__)
+        self.assertEqual("sticker-server-id", created[0][1][0]["rawid"])
+        self.assertTrue(created[0][2])
+        self.assertEqual({"sticker-server-id"}, bridge.processed_ids)
+        self.assertEqual({}, bridge.pending_buffers)
+
     def test_video_fetch_matches_server_id_and_caption_uses_video_url(self):
         with tempfile.TemporaryDirectory(prefix="akasha-video-") as temp:
             state_module = types.ModuleType("state")
@@ -466,6 +530,209 @@ class BridgeRuntimeTests(unittest.TestCase):
                 local_credential,
                 json.dumps(payload, ensure_ascii=False),
             )
+
+    def test_sticker_fetch_matches_server_id_and_uses_emoji_export(self):
+        with tempfile.TemporaryDirectory(prefix="akasha-sticker-") as temp:
+            state_module = types.ModuleType("state")
+            state_module.group_reply_mode = "all"
+            config_module = types.ModuleType("config")
+            local_credential = "local-" + "weflow-" + "credential"
+            config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+            config_module.ACCESS_TOKEN = local_credential
+            config_module.ASTRBOT_ATTACHMENTS = temp
+
+            get_calls = []
+
+            class FakeApiResponse:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return {
+                        "messages": [
+                            {
+                                "serverId": "wrong-id",
+                                "localType": 47,
+                                "isSend": 0,
+                                "mediaType": "emoji",
+                                "mediaUrl": "/api/v1/media/wrong.gif",
+                            },
+                            {
+                                "serverId": "target-id",
+                                "localType": 3,
+                                "isSend": 0,
+                                "mediaType": "image",
+                                "mediaUrl": "/api/v1/media/not-a-sticker.jpg",
+                            },
+                            {
+                                "serverId": "target-id",
+                                "localType": 47,
+                                "isSend": 0,
+                                "mediaType": "emoji",
+                                "mediaUrl": "/api/v1/media/target.gif",
+                            },
+                        ]
+                    }
+
+            class FakeDownloadResponse:
+                status_code = 200
+                headers = {
+                    "Content-Type": "image/gif",
+                    "Content-Length": "13",
+                }
+
+                @staticmethod
+                def iter_content(chunk_size):
+                    self.assertEqual(1024 * 1024, chunk_size)
+                    return iter((b"sticker-bytes",))
+
+                @staticmethod
+                def close():
+                    return None
+
+            def fake_get(url, **kwargs):
+                get_calls.append((url, kwargs))
+                if url.endswith("/api/v1/messages"):
+                    return FakeApiResponse()
+                self.assertEqual(
+                    "http://127.0.0.1:5031/api/v1/media/target.gif",
+                    url,
+                )
+                return FakeDownloadResponse()
+
+            requests_module = types.ModuleType("requests")
+            requests_module.get = fake_get
+            requests_module.Timeout = TimeoutError
+            bridge_core = self._load_bridge_core(
+                "bridge_sticker_fetch_test",
+                state_module=state_module,
+                config_module=config_module,
+                requests_module=requests_module,
+            )
+
+            sticker_path = bridge_core.WeFlowBridge(
+                sender=None
+            )._fetch_wechat_sticker(
+                {
+                    "sessionId": "wxid-contact",
+                    "rawid": "target-id",
+                    "timestamp": 100,
+                }
+            )
+
+            self.assertIsNotNone(sticker_path)
+            self.assertEqual(
+                b"sticker-bytes",
+                pathlib.Path(sticker_path).read_bytes(),
+            )
+            self.assertEqual(".gif", pathlib.Path(sticker_path).suffix)
+            query = get_calls[0][1]["params"]
+            self.assertEqual("true", query["media"])
+            self.assertEqual("true", query["emoji"])
+            self.assertEqual("false", query["image"])
+            self.assertEqual("false", query["voice"])
+            self.assertEqual("false", query["video"])
+            self.assertEqual(
+                "Bearer " + local_credential,
+                get_calls[1][1]["headers"]["Authorization"],
+            )
+            self.assertNotIn(local_credential, get_calls[1][0])
+
+            get_calls.clear()
+            unmatched = bridge_core.WeFlowBridge(
+                sender=None
+            )._fetch_wechat_sticker(
+                {
+                    "sessionId": "wxid-contact",
+                    "rawid": "missing-id",
+                    "timestamp": 100,
+                }
+            )
+            self.assertIsNone(unmatched)
+            self.assertEqual(1, len(get_calls))
+
+    def test_sticker_raw_xml_never_reaches_log_or_onebot_event(self):
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        state_module.remember_private_route = lambda *_args, **_kwargs: 7001
+        state_module._ob_id_to_contact = {}
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = "wxid-bot"
+        config_module.BUFFER_SECONDS = 5
+        requests_module = types.ModuleType("requests")
+        bridge_core = self._load_bridge_core(
+            "bridge_sticker_xml_privacy_test",
+            state_module=state_module,
+            config_module=config_module,
+            requests_module=requests_module,
+        )
+        pushed = []
+        bridge_core.push_event = lambda event: pushed.append(event) or 1
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        class FakeTimer:
+            def __init__(self, _delay, callback):
+                self.callback = callback
+                self.daemon = False
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        raw_xml = (
+            '<msg><emoji md5="private-md5" aeskey="private-aeskey" '
+            'cdnurl="https://private.example/sticker" /></msg>'
+        )
+        sticker = {
+            "content": raw_xml,
+            "localType": 47,
+            "sourceName": "private-contact",
+            "sessionId": "wxid-contact",
+            "sessionType": "private",
+            "rawid": "sticker-server-id",
+            "timestamp": 100,
+        }
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge._fetch_wechat_sticker = lambda _data: None
+
+        with (
+            mock.patch.object(bridge_core.threading, "Thread", ImmediateThread),
+            mock.patch.object(bridge_core.threading, "Timer", FakeTimer),
+            self.assertLogs("ob11-bridge", level="INFO") as captured,
+        ):
+            bridge.add_to_buffer(sticker)
+            bridge.process_sender("wxid-contact", 1)
+
+        self.assertEqual(1, len(pushed))
+        serialized_event = json.dumps(pushed[0], ensure_ascii=False)
+        serialized_logs = "\n".join(captured.output)
+        for private_fragment in (
+            "<msg",
+            "private-md5",
+            "private-aeskey",
+            "private.example",
+            "cdnurl",
+        ):
+            self.assertNotIn(private_fragment, serialized_event)
+            self.assertNotIn(private_fragment, serialized_logs)
+        self.assertIn("微信表情包", serialized_event)
+        self.assertIn("内容无法描述", serialized_event)
+        chat_line = next(line for line in captured.output if "CHAT " in line)
+        self.assertEqual(
+            "[表情]",
+            json.loads(chat_line.split("CHAT ", 1)[1])["body"],
+        )
 
     @staticmethod
     def _configure_verified_private_route(
@@ -959,6 +1226,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         state_module.group_reply_mode = "mention"
         state_module.sender_instance = None
         state_module.send_preview = None
+        state_module.last_send_result = None
 
         def get_send_preview():
             if state_module.send_preview is None:
@@ -978,6 +1246,13 @@ class BridgeRuntimeTests(unittest.TestCase):
 
         state_module.get_send_preview = get_send_preview
         state_module.cancel_current_preview = cancel_current_preview
+        state_module.get_last_send_result = (
+            lambda: (
+                dict(state_module.last_send_result)
+                if state_module.last_send_result is not None
+                else None
+            )
+        )
 
         config_module = types.ModuleType("config")
         config_module.CONFIG_FILE = str(config_path)
@@ -985,6 +1260,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         config_module.UIA_FIXED_CALIBRATION = calibration
         config_module.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = 1.0
         config_module.UIA_FIXED_PRE_SEND_DELAY = 5.0
+        config_module.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS = 0.25
         config_module.WEB_PORT = 8766
 
         spec = importlib.util.spec_from_file_location(
@@ -1060,6 +1336,7 @@ class BridgeRuntimeTests(unittest.TestCase):
         config_module.UIA_FIXED_CALIBRATION = {}
         config_module.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = 1.0
         config_module.UIA_FIXED_PRE_SEND_DELAY = 5.0
+        config_module.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS = 0.25
         config_module.ACCESS_TOKEN = "fixture"
         config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
         config_module.WEB_PORT = 8766
@@ -1266,6 +1543,10 @@ class BridgeRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(template.get("uia_fixed_pre_paste_preview_delay"), 1.0)
         self.assertEqual(template.get("uia_fixed_pre_send_delay"), 5.0)
+        self.assertEqual(
+            template.get("uia_fixed_settle_jitter_max_seconds"),
+            0.25,
+        )
         legacy_keys = {
             "send_method",
             "weflow_send_api",
@@ -1373,6 +1654,44 @@ class BridgeRuntimeTests(unittest.TestCase):
             "aspect_ratio",
         ):
             self.assertNotIn(private_name, serialized)
+
+    def test_control_panel_exposes_safe_last_send_failure_reason(self):
+        invalid = {"schema_version": 1, "completed": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, state_module, _ = self._load_web_panel(
+                invalid,
+                config_path,
+                log_path,
+            )
+            state_module.last_send_result = {
+                "sequence": 7,
+                "status": "failed",
+                "code": "E_UIA_FIXED_WINDOW",
+                "stage": "preflight",
+                "message": "微信窗口未处于已标定的前台状态",
+                "time": 123.0,
+            }
+
+            response = self._invoke_web_handler(panel, "do_GET", "/status")
+
+        self.assertEqual(response["code"], 200)
+        self.assertEqual(
+            response["data"]["last_send_result"],
+            state_module.last_send_result,
+        )
+        serialized = json.dumps(response["data"], ensure_ascii=False)
+        self.assertNotIn("contact", serialized)
+        self.assertNotIn("body", serialized)
+        source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
+        self.assertIn('id="sendResult"', source)
+        self.assertIn("sendResultMessage", source)
+        self.assertIn("outcome.message", source)
+        self.assertNotIn("sendResultMessage.innerHTML", source)
 
     def test_money_agent_http_surface_requires_capability_and_routes_steps(self):
         invalid = {"schema_version": 1, "completed": True}
@@ -1536,7 +1855,7 @@ class BridgeRuntimeTests(unittest.TestCase):
             )
             log_path = root / "bridge.log"
             log_path.write_text("", encoding="utf-8")
-            panel, _, _ = self._load_web_panel(
+            panel, _, panel_config = self._load_web_panel(
                 calibration, config_path, log_path
             )
 
@@ -1555,6 +1874,10 @@ class BridgeRuntimeTests(unittest.TestCase):
                 5.0,
             )
             self.assertEqual(
+                get_response["data"]["uia_fixed_settle_jitter_max_seconds"],
+                0.25,
+            )
+            self.assertEqual(
                 get_response["data"]["video_caption_max_mib"],
                 6,
             )
@@ -1565,6 +1888,7 @@ class BridgeRuntimeTests(unittest.TestCase):
                 "/api/config",
                 {
                     "buffer_seconds": 7,
+                    "uia_fixed_settle_jitter_max_seconds": 0.4,
                     access_key: "   ",
                     image_key: {"invalid": "value"},
                     "uia_fixed_calibration": {
@@ -1594,6 +1918,11 @@ class BridgeRuntimeTests(unittest.TestCase):
             replacement_response, {"data": {"ok": True}, "code": 200}
         )
         self.assertEqual(saved["buffer_seconds"], 7)
+        self.assertEqual(saved["uia_fixed_settle_jitter_max_seconds"], 0.4)
+        self.assertEqual(
+            panel_config.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS,
+            0.4,
+        )
         self.assertEqual(saved["uia_fixed_calibration"], calibration)
         self.assertEqual(saved[access_key], original_access_value)
         self.assertEqual(saved[image_key], original_image_value)
@@ -1674,6 +2003,11 @@ class BridgeRuntimeTests(unittest.TestCase):
         )
         self.assertIn(
             "pre_send_delay=config.UIA_FIXED_PRE_SEND_DELAY",
+            main_source,
+        )
+        self.assertIn(
+            "settle_jitter_max_seconds="
+            "config.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS",
             main_source,
         )
         self.assertIn("sender_mode=uia_fixed", main_source)
@@ -2449,6 +2783,14 @@ class BridgeRuntimeTests(unittest.TestCase):
             "Bearer contacts-" + "token",
         )
         self.assertGreater(kwargs["timeout"], 0)
+        self.assertEqual(len(state_module._ob_ws.payloads), 2)
+        notice = state_module._ob_ws.payloads[0]
+        self.assertEqual(notice["notice_type"], "akasha_send_result")
+        self.assertEqual(notice["sub_type"], "sent")
+        self.assertIs(notice["success"], True)
+        self.assertEqual(notice["delivered_parts"], ["private-body"])
+        self.assertEqual(notice["account"], "bot-account")
+        self.assertEqual(notice["session"], "stable-private-session")
         self.assertEqual(state_module._ob_ws.payloads[-1]["status"], "ok")
         self.assertEqual(state_module._ob_ws.payloads[-1]["retcode"], 0)
 
@@ -2538,6 +2880,144 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual("failed", response["status"])
         self.assertNotEqual(0, response["retcode"])
         self.assertEqual("private-send-failure", response["echo"])
+        self.assertEqual(
+            {
+                "error_code": "E_UIA_SEND_FAILED",
+                "error_stage": "submit",
+            },
+            response["data"],
+        )
+
+    def test_multisegment_send_preserves_first_safe_failure_reason(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send(self, payload):
+                self.payloads.append(json.loads(payload))
+
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = FakeWebSocket()
+        state_module._ob_id_to_contact = {}
+        state_module._self_id_int = 99
+        state_module.last_result = None
+
+        def record_result(success, *, code, stage):
+            state_module.last_result = {
+                "status": "sent" if success else "failed",
+                "code": "OK" if success else code,
+                "stage": stage,
+            }
+
+        state_module.record_send_result = record_result
+        state_module.get_last_send_result = lambda: state_module.last_result
+
+        class SequenceSender:
+            def __init__(self):
+                self.calls = 0
+
+            def send_text(self, _contact, _text):
+                self.calls += 1
+                if self.calls == 1:
+                    record_result(
+                        False,
+                        code="E_UIA_SEND_CANCELLED",
+                        stage="paste",
+                    )
+                    return False
+                record_result(True, code="OK", stage="complete")
+                return True
+
+        state_module.sender_instance = SequenceSender()
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        requests_module = types.ModuleType("requests")
+        self._configure_verified_private_route(
+            state_module,
+            config_module,
+            requests_module,
+        )
+        protocol = self._load_ob_protocol(
+            "multisegment_failure_reason_ob_protocol",
+            state_module,
+            config_module,
+            requests_module,
+        )
+        request = {
+            "action": "send_private_msg",
+            "params": {
+                "user_id": 7,
+                "message": [
+                    {"type": "text", "data": {"text": "first"}},
+                    {"type": "text", "data": {"text": "second"}},
+                ],
+            },
+            "echo": "multi-failure",
+        }
+
+        with self.assertLogs("ob11-bridge", level="INFO"):
+            asyncio.run(protocol._handle_ob_api(request))
+
+        notice, response = state_module._ob_ws.payloads
+        expected = {
+            "error_code": "E_UIA_SEND_CANCELLED",
+            "error_stage": "paste",
+        }
+        self.assertEqual(expected["error_code"], notice["error_code"])
+        self.assertEqual(expected["error_stage"], notice["error_stage"])
+        self.assertEqual(expected, response["data"])
+        self.assertEqual(expected["error_code"], state_module.last_result["code"])
+
+    def test_success_notice_keeps_all_delivered_parts_beyond_one_hundred(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send(self, payload):
+                self.payloads.append(json.loads(payload))
+
+        class SuccessfulSender:
+            @staticmethod
+            def send_text(_contact, _text):
+                return True
+
+        state_module = types.ModuleType("state")
+        state_module._ob_ws = FakeWebSocket()
+        state_module._ob_id_to_contact = {}
+        state_module._self_id_int = 99
+        state_module.sender_instance = SuccessfulSender()
+        config_module = types.ModuleType("config")
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        requests_module = types.ModuleType("requests")
+        self._configure_verified_private_route(
+            state_module,
+            config_module,
+            requests_module,
+        )
+        protocol = self._load_ob_protocol(
+            "long_success_notice_ob_protocol",
+            state_module,
+            config_module,
+            requests_module,
+        )
+        parts = [f"part-{index:03d}" for index in range(101)]
+        request = {
+            "action": "send_private_msg",
+            "params": {
+                "user_id": 7,
+                "message": [
+                    {"type": "text", "data": {"text": part}}
+                    for part in parts
+                ],
+            },
+        }
+
+        with self.assertLogs("ob11-bridge", level="INFO"):
+            asyncio.run(protocol._handle_ob_api(request))
+
+        notice, response = state_module._ob_ws.payloads
+        self.assertEqual(parts, notice["delivered_parts"])
+        self.assertEqual("ok", response["status"])
 
     def test_private_send_fails_closed_before_uia_when_route_is_not_verifiable(self):
         class FakeWebSocket:

@@ -20,6 +20,7 @@ class PreparedContact:
     binding: ContactBinding
     contact: ContactRecord
     request_key: str = ""
+    prompt_messages: tuple[MemoryMessage, ...] = ()
 
 
 def _source_time(value: Any) -> float:
@@ -57,7 +58,7 @@ class ContactMemoryRuntime:
         synchronizer: WeFlowSync,
         context_builder: ContextBuilder,
         qwen_sessions: QwenSessionManager | None,
-        fallback_context_tokens: int = 120_000,
+        fallback_context_tokens: int = 24_000,
     ) -> None:
         normalized_mode = str(mode or "shadow").lower()
         self.mode = normalized_mode if normalized_mode in self.VALID_MODES else "shadow"
@@ -66,7 +67,10 @@ class ContactMemoryRuntime:
         self.synchronizer = synchronizer
         self.context_builder = context_builder
         self.qwen_sessions = qwen_sessions
-        self.fallback_context_tokens = max(1000, int(fallback_context_tokens))
+        self.fallback_context_tokens = min(
+            24_000,
+            max(1000, int(fallback_context_tokens)),
+        )
         # Provider request session IDs use opaque, request-scoped keys. Never
         # key memory by AstrBot UMO alone: separate accounts can reuse a UMO.
         self._prepared: dict[str, PreparedContact] = {}
@@ -172,9 +176,9 @@ class ContactMemoryRuntime:
         self,
         prepared: PreparedContact,
         prompt: str,
-    ) -> None:
+    ) -> tuple[MemoryMessage, ...]:
         if not prompt.strip():
-            return
+            return ()
         sources = prepared.binding.source_messages
         lines = prompt.splitlines()
         messages: list[MemoryMessage] = []
@@ -227,7 +231,11 @@ class ContactMemoryRuntime:
                     pending=True,
                 )
             )
-        await self.store.upsert_messages(prepared.contact.id, messages)
+        _changed, snapshots = await self.store.upsert_messages_with_snapshots(
+            prepared.contact.id,
+            messages,
+        )
+        return snapshots
 
     async def prepare_request(
         self,
@@ -246,16 +254,17 @@ class ContactMemoryRuntime:
             f"{prepared.contact.contact_hmac}."
             f"{secrets.token_urlsafe(18)}"
         )
+        prompt_messages = await self._archive_bridge_input(prepared, prompt)
         prepared = PreparedContact(
             binding=prepared.binding,
             contact=prepared.contact,
             request_key=request_key,
+            prompt_messages=prompt_messages,
         )
         self._prepared[request_key] = prepared
         if len(self._prepared) > 4096:
             oldest_key = next(iter(self._prepared))
             self._prepared.pop(oldest_key, None)
-        await self._archive_bridge_input(prepared, prompt)
         sync_result = await self.synchronizer.sync_contact(
             prepared.contact.id,
             prepared.binding,
@@ -275,6 +284,7 @@ class ContactMemoryRuntime:
             prepared.contact.id,
             current_prompt=current_prompt,
             exclude_source_uids=self.source_uids(prepared.binding),
+            represented_prompt_messages=prepared.prompt_messages,
             token_budget=self.fallback_context_tokens,
         )
         contexts: list[dict[str, Any]] = []
@@ -324,6 +334,7 @@ class ContactMemoryRuntime:
             system_prompt=system_prompt,
             tool_fingerprint=tool_fingerprint,
             exclude_source_uids=self.source_uids(prepared.binding),
+            represented_prompt_messages=prepared.prompt_messages,
             request_key=contact_key,
             input_items=input_items,
             tools=tools,
@@ -344,6 +355,29 @@ class ContactMemoryRuntime:
             await self.store.invalidate_unconfirmed_outputs(prepared.contact.id)
         self._drop_contact_cache(prepared.contact.id)
         return True
+
+    async def record_send_success(self, event: Any) -> bool:
+        prepared = await self.bind_event(event, allow_off=True)
+        if not prepared or prepared.contact.tombstoned_at is not None:
+            return False
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        if not isinstance(raw, Mapping) or raw.get("success") is not True:
+            return False
+        delivered = raw.get("delivered_parts")
+        if not isinstance(delivered, list):
+            return False
+        parts = tuple(
+            value
+            for value in delivered
+            if isinstance(value, str) and value
+        )
+        if not parts:
+            return False
+        return await self.store.confirm_generated_delivery(
+            prepared.contact.id,
+            parts,
+        )
 
     async def archive_fallback_output(
         self,

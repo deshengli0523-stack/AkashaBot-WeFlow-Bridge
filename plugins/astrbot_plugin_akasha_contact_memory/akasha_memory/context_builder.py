@@ -62,12 +62,12 @@ class ContextBuilder:
         self,
         store: MemoryStore,
         *,
-        seed_max_tokens: int = 150_000,
-        recent_query_limit: int = 5000,
-        retrieval_limit: int = 120,
+        seed_max_tokens: int = 24_000,
+        recent_query_limit: int = 200,
+        retrieval_limit: int = 0,
     ) -> None:
         self.store = store
-        self.seed_max_tokens = max(1000, int(seed_max_tokens))
+        self.seed_max_tokens = min(24_000, max(1000, int(seed_max_tokens)))
         self.recent_query_limit = max(100, min(int(recent_query_limit), 10000))
         self.retrieval_limit = max(0, min(int(retrieval_limit), 500))
 
@@ -76,12 +76,27 @@ class ContextBuilder:
         messages: Iterable[MemoryMessage],
         *,
         source_uids: set[str],
+        represented_messages: tuple[MemoryMessage, ...],
         current_prompt: str,
     ) -> list[MemoryMessage]:
+        represented_versions = {
+            (message.id, message.direction, message.effective_content)
+            for message in represented_messages
+            if message.id is not None
+        }
         output = [
             message
             for message in messages
-            if message.source_uid not in source_uids
+            if (
+                (
+                    message.id,
+                    message.direction,
+                    message.effective_content,
+                )
+                not in represented_versions
+                if represented_versions
+                else message.source_uid not in source_uids
+            )
         ]
         normalized_prompt = _normalized_text(current_prompt)
         if not normalized_prompt:
@@ -104,6 +119,7 @@ class ContextBuilder:
         *,
         current_prompt: str = "",
         exclude_source_uids: Iterable[str] = (),
+        represented_prompt_messages: Iterable[MemoryMessage] = (),
         token_budget: int | None = None,
         recent_message_limit: int | None = None,
     ) -> ContextBundle:
@@ -135,6 +151,7 @@ class ContextBuilder:
         recent = self._excluded(
             recent,
             source_uids=set(exclude_source_uids),
+            represented_messages=tuple(represented_prompt_messages),
             current_prompt=current_prompt,
         )
 
@@ -174,6 +191,7 @@ class ContextBuilder:
                 retrieved.append(message)
                 used += cost
 
+        included_retrieved: list[MemoryMessage] = []
         if retrieved:
             marker = {
                 "role": "system",
@@ -184,6 +202,7 @@ class ContextBuilder:
                 items.append(marker)
                 used += marker_cost
                 items.extend(_as_item(message) for message in retrieved)
+                included_retrieved = retrieved
 
         if len(selected_recent) < len(recent):
             marker_text = "更早的完整记录仍保存在本地，本轮仅注入相关片段和最近记录。"
@@ -197,5 +216,8 @@ class ContextBuilder:
             items=tuple(items),
             estimated_tokens=used,
             recent_count=len(selected_recent),
-            retrieved_count=len(retrieved),
+            retrieved_count=len(included_retrieved),
+            represented_messages=tuple(
+                included_retrieved + selected_recent
+            ),
         )

@@ -6,16 +6,17 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
 from .models import ContactRecord, MemoryMessage, QwenSessionRecord
 
 _T = TypeVar("_T")
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 10
 SEND_FAILURE_REBUILD_MESSAGE_LIMIT = 20
 
-_SCHEMA_V7 = """
+_SCHEMA_V10 = """
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY,
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS messages (
     semantic_content TEXT,
     message_type TEXT NOT NULL DEFAULT 'text',
     content_hash TEXT NOT NULL,
+    representation_hash TEXT NOT NULL,
     id_quality TEXT NOT NULL DEFAULT 'source',
     origin TEXT NOT NULL DEFAULT 'weflow',
     pending INTEGER NOT NULL DEFAULT 0 CHECK(pending IN (0, 1)),
@@ -50,6 +52,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_contact_time
     ON messages(contact_id, source_time, source_uid);
 CREATE INDEX IF NOT EXISTS idx_messages_pending_hash
     ON messages(contact_id, direction, pending, content_hash, source_time);
+CREATE TABLE IF NOT EXISTS message_delivery (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    progress TEXT NOT NULL DEFAULT '',
+    confirmed INTEGER NOT NULL DEFAULT 0 CHECK(confirmed IN (0, 1)),
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sync_state (
     contact_id INTEGER PRIMARY KEY REFERENCES contacts(id) ON DELETE CASCADE,
     cursor_time REAL NOT NULL DEFAULT 0,
@@ -93,7 +101,99 @@ CREATE TABLE IF NOT EXISTS qwen_items (
     created_at REAL NOT NULL,
     UNIQUE(session_id, item_id)
 );
-PRAGMA user_version = 7;
+CREATE TABLE IF NOT EXISTS qwen_session_messages (
+    session_id INTEGER NOT NULL
+        REFERENCES qwen_sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL
+        REFERENCES messages(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
+    representation_hash TEXT NOT NULL,
+    represented_at REAL NOT NULL,
+    PRIMARY KEY(session_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qwen_session_messages_message
+    ON qwen_session_messages(message_id, session_id);
+CREATE TABLE IF NOT EXISTS message_replacements (
+    source_uid TEXT NOT NULL,
+    source_direction TEXT NOT NULL
+        CHECK(source_direction IN ('in', 'out')),
+    source_representation_hash TEXT NOT NULL,
+    target_message_id INTEGER NOT NULL
+        REFERENCES messages(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(
+        source_uid, source_direction, source_representation_hash,
+        target_message_id
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_message_replacements_target
+    ON message_replacements(target_message_id);
+PRAGMA user_version = 10;
+COMMIT;
+"""
+
+_MIGRATE_V7_TO_V8 = """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS message_delivery (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    progress TEXT NOT NULL DEFAULT '',
+    confirmed INTEGER NOT NULL DEFAULT 0 CHECK(confirmed IN (0, 1)),
+    updated_at REAL NOT NULL
+);
+PRAGMA user_version = 8;
+COMMIT;
+"""
+
+_MIGRATE_V8_TO_V9 = """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS qwen_session_messages (
+    session_id INTEGER NOT NULL
+        REFERENCES qwen_sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL
+        REFERENCES messages(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
+    content_hash TEXT NOT NULL,
+    represented_at REAL NOT NULL,
+    PRIMARY KEY(session_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qwen_session_messages_message
+    ON qwen_session_messages(message_id, session_id);
+UPDATE qwen_sessions SET dirty = 1;
+PRAGMA user_version = 9;
+COMMIT;
+"""
+
+_MIGRATE_V9_TO_V10 = """
+BEGIN IMMEDIATE;
+DROP TABLE qwen_session_messages;
+CREATE TABLE qwen_session_messages (
+    session_id INTEGER NOT NULL
+        REFERENCES qwen_sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL
+        REFERENCES messages(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
+    representation_hash TEXT NOT NULL,
+    represented_at REAL NOT NULL,
+    PRIMARY KEY(session_id, message_id)
+);
+CREATE INDEX idx_qwen_session_messages_message
+    ON qwen_session_messages(message_id, session_id);
+CREATE TABLE IF NOT EXISTS message_replacements (
+    source_uid TEXT NOT NULL,
+    source_direction TEXT NOT NULL
+        CHECK(source_direction IN ('in', 'out')),
+    source_representation_hash TEXT NOT NULL,
+    target_message_id INTEGER NOT NULL
+        REFERENCES messages(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(
+        source_uid, source_direction, source_representation_hash,
+        target_message_id
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_message_replacements_target
+    ON message_replacements(target_message_id);
+UPDATE qwen_sessions SET dirty = 1;
 COMMIT;
 """
 
@@ -202,6 +302,12 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _representation_hash(message: MemoryMessage) -> str:
+    return hashlib.sha256(
+        message.effective_content.encode("utf-8")
+    ).hexdigest()
+
+
 def _equivalence_text(content: str) -> str:
     return "".join(content.split())
 
@@ -245,6 +351,47 @@ def _message_from_row(row: sqlite3.Row) -> MemoryMessage:
         id_quality=str(row["id_quality"]),
         origin=str(row["origin"]),
         pending=bool(row["pending"]),
+    )
+
+
+def _inherit_message_representation(
+    connection: sqlite3.Connection,
+    contact_id: int,
+    source_message_id: int,
+    target_message_ids: Iterable[int],
+) -> None:
+    ids = tuple(int(message_id) for message_id in target_message_ids)
+    if not ids:
+        return
+    now = time.time()
+    connection.executemany(
+        """
+        INSERT INTO qwen_session_messages(
+            session_id, message_id, direction, representation_hash,
+            represented_at
+        )
+        SELECT
+            represented.session_id,
+            messages.id,
+            messages.direction,
+            messages.representation_hash,
+            ?
+        FROM qwen_session_messages AS represented
+        JOIN qwen_sessions
+          ON qwen_sessions.id = represented.session_id
+        JOIN messages ON messages.id = ?
+        WHERE qwen_sessions.contact_id = ?
+          AND qwen_sessions.dirty = 0
+          AND represented.message_id = ?
+        ON CONFLICT(session_id, message_id) DO UPDATE SET
+            direction = excluded.direction,
+            representation_hash = excluded.representation_hash,
+            represented_at = excluded.represented_at
+        """,
+        (
+            (now, message_id, contact_id, int(source_message_id))
+            for message_id in ids
+        ),
     )
 
 
@@ -351,6 +498,30 @@ class MemoryStore:
                     f"memory schema {current} is newer than supported {_SCHEMA_VERSION}"
                 )
             if current == _SCHEMA_VERSION:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM messages
+                    WHERE representation_hash = ''
+                    """
+                ).fetchall()
+                if rows:
+                    connection.executemany(
+                        """
+                        UPDATE messages SET representation_hash = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            (
+                                _representation_hash(_message_from_row(row)),
+                                int(row["id"]),
+                            )
+                            for row in rows
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE qwen_sessions SET dirty = 1"
+                    )
+                    connection.commit()
                 wal_cursor = connection.execute("PRAGMA journal_mode = WAL")
                 wal_cursor.fetchone()
                 wal_cursor.close()
@@ -365,23 +536,80 @@ class MemoryStore:
                 finally:
                     backup.close()
             if current == 0:
-                connection.executescript(_SCHEMA_V7)
+                connection.executescript(_SCHEMA_V10)
             elif current == 1:
                 connection.executescript(_MIGRATE_V1_TO_V7)
+                connection.executescript(_MIGRATE_V7_TO_V8)
+                connection.executescript(_MIGRATE_V8_TO_V9)
             elif current == 2:
                 connection.executescript(_MIGRATE_V2_TO_V7)
+                connection.executescript(_MIGRATE_V7_TO_V8)
+                connection.executescript(_MIGRATE_V8_TO_V9)
             elif current == 3:
                 connection.executescript(_MIGRATE_V3_TO_V7)
+                connection.executescript(_MIGRATE_V7_TO_V8)
+                connection.executescript(_MIGRATE_V8_TO_V9)
             elif current == 4:
                 connection.executescript(_MIGRATE_V4_TO_V7)
+                connection.executescript(_MIGRATE_V7_TO_V8)
+                connection.executescript(_MIGRATE_V8_TO_V9)
             elif current == 5:
                 connection.executescript(_MIGRATE_V5_TO_V7)
+                connection.executescript(_MIGRATE_V7_TO_V8)
+                connection.executescript(_MIGRATE_V8_TO_V9)
             elif current == 6:
                 connection.executescript(_MIGRATE_V6_TO_V7)
+                connection.executescript(_MIGRATE_V7_TO_V8)
+                connection.executescript(_MIGRATE_V8_TO_V9)
+            elif current == 7:
+                connection.executescript(_MIGRATE_V7_TO_V8)
+                connection.executescript(_MIGRATE_V8_TO_V9)
+            elif current == 8:
+                connection.executescript(_MIGRATE_V8_TO_V9)
+            elif current == 9:
+                pass
             else:
                 raise sqlite3.DatabaseError(
                     f"no migration path from memory schema {current}"
                 )
+            if 1 <= current <= 9:
+                message_columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA table_info(messages)"
+                    ).fetchall()
+                }
+                if "representation_hash" not in message_columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE messages
+                        ADD COLUMN representation_hash
+                            TEXT NOT NULL DEFAULT ''
+                        """
+                    )
+                    connection.commit()
+                connection.executescript(_MIGRATE_V9_TO_V10)
+                rows = connection.execute(
+                    """
+                    SELECT * FROM messages
+                    WHERE representation_hash = ''
+                    """
+                ).fetchall()
+                connection.executemany(
+                    """
+                    UPDATE messages SET representation_hash = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        (
+                            _representation_hash(_message_from_row(row)),
+                            int(row["id"]),
+                        )
+                        for row in rows
+                    ),
+                )
+                connection.execute("PRAGMA user_version = 10")
+                connection.commit()
             wal_cursor = connection.execute("PRAGMA journal_mode = WAL")
             wal_cursor.fetchone()
             wal_cursor.close()
@@ -543,21 +771,30 @@ class MemoryStore:
         messages: Iterable[MemoryMessage],
         *,
         advance_memory_revision: bool = False,
-    ) -> int:
+        _capture_snapshots: bool = False,
+    ) -> int | tuple[int, tuple[MemoryMessage, ...]]:
         records = tuple(messages)
         if not records:
-            return 0
+            return (0, ()) if _capture_snapshots else 0
 
-        def operation(connection: sqlite3.Connection) -> int:
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> int | tuple[int, tuple[MemoryMessage, ...]]:
             contact_state = connection.execute(
                 "SELECT tombstoned_at FROM contacts WHERE id = ?",
                 (contact_id,),
             ).fetchone()
             if contact_state is None or contact_state["tombstoned_at"] is not None:
-                return 0
+                return (0, ()) if _capture_snapshots else 0
             changed = 0
             external_changed = 0
             now = time.time()
+            captured: list[MemoryMessage] = []
+
+            def capture(message: MemoryMessage, message_id: int) -> None:
+                if _capture_snapshots and message_id > 0:
+                    captured.append(replace(message, id=message_id))
+
             for message in records:
                 if not message.source_uid or not message.content:
                     continue
@@ -566,7 +803,8 @@ class MemoryStore:
                     """
                     SELECT
                         id, source_time, direction, content, semantic_content,
-                        message_type, id_quality, origin, pending
+                        message_type, content_hash, representation_hash,
+                        id_quality, origin, pending
                     FROM messages
                     WHERE contact_id = ? AND source_uid = ?
                     """,
@@ -590,13 +828,27 @@ class MemoryStore:
                             ).effective_content
                             == semantic
                         ):
+                            representation_digest = _representation_hash(message)
                             connection.execute(
                                 """
-                                UPDATE messages SET semantic_content = ?
+                                UPDATE messages SET
+                                    semantic_content = ?,
+                                    representation_hash = ?
                                 WHERE id = ?
                                 """,
-                                (semantic, int(existing["id"])),
+                                (
+                                    semantic,
+                                    representation_digest,
+                                    int(existing["id"]),
+                                ),
                             )
+                            if (
+                                str(existing["representation_hash"])
+                                != representation_digest
+                            ):
+                                changed += 1
+                                external_changed += 1
+                        capture(message, int(existing["id"]))
                         continue
                     semantic_content = message.semantic_content
                     if message.origin == "weflow" and semantic_content is None:
@@ -615,6 +867,9 @@ class MemoryStore:
                             )
                             if probe.effective_content == candidate:
                                 semantic_content = candidate
+                    representation_digest = _representation_hash(
+                        replace(message, semantic_content=semantic_content)
+                    )
                     authoritative_changed = (
                         message.origin == "weflow"
                         and str(existing["origin"]) == "weflow"
@@ -623,6 +878,8 @@ class MemoryStore:
                             float(existing["source_time"]) != message.source_time
                             or str(existing["direction"]) != message.direction
                             or str(existing["content"]) != message.content
+                            or str(existing["representation_hash"])
+                            != representation_digest
                             or str(existing["message_type"]) != message.message_type
                             or str(existing["id_quality"]) != message.id_quality
                         )
@@ -632,7 +889,8 @@ class MemoryStore:
                         UPDATE messages SET
                             source_time = ?, direction = ?, content = ?,
                             semantic_content = ?, message_type = ?,
-                            content_hash = ?, id_quality = ?, origin = ?,
+                            content_hash = ?, representation_hash = ?,
+                            id_quality = ?, origin = ?,
                             pending = ?
                         WHERE id = ?
                         """,
@@ -643,6 +901,7 @@ class MemoryStore:
                             semantic_content,
                             message.message_type,
                             content_digest,
+                            representation_digest,
                             message.id_quality,
                             message.origin,
                             int(message.pending),
@@ -652,20 +911,29 @@ class MemoryStore:
                     if authoritative_changed:
                         changed += 1
                         external_changed += 1
+                    capture(message, int(existing["id"]))
                     continue
 
                 pending = None
                 if message.origin == "weflow":
                     pending = connection.execute(
                         """
-                        SELECT id, id_quality, semantic_content FROM messages
-                        WHERE contact_id = ?
-                          AND direction = ?
-                          AND pending = 1
-                          AND origin = ?
-                          AND content_hash = ?
-                          AND ABS(source_time - ?) <= 300
-                        ORDER BY ABS(source_time - ?), id
+                        SELECT
+                            messages.id,
+                            messages.id_quality,
+                            messages.semantic_content,
+                            COALESCE(message_delivery.confirmed, 0)
+                                AS delivery_confirmed
+                        FROM messages
+                        LEFT JOIN message_delivery
+                          ON message_delivery.message_id = messages.id
+                        WHERE messages.contact_id = ?
+                          AND messages.direction = ?
+                          AND messages.pending = 1
+                          AND messages.origin = ?
+                          AND messages.content_hash = ?
+                          AND ABS(messages.source_time - ?) <= 300
+                        ORDER BY ABS(messages.source_time - ?), messages.id
                         LIMIT 1
                         """,
                         (
@@ -681,13 +949,25 @@ class MemoryStore:
                     fallback_output = (
                         str(pending["id_quality"]) == "fallback_response"
                     )
+                    pending_semantic = (
+                        message.semantic_content
+                        if message.semantic_content is not None
+                        else pending["semantic_content"]
+                    )
+                    representation_digest = _representation_hash(
+                        replace(
+                            message,
+                            semantic_content=pending_semantic,
+                        )
+                    )
                     try:
                         connection.execute(
                             """
                             UPDATE messages SET
                                 source_uid = ?, source_time = ?, content = ?,
                                 semantic_content = ?, message_type = ?,
-                                content_hash = ?, id_quality = ?,
+                                content_hash = ?, representation_hash = ?,
+                                id_quality = ?,
                                 origin = 'weflow', pending = 0
                             WHERE id = ?
                             """,
@@ -695,41 +975,42 @@ class MemoryStore:
                                 message.source_uid,
                                 message.source_time,
                                 message.content,
-                                (
-                                    message.semantic_content
-                                    if message.semantic_content is not None
-                                    else pending["semantic_content"]
-                                ),
+                                pending_semantic,
                                 message.message_type,
                                 content_digest,
+                                representation_digest,
                                 message.id_quality,
                                 int(pending["id"]),
                             ),
                         )
+                        capture(message, int(pending["id"]))
                     except sqlite3.IntegrityError:
                         connection.execute(
                             "DELETE FROM messages WHERE id = ?",
                             (int(pending["id"]),),
                         )
+                        replacement = connection.execute(
+                            """
+                            SELECT id FROM messages
+                            WHERE contact_id = ? AND source_uid = ?
+                            """,
+                            (contact_id, message.source_uid),
+                        ).fetchone()
+                        if replacement is not None:
+                            capture(message, int(replacement["id"]))
                     if fallback_output:
-                        # A fallback response is not part of any Qwen
-                        # Conversation. Invalidate even a newer session that
-                        # may have been created while UIA was sending it.
-                        connection.execute(
-                            """
-                            UPDATE qwen_sessions SET dirty = 1
-                            WHERE contact_id = ?
-                            """,
-                            (contact_id,),
-                        )
-                        connection.execute(
-                            """
-                            UPDATE contacts
-                            SET memory_revision = memory_revision + 1
-                            WHERE id = ?
-                            """,
-                            (contact_id,),
-                        )
+                        # Fallback output was produced outside the persistent
+                        # Qwen Conversation. Queue it for incremental append,
+                        # but do not rebuild an otherwise healthy session.
+                        if not bool(pending["delivery_confirmed"]):
+                            connection.execute(
+                                """
+                                UPDATE contacts
+                                SET memory_revision = memory_revision + 1
+                                WHERE id = ?
+                                """,
+                                (contact_id,),
+                            )
                     changed += 1
                     continue
 
@@ -738,8 +1019,9 @@ class MemoryStore:
                     INSERT OR IGNORE INTO messages(
                         contact_id, source_uid, source_time, direction,
                         content, semantic_content, message_type, content_hash,
-                        id_quality, origin, pending, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        representation_hash, id_quality, origin, pending,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         contact_id,
@@ -750,6 +1032,7 @@ class MemoryStore:
                         message.semantic_content,
                         message.message_type,
                         content_digest,
+                        _representation_hash(message),
                         message.id_quality,
                         message.origin,
                         int(message.pending),
@@ -758,25 +1041,81 @@ class MemoryStore:
                 )
                 inserted = max(cursor.rowcount, 0)
                 changed += inserted
+                if inserted:
+                    capture(message, int(cursor.lastrowid))
+                elif _capture_snapshots:
+                    existing_id = connection.execute(
+                        """
+                        SELECT id FROM messages
+                        WHERE contact_id = ? AND source_uid = ?
+                        """,
+                        (contact_id, message.source_uid),
+                    ).fetchone()
+                    if existing_id is not None:
+                        capture(message, int(existing_id["id"]))
                 if inserted and message.origin == "weflow":
                     defer_split_outgoing = False
                     if message.direction == "out":
-                        defer_split_outgoing = (
-                            connection.execute(
+                        generated_candidates = connection.execute(
+                            """
+                            SELECT source_time, content
+                            FROM messages
+                            WHERE contact_id = ?
+                              AND direction = 'out'
+                              AND origin = 'generated'
+                              AND pending = 1
+                              AND ABS(source_time - ?) <= 900
+                            ORDER BY source_time, id
+                            """,
+                            (contact_id, message.source_time),
+                        ).fetchall()
+                        current_message_id = int(cursor.lastrowid)
+                        for generated in generated_candidates:
+                            target = _equivalence_text(
+                                str(generated["content"])
+                            )
+                            if not target:
+                                continue
+                            outgoing = connection.execute(
                                 """
-                                SELECT 1
+                                SELECT id, content
                                 FROM messages
                                 WHERE contact_id = ?
                                   AND direction = 'out'
-                                  AND origin = 'generated'
-                                  AND pending = 1
-                                  AND ABS(source_time - ?) <= 900
-                                LIMIT 1
+                                  AND origin = 'weflow'
+                                  AND pending = 0
+                                  AND source_time >= ?
+                                  AND source_time <= ?
+                                ORDER BY source_time, source_uid
                                 """,
-                                (contact_id, message.source_time),
-                            ).fetchone()
-                            is not None
-                        )
+                                (
+                                    contact_id,
+                                    float(generated["source_time"]) - 10.0,
+                                    message.source_time,
+                                ),
+                            ).fetchall()
+                            current_index = next(
+                                (
+                                    index
+                                    for index, row in enumerate(outgoing)
+                                    if int(row["id"]) == current_message_id
+                                ),
+                                -1,
+                            )
+                            if current_index < 0:
+                                continue
+                            for start_index in range(current_index + 1):
+                                assembled = "".join(
+                                    _equivalence_text(str(row["content"]))
+                                    for row in outgoing[
+                                        start_index : current_index + 1
+                                    ]
+                                )
+                                if assembled and target.startswith(assembled):
+                                    defer_split_outgoing = True
+                                    break
+                            if defer_split_outgoing:
+                                break
                     if not defer_split_outgoing:
                         external_changed += 1
             if external_changed:
@@ -788,10 +1127,6 @@ class MemoryStore:
                     """,
                     (contact_id,),
                 )
-                connection.execute(
-                    "UPDATE qwen_sessions SET dirty = 1 WHERE contact_id = ?",
-                    (contact_id,),
-                )
             elif changed and advance_memory_revision:
                 connection.execute(
                     """
@@ -801,9 +1136,28 @@ class MemoryStore:
                     """,
                     (contact_id,),
                 )
+            if _capture_snapshots:
+                return changed, tuple(captured)
             return changed
 
         return await self._write(operation)
+
+    async def upsert_messages_with_snapshots(
+        self,
+        contact_id: int,
+        messages: Iterable[MemoryMessage],
+        *,
+        advance_memory_revision: bool = False,
+    ) -> tuple[int, tuple[MemoryMessage, ...]]:
+        result = await self.upsert_messages(
+            contact_id,
+            messages,
+            advance_memory_revision=advance_memory_revision,
+            _capture_snapshots=True,
+        )
+        if isinstance(result, tuple):
+            return result
+        return result, ()
 
     async def archive_generated(
         self,
@@ -830,6 +1184,110 @@ class MemoryStore:
             advance_memory_revision=advance_memory_revision,
         )
 
+    async def archive_generated_snapshot(
+        self,
+        contact_id: int,
+        *,
+        response_id: str,
+        content: str,
+        source_time: float | None = None,
+        id_quality: str = "response_id",
+        advance_memory_revision: bool = False,
+    ) -> MemoryMessage | None:
+        message = MemoryMessage(
+            source_uid=f"generated:{response_id}",
+            source_time=source_time or time.time(),
+            direction="out",
+            content=content,
+            id_quality=id_quality,
+            origin="generated",
+            pending=True,
+        )
+        _changed, snapshots = await self.upsert_messages_with_snapshots(
+            contact_id,
+            (message,),
+            advance_memory_revision=advance_memory_revision,
+        )
+        return snapshots[0] if snapshots else None
+
+    async def confirm_generated_delivery(
+        self,
+        contact_id: int,
+        delivered_parts: Iterable[str],
+    ) -> bool:
+        """Advance the FIFO generated turn after UIA reports actual delivery."""
+
+        addition = "".join(
+            _equivalence_text(str(part))
+            for part in delivered_parts
+            if _equivalence_text(str(part))
+        )
+        if not addition:
+            return False
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            rows = connection.execute(
+                """
+                SELECT
+                    messages.id,
+                    messages.content,
+                    messages.id_quality,
+                    COALESCE(message_delivery.progress, '') AS progress,
+                    COALESCE(message_delivery.confirmed, 0) AS confirmed
+                FROM messages
+                LEFT JOIN message_delivery
+                  ON message_delivery.message_id = messages.id
+                WHERE messages.contact_id = ?
+                  AND messages.direction = 'out'
+                  AND messages.origin = 'generated'
+                  AND messages.pending = 1
+                ORDER BY messages.source_time, messages.id
+                """,
+                (contact_id,),
+            ).fetchall()
+            for row in rows:
+                target = _equivalence_text(str(row["content"]))
+                progress = str(row["progress"])
+                if not target or bool(row["confirmed"]):
+                    continue
+                candidate = progress + addition
+                if not target.startswith(candidate):
+                    continue
+                confirmed = candidate == target
+                connection.execute(
+                    """
+                    INSERT INTO message_delivery(
+                        message_id, progress, confirmed, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(message_id) DO UPDATE SET
+                        progress = excluded.progress,
+                        confirmed = excluded.confirmed,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        int(row["id"]),
+                        candidate,
+                        int(confirmed),
+                        time.time(),
+                    ),
+                )
+                if (
+                    confirmed
+                    and str(row["id_quality"]) == "fallback_response"
+                ):
+                    connection.execute(
+                        """
+                        UPDATE contacts
+                        SET memory_revision = memory_revision + 1
+                        WHERE id = ? AND tombstoned_at IS NULL
+                        """,
+                        (contact_id,),
+                    )
+                return confirmed
+            return False
+
+        return await self._write(operation)
+
     async def recent_messages(
         self,
         contact_id: int,
@@ -842,8 +1300,17 @@ class MemoryStore:
             rows = connection.execute(
                 """
                 SELECT * FROM (
-                    SELECT * FROM messages
-                    WHERE contact_id = ? AND pending = 0
+                    SELECT messages.* FROM messages
+                    WHERE contact_id = ?
+                      AND (
+                          pending = 0
+                          OR EXISTS (
+                              SELECT 1
+                              FROM message_delivery
+                              WHERE message_delivery.message_id = messages.id
+                                AND message_delivery.confirmed = 1
+                          )
+                      )
                     ORDER BY source_time DESC, source_uid DESC
                     LIMIT ?
                 )
@@ -892,7 +1359,15 @@ class MemoryStore:
                 f"""
                 SELECT * FROM messages
                 WHERE contact_id = ?
-                  AND pending = 0
+                  AND (
+                      pending = 0
+                      OR EXISTS (
+                          SELECT 1
+                          FROM message_delivery
+                          WHERE message_delivery.message_id = messages.id
+                            AND message_delivery.confirmed = 1
+                      )
+                  )
                   AND (
                       source_time < ?
                       OR (source_time = ? AND source_uid < ?)
@@ -904,6 +1379,97 @@ class MemoryStore:
                 params,
             ).fetchall()
             rows.reverse()
+            return [_message_from_row(row) for row in rows]
+
+        return await self._read(operation)
+
+    async def session_delta_messages(
+        self,
+        contact_id: int,
+        *,
+        session_id: int,
+        after_created_at: float,
+        recent_source_floor: float,
+        limit: int = 200,
+    ) -> list[MemoryMessage]:
+        """Return the oldest external turns not yet represented in the session."""
+
+        safe_limit = max(1, min(int(limit), 500))
+
+        def operation(connection: sqlite3.Connection) -> list[MemoryMessage]:
+            rows = connection.execute(
+                """
+                SELECT * FROM (
+                    SELECT
+                        messages.*,
+                        CASE
+                            WHEN messages.origin = 'generated'
+                            THEN message_delivery.updated_at
+                            ELSE messages.created_at
+                        END AS delta_order_at
+                    FROM messages
+                    LEFT JOIN message_delivery
+                      ON message_delivery.message_id = messages.id
+                    WHERE messages.contact_id = ?
+                      AND (
+                          (
+                              messages.origin = 'weflow'
+                              AND messages.pending = 0
+                              AND (
+                                  (
+                                      messages.created_at > ?
+                                      AND (
+                                          messages.source_time = 0
+                                          OR messages.source_time >= ?
+                                      )
+                                  )
+                                  OR EXISTS (
+                                      SELECT 1
+                                      FROM qwen_session_messages AS previous
+                                      WHERE previous.session_id = ?
+                                        AND previous.message_id = messages.id
+                                        AND (
+                                            previous.direction <>
+                                                messages.direction
+                                            OR previous.representation_hash <>
+                                                messages.representation_hash
+                                        )
+                                  )
+                              )
+                          )
+                          OR (
+                              messages.origin = 'generated'
+                              AND messages.pending = 1
+                              AND messages.id_quality = 'fallback_response'
+                              AND COALESCE(message_delivery.confirmed, 0) = 1
+                              AND message_delivery.updated_at > ?
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM qwen_session_messages
+                          WHERE qwen_session_messages.session_id = ?
+                            AND qwen_session_messages.message_id = messages.id
+                            AND qwen_session_messages.direction =
+                                messages.direction
+                            AND qwen_session_messages.representation_hash =
+                                messages.representation_hash
+                      )
+                    ORDER BY delta_order_at, messages.id
+                    LIMIT ?
+                )
+                ORDER BY delta_order_at, id
+                """,
+                (
+                    contact_id,
+                    float(after_created_at),
+                    max(0.0, float(recent_source_floor)),
+                    session_id,
+                    float(after_created_at),
+                    session_id,
+                    safe_limit,
+                ),
+            ).fetchall()
             return [_message_from_row(row) for row in rows]
 
         return await self._read(operation)
@@ -925,13 +1491,25 @@ class MemoryStore:
                 return 0, False
             pending_rows = connection.execute(
                 """
-                SELECT id, source_time, content, id_quality
+                SELECT
+                    messages.id,
+                    messages.source_uid,
+                    messages.source_time,
+                    messages.content,
+                    messages.representation_hash,
+                    messages.id_quality,
+                    COALESCE(message_delivery.confirmed, 0)
+                        AS delivery_confirmed,
+                    COALESCE(message_delivery.updated_at, 0)
+                        AS delivery_updated_at
                 FROM messages
-                WHERE contact_id = ?
-                  AND direction = 'out'
-                  AND origin = 'generated'
-                  AND pending = 1
-                ORDER BY source_time, id
+                LEFT JOIN message_delivery
+                  ON message_delivery.message_id = messages.id
+                WHERE messages.contact_id = ?
+                  AND messages.direction = 'out'
+                  AND messages.origin = 'generated'
+                  AND messages.pending = 1
+                ORDER BY messages.source_time, messages.id
                 """,
                 (contact_id,),
             ).fetchall()
@@ -1014,31 +1592,62 @@ class MemoryStore:
                     if matched_ids is not None:
                         break
                 if matched_ids is not None:
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO message_replacements(
+                            source_uid, source_direction,
+                            source_representation_hash, target_message_id,
+                            created_at
+                        ) VALUES (?, 'out', ?, ?, ?)
+                        """,
+                        (
+                            (
+                                str(pending["source_uid"]),
+                                str(pending["representation_hash"]),
+                                message_id,
+                                now,
+                            )
+                            for message_id in matched_ids
+                        ),
+                    )
+                    _inherit_message_representation(
+                        connection,
+                        contact_id,
+                        int(pending["id"]),
+                        matched_ids,
+                    )
                     connection.execute(
                         "DELETE FROM messages WHERE id = ?",
                         (int(pending["id"]),),
                     )
                     if str(pending["id_quality"]) == "fallback_response":
-                        # Split UIA sends are reconciled here rather than in
-                        # upsert_messages(). A newer clean cloud session still
-                        # must be rebuilt so it receives the fallback turn.
-                        connection.execute(
-                            """
-                            UPDATE qwen_sessions SET dirty = 1
-                            WHERE contact_id = ?
-                            """,
-                            (contact_id,),
-                        )
-                        connection.execute(
-                            """
-                            UPDATE contacts
-                            SET memory_revision = memory_revision + 1
-                            WHERE id = ?
-                            """,
-                            (contact_id,),
-                        )
+                        # Split fallback sends must be incrementally appended
+                        # only when UIA did not already confirm the delivery.
+                        if not bool(pending["delivery_confirmed"]):
+                            connection.execute(
+                                """
+                                UPDATE contacts
+                                SET memory_revision = memory_revision + 1
+                                WHERE id = ?
+                                """,
+                                (contact_id,),
+                            )
                     used_ids.update(matched_ids)
                     resolved += 1
+                    continue
+                submitted_stale = (
+                    now
+                    - (
+                        float(pending["delivery_updated_at"])
+                        if float(pending["delivery_updated_at"]) > 0
+                        else float(pending["source_time"])
+                    )
+                    >= max(900.0, float(stale_after_seconds))
+                )
+                if bool(pending["delivery_confirmed"]) and not submitted_stale:
+                    # UIA already submitted the full cloud turn. A later
+                    # incoming message must not misclassify it as canceled
+                    # while WeFlow history is still catching up.
                     continue
                 stale = (
                     now - float(pending["source_time"])
@@ -1342,6 +1951,59 @@ class MemoryStore:
 
         return await self._write(operation)
 
+    async def advance_qwen_session_revision(
+        self,
+        session_id: int,
+        *,
+        expected_memory_revision: int,
+        target_memory_revision: int,
+        added_tokens: int = 0,
+    ) -> QwenSessionRecord:
+        """Commit an incremental cloud append without rebuilding the session."""
+
+        def operation(connection: sqlite3.Connection) -> QwenSessionRecord:
+            now = time.time()
+            cursor = connection.execute(
+                """
+                UPDATE qwen_sessions
+                SET memory_revision = ?,
+                    estimated_tokens = estimated_tokens + ?,
+                    last_used_at = ?
+                WHERE id = ?
+                  AND dirty = 0
+                  AND pending_owner = ''
+                  AND memory_revision = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM contacts
+                      WHERE contacts.id = qwen_sessions.contact_id
+                        AND contacts.tombstoned_at IS NULL
+                        AND contacts.memory_revision = ?
+                  )
+                """,
+                (
+                    int(target_memory_revision),
+                    max(0, int(added_tokens)),
+                    now,
+                    session_id,
+                    int(expected_memory_revision),
+                    int(target_memory_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MemoryRevisionChanged(
+                    "contact history changed while appending Qwen session delta"
+                )
+            row = connection.execute(
+                "SELECT * FROM qwen_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise sqlite3.DatabaseError("updated Qwen session is missing")
+            return _session_from_row(row)
+
+        return await self._write(operation)
+
     async def update_qwen_session_usage(
         self,
         session_id: int,
@@ -1451,6 +2113,12 @@ class MemoryStore:
                   AND direction = 'out'
                   AND origin = 'generated'
                   AND pending = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM message_delivery
+                      WHERE message_delivery.message_id = messages.id
+                        AND message_delivery.confirmed = 1
+                  )
                 """,
                 (contact_id,),
             )
@@ -1518,6 +2186,237 @@ class MemoryStore:
             )
 
         await self._write(operation)
+
+    async def record_qwen_external_sources(
+        self,
+        session_id: int,
+        contact_id: int,
+        source_uids: Iterable[str],
+    ) -> None:
+        source_ids = tuple(
+            str(source_uid)
+            for source_uid in source_uids
+            if str(source_uid)
+        )
+        if not source_ids:
+            return
+
+        def operation(connection: sqlite3.Connection) -> None:
+            now = time.time()
+            connection.executemany(
+                """
+                INSERT INTO qwen_session_messages(
+                    session_id, message_id, direction, representation_hash,
+                    represented_at
+                )
+                SELECT
+                    ?, messages.id, messages.direction,
+                    messages.representation_hash, ?
+                FROM messages
+                JOIN qwen_sessions
+                  ON qwen_sessions.id = ?
+                 AND qwen_sessions.contact_id = messages.contact_id
+                WHERE messages.contact_id = ?
+                  AND messages.source_uid = ?
+                ON CONFLICT(session_id, message_id) DO UPDATE SET
+                    direction = excluded.direction,
+                    representation_hash = excluded.representation_hash,
+                    represented_at = excluded.represented_at
+                """,
+                (
+                    (session_id, now, session_id, contact_id, source_uid)
+                    for source_uid in source_ids
+                ),
+            )
+
+        await self._write(operation)
+
+    async def record_qwen_external_messages(
+        self,
+        session_id: int,
+        messages: Iterable[MemoryMessage],
+    ) -> None:
+        snapshots = tuple(
+            message
+            for message in messages
+            if message.id is not None and int(message.id) > 0
+        )
+        if not snapshots:
+            return
+
+        def operation(connection: sqlite3.Connection) -> None:
+            now = time.time()
+            connection.executemany(
+                """
+                INSERT INTO qwen_session_messages(
+                    session_id, message_id, direction, representation_hash,
+                    represented_at
+                )
+                SELECT ?, ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM messages
+                    JOIN qwen_sessions
+                      ON qwen_sessions.id = ?
+                     AND qwen_sessions.contact_id = messages.contact_id
+                    WHERE messages.id = ?
+                )
+                ON CONFLICT(session_id, message_id) DO UPDATE SET
+                    direction = excluded.direction,
+                    representation_hash = excluded.representation_hash,
+                    represented_at = excluded.represented_at
+                """,
+                (
+                    (
+                        session_id,
+                        int(message.id),
+                        message.direction,
+                        _representation_hash(message),
+                        now,
+                        session_id,
+                        int(message.id),
+                    )
+                    for message in snapshots
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO qwen_session_messages(
+                    session_id, message_id, direction, representation_hash,
+                    represented_at
+                )
+                SELECT
+                    ?, target.id, target.direction,
+                    target.representation_hash, ?
+                FROM message_replacements AS replacement
+                JOIN messages AS target
+                  ON target.id = replacement.target_message_id
+                JOIN qwen_sessions AS target_session
+                  ON target_session.id = ?
+                 AND target_session.contact_id = target.contact_id
+                WHERE replacement.source_uid = ?
+                  AND replacement.source_direction = ?
+                  AND replacement.source_representation_hash = ?
+                ON CONFLICT(session_id, message_id) DO UPDATE SET
+                    direction = excluded.direction,
+                    representation_hash = excluded.representation_hash,
+                    represented_at = excluded.represented_at
+                """,
+                (
+                    (
+                        session_id,
+                        now,
+                        session_id,
+                        message.source_uid,
+                        message.direction,
+                        _representation_hash(message),
+                    )
+                    for message in snapshots
+                ),
+            )
+
+        await self._write(operation)
+
+    async def record_qwen_prompt_messages(
+        self,
+        session_id: int,
+        messages: Iterable[MemoryMessage],
+    ) -> None:
+        """Record prompt snapshots without hiding a newer represented version."""
+
+        snapshots = tuple(
+            message
+            for message in messages
+            if message.id is not None and int(message.id) > 0
+        )
+        if not snapshots:
+            return
+
+        def operation(connection: sqlite3.Connection) -> None:
+            now = time.time()
+            connection.executemany(
+                """
+                INSERT INTO qwen_session_messages(
+                    session_id, message_id, direction, representation_hash,
+                    represented_at
+                )
+                SELECT ?, ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM messages
+                    JOIN qwen_sessions
+                      ON qwen_sessions.id = ?
+                     AND qwen_sessions.contact_id = messages.contact_id
+                    WHERE messages.id = ?
+                )
+                ON CONFLICT(session_id, message_id) DO UPDATE SET
+                    direction = excluded.direction,
+                    representation_hash = excluded.representation_hash,
+                    represented_at = excluded.represented_at
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM messages AS current
+                    WHERE current.id = excluded.message_id
+                      AND current.direction =
+                          qwen_session_messages.direction
+                      AND current.representation_hash =
+                          qwen_session_messages.representation_hash
+                )
+                """,
+                (
+                    (
+                        session_id,
+                        int(message.id),
+                        message.direction,
+                        _representation_hash(message),
+                        now,
+                        session_id,
+                        int(message.id),
+                    )
+                    for message in snapshots
+                ),
+            )
+
+        await self._write(operation)
+
+    async def record_qwen_delta_tokens(
+        self,
+        session_id: int,
+        *,
+        expected_memory_revision: int,
+        added_tokens: int,
+    ) -> QwenSessionRecord:
+        """Persist token usage for a partial delta without consuming revision."""
+
+        def operation(connection: sqlite3.Connection) -> QwenSessionRecord:
+            cursor = connection.execute(
+                """
+                UPDATE qwen_sessions
+                SET estimated_tokens = estimated_tokens + ?
+                WHERE id = ?
+                  AND dirty = 0
+                  AND pending_owner = ''
+                  AND memory_revision = ?
+                """,
+                (
+                    max(0, int(added_tokens)),
+                    session_id,
+                    int(expected_memory_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MemoryRevisionChanged(
+                    "Qwen session changed while recording delta progress"
+                )
+            row = connection.execute(
+                "SELECT * FROM qwen_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise sqlite3.DatabaseError("updated Qwen session is missing")
+            return _session_from_row(row)
+
+        return await self._write(operation)
 
     async def list_contact_conversations(self, contact_id: int) -> list[str]:
         return await self._read(

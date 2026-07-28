@@ -412,8 +412,6 @@ class AkashaQwenMemoryProvider(Provider):
         requires_fallback = bool(
             not bound
             or (not current and not tool_inputs)
-            or image_urls
-            or audio_urls
             or tool_calls_result is not None
             or not extra_supported
             or not current_supported
@@ -423,8 +421,6 @@ class AkashaQwenMemoryProvider(Provider):
             or unsupported_required_choice
         )
         if requires_fallback:
-            if bound and self.runtime and session_id:
-                await self.runtime.mark_dirty(str(session_id))
             return await self._fallback(
                 prompt=prompt,
                 session_id=session_id,

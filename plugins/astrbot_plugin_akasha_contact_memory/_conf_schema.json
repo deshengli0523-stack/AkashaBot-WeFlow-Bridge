@@ -55,17 +55,17 @@
   "seed_max_tokens": {
     "description": "新云端会话最大播种 token",
     "type": "int",
-    "default": 150000
+    "default": 24000
   },
   "soft_context_tokens": {
     "description": "云端会话软上限 token",
     "type": "int",
-    "default": 700000
+    "default": 120000
   },
   "fallback_context_tokens": {
     "description": "Chat Completions 回退注入上限 token",
     "type": "int",
-    "default": 120000
+    "default": 24000
   },
   "cloud_ttl_days": {
     "description": "云端会话最长使用天数",

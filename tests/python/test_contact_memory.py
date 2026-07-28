@@ -322,7 +322,7 @@ class ContactMemoryTests(unittest.TestCase):
                     }
                 finally:
                     connection.close()
-                self.assertEqual(7, version)
+                self.assertEqual(10, version)
                 self.assertIn("memory_revision", contact_columns)
                 self.assertIn("next_seed_recent_limit", contact_columns)
                 self.assertIn("memory_revision", session_columns)
@@ -376,7 +376,7 @@ class ContactMemoryTests(unittest.TestCase):
                     ).fetchone()[0]
                 finally:
                     connection.close()
-                self.assertEqual(7, version)
+                self.assertEqual(10, version)
 
         asyncio.run(scenario())
 
@@ -412,9 +412,180 @@ class ContactMemoryTests(unittest.TestCase):
                     ).fetchone()[0]
                 finally:
                     connection.close()
-                self.assertEqual(7, version)
+                self.assertEqual(10, version)
                 self.assertEqual(0, revision)
                 self.assertEqual(0, recent_limit)
+
+        asyncio.run(scenario())
+
+    def test_memory_schema_v7_adds_delivery_confirmation_state(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-v7-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                store = MemoryStore(root)
+                await store.initialize()
+                connection = sqlite3.connect(store.path)
+                try:
+                    connection.execute("DROP TABLE message_delivery")
+                    connection.execute("PRAGMA user_version = 7")
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                await store.initialize()
+                connection = sqlite3.connect(store.path)
+                try:
+                    version = connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                    delivery_table = connection.execute(
+                        """
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE type = 'table' AND name = 'message_delivery'
+                        """
+                    ).fetchone()
+                finally:
+                    connection.close()
+
+                self.assertEqual(10, version)
+                self.assertIsNotNone(delivery_table)
+
+        asyncio.run(scenario())
+
+    def test_memory_schema_v8_adds_versioned_session_message_markers(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-v8-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac="contact-hmac",
+                    account_enc="account",
+                    session_enc="session",
+                    routing_name="contact",
+                )
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="legacy-clean-session",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=time.time(),
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                connection = sqlite3.connect(store.path)
+                try:
+                    connection.execute("DROP TABLE qwen_session_messages")
+                    connection.execute("PRAGMA user_version = 8")
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                await store.initialize()
+                connection = sqlite3.connect(store.path)
+                try:
+                    version = connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0]
+                    marker_table = connection.execute(
+                        """
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE type = 'table'
+                          AND name = 'qwen_session_messages'
+                        """
+                    ).fetchone()
+                finally:
+                    connection.close()
+
+                self.assertEqual(10, version)
+                self.assertIsNotNone(marker_table)
+                migrated = await store.active_qwen_session(contact.id)
+                self.assertIsNotNone(migrated)
+                self.assertTrue(migrated.dirty)
+
+        asyncio.run(scenario())
+
+    def test_memory_schema_v10_repairs_interrupted_representation_backfill(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-v10-repair-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac="contact-hmac",
+                    account_enc="account",
+                    session_enc="session",
+                    routing_name="contact",
+                )
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="interrupted-session",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=time.time() - 60,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:interrupted-media",
+                            time.time(),
+                            "in",
+                            "[图片]",
+                            semantic_content="[图片: cat]",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                connection = sqlite3.connect(store.path)
+                try:
+                    connection.execute(
+                        "UPDATE messages SET representation_hash = ''"
+                    )
+                    connection.execute(
+                        "UPDATE qwen_sessions SET dirty = 0"
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                await store.initialize()
+                connection = sqlite3.connect(store.path)
+                try:
+                    representation_hash = connection.execute(
+                        """
+                        SELECT representation_hash FROM messages
+                        WHERE source_uid = 'raw:interrupted-media'
+                        """
+                    ).fetchone()[0]
+                finally:
+                    connection.close()
+                self.assertTrue(representation_hash)
+                repaired = await store.active_qwen_session(contact.id)
+                self.assertIsNotNone(repaired)
+                self.assertTrue(repaired.dirty)
 
         asyncio.run(scenario())
 
@@ -878,7 +1049,81 @@ class ContactMemoryTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_external_weflow_turn_invalidates_but_current_bridge_echo_does_not(self):
+    def test_bridge_send_success_confirms_generated_cloud_turn(self):
+        fake_aiohttp = types.ModuleType("aiohttp")
+        original_aiohttp = sys.modules.get("aiohttp")
+        sys.modules["aiohttp"] = fake_aiohttp
+        try:
+            from akasha_memory.runtime import ContactMemoryRuntime
+        finally:
+            if original_aiohttp is None:
+                sys.modules.pop("aiohttp", None)
+            else:
+                sys.modules["aiohttp"] = original_aiohttp
+
+        class FakeSync:
+            async def close(self):
+                return None
+
+        class FakeEvent:
+            unified_msg_origin = "aiocqhttp:FriendMessage:123"
+            message_obj = types.SimpleNamespace(
+                raw_message={
+                    "akasha_schema": 1,
+                    "type": "private",
+                    "account": "account",
+                    "session": "session",
+                    "routing_name": "contact",
+                    "source_messages": [],
+                    "notice_type": "akasha_send_result",
+                    "success": True,
+                    "delivered_parts": ["第一句。", "第二句。"],
+                }
+            )
+
+            def is_private_chat(self):
+                return True
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-send-success-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="delivered-response",
+                    content="第一句。第二句。",
+                )
+                runtime = ContactMemoryRuntime(
+                    mode="active",
+                    secret_manager=secrets,
+                    store=store,
+                    synchronizer=FakeSync(),
+                    context_builder=ContextBuilder(store),
+                    qwen_sessions=None,
+                )
+
+                self.assertTrue(await runtime.record_send_success(FakeEvent()))
+                self.assertEqual(
+                    ["第一句。第二句。"],
+                    [
+                        message.content
+                        for message in await store.recent_messages(contact.id)
+                    ],
+                )
+
+        asyncio.run(scenario())
+
+    def test_external_weflow_turn_advances_revision_without_dirtying_session(self):
         async def scenario():
             with tempfile.TemporaryDirectory(prefix="akasha-memory-external-turn-") as temp:
                 root = pathlib.Path(temp)
@@ -948,7 +1193,7 @@ class ContactMemoryTests(unittest.TestCase):
                     ],
                 )
                 current = await store.active_qwen_session(contact.id)
-                self.assertTrue(current.dirty)
+                self.assertFalse(current.dirty)
                 self.assertEqual(1, await store.contact_memory_revision(contact.id))
 
         asyncio.run(scenario())
@@ -1455,7 +1700,13 @@ class ContactMemoryTests(unittest.TestCase):
                 )
                 current = await store.active_qwen_session(contact.id)
                 self.assertEqual("conv-2", current.conversation_id)
-                self.assertTrue(current.dirty)
+                self.assertFalse(current.dirty)
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ["fallback reply A"],
+                    )
+                )
 
                 await manager.respond(
                     contact,
@@ -1466,7 +1717,7 @@ class ContactMemoryTests(unittest.TestCase):
                     tools=tools,
                 )
                 current = await store.active_qwen_session(contact.id)
-                self.assertEqual("conv-3", current.conversation_id)
+                self.assertEqual("conv-2", current.conversation_id)
                 self.assertFalse(current.dirty)
 
                 await store.upsert_messages(
@@ -1494,8 +1745,8 @@ class ContactMemoryTests(unittest.TestCase):
                 self.assertEqual(1, resolved)
                 self.assertFalse(diverged)
                 current = await store.active_qwen_session(contact.id)
-                self.assertEqual("conv-3", current.conversation_id)
-                self.assertTrue(current.dirty)
+                self.assertEqual("conv-2", current.conversation_id)
+                self.assertFalse(current.dirty)
 
         asyncio.run(scenario())
 
@@ -2159,6 +2410,1689 @@ class ContactMemoryTests(unittest.TestCase):
                 self.assertEqual(1, fetch_count)
 
         asyncio.run(scenario())
+
+    def test_successful_delivery_survives_later_incoming_before_weflow_confirmation(
+        self,
+    ):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-delivery-confirmed-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=time.time() - 2100,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="cloud-response",
+                    content="第一句。第二句。",
+                    source_time=time.time() - 1800,
+                )
+
+                self.assertFalse(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ["第一句。"],
+                    )
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ["第二句。"],
+                    )
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:later-incoming",
+                            time.time(),
+                            "in",
+                            "下一条消息",
+                            origin="weflow",
+                        )
+                    ],
+                )
+                resolved, dirty = await store.reconcile_pending_outputs(
+                    contact.id,
+                    stale_after_seconds=30,
+                )
+
+                self.assertEqual(resolved, 0)
+                self.assertFalse(dirty)
+                self.assertFalse(
+                    (await store.active_qwen_session(contact.id)).dirty
+                )
+                self.assertIn(
+                    "第一句。第二句。",
+                    [
+                        message.content
+                        for message in await store.recent_messages(contact.id)
+                    ],
+                )
+
+        asyncio.run(scenario())
+
+    def test_external_delta_appends_without_recreating_contact_conversation(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.add_calls = []
+                self.respond_calls = []
+
+            async def create_conversation(self, *, metadata=None):
+                conversation_id = f"conv-{len(self.created) + 1}"
+                self.created.append(conversation_id)
+                return conversation_id
+
+            async def add_items(self, conversation_id, items):
+                copied = [dict(item) for item in items]
+                self.add_calls.append((conversation_id, copied))
+                return [
+                    f"{conversation_id}-item-{len(self.add_calls)}-{index}"
+                    for index in range(len(copied))
+                ]
+
+            async def respond(
+                self,
+                *,
+                conversation_id,
+                model,
+                prompt,
+                input_items=None,
+                tools=None,
+                tool_choice="auto",
+                request_max_retries=None,
+            ):
+                self.respond_calls.append((conversation_id, prompt))
+                index = len(self.respond_calls)
+                return QwenResult(
+                    response_id=f"response-{index}",
+                    text=f"reply-{index}",
+                    input_tokens=100 + index,
+                    output_tokens=10,
+                )
+
+            async def delete_conversation_fully(self, _conversation_id):
+                return None
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-incremental-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                client = FakeClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+
+                await manager.respond(
+                    contact,
+                    prompt="first prompt",
+                    system_prompt="persona",
+                    request_key="request-1",
+                )
+                client.add_calls.clear()
+                await store.upsert_messages(
+                    contact.id,
+                    [
+                        MemoryMessage(
+                            "raw:manual-outgoing",
+                            time.time() + 1,
+                            "out",
+                            "operator note",
+                            origin="weflow",
+                        )
+                    ],
+                )
+                self.assertFalse(
+                    (await store.active_qwen_session(contact.id)).dirty
+                )
+
+                await manager.respond(
+                    contact,
+                    prompt="second prompt",
+                    system_prompt="persona",
+                    request_key="request-2",
+                )
+
+                self.assertEqual(client.created, ["conv-1"])
+                self.assertEqual(
+                    client.respond_calls,
+                    [
+                        ("conv-1", "first prompt"),
+                        ("conv-1", "second prompt"),
+                    ],
+                )
+                self.assertEqual(
+                    client.add_calls,
+                    [
+                        (
+                            "conv-1",
+                            [{"role": "assistant", "content": "operator note"}],
+                        )
+                    ],
+                )
+
+        asyncio.run(scenario())
+
+    def test_incremental_delta_keeps_bounded_backlog_and_late_fallback(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.add_calls = []
+                self.respond_calls = []
+
+            async def create_conversation(self, *, metadata=None):
+                conversation_id = f"conv-{len(self.created) + 1}"
+                self.created.append(conversation_id)
+                return conversation_id
+
+            async def add_items(self, conversation_id, items):
+                copied = [dict(item) for item in items]
+                self.add_calls.append((conversation_id, copied))
+                return [
+                    f"{conversation_id}-item-{len(self.add_calls)}-{index}"
+                    for index in range(len(copied))
+                ]
+
+            async def respond(
+                self,
+                *,
+                conversation_id,
+                model,
+                prompt,
+                input_items=None,
+                tools=None,
+                tool_choice="auto",
+                request_max_retries=None,
+            ):
+                self.respond_calls.append((conversation_id, prompt))
+                index = len(self.respond_calls)
+                return QwenResult(
+                    response_id=f"response-{index}",
+                    text=f"reply-{index}",
+                    input_tokens=100,
+                    output_tokens=10,
+                )
+
+            async def delete_conversation_fully(self, _conversation_id):
+                return None
+
+        def appended_contents(client):
+            return [
+                str(item["content"])
+                for _conversation_id, items in client.add_calls
+                for item in items
+                if item.get("role") in {"user", "assistant"}
+            ]
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-delta-watermark-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                client = FakeClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+                await manager.respond(
+                    contact,
+                    prompt="create session",
+                    system_prompt="persona",
+                    request_key="request-1",
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ("reply-1",),
+                    )
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:reply-1",
+                            time.time(),
+                            "out",
+                            "reply-1",
+                            origin="weflow",
+                        ),
+                        MemoryMessage(
+                            "raw:after-native-reply",
+                            time.time() + 0.1,
+                            "out",
+                            "external after native reply",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after native reply observation",
+                    system_prompt="persona",
+                    request_key="request-2",
+                )
+                self.assertEqual(
+                    ["external after native reply"],
+                    appended_contents(client),
+                )
+
+                tiny_messages = [
+                    MemoryMessage(
+                        f"raw:tiny-{index:03d}",
+                        time.time() + index / 1000,
+                        "in",
+                        f"external-{index:03d}",
+                        origin="weflow",
+                    )
+                    for index in range(201)
+                ]
+                await store.upsert_messages(contact.id, tiny_messages)
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after tiny backlog",
+                    system_prompt="persona",
+                    request_key="request-3",
+                )
+                self.assertEqual(
+                    [message.content for message in tiny_messages],
+                    appended_contents(client),
+                )
+
+                large_messages = [
+                    MemoryMessage(
+                        f"raw:large-{index:03d}",
+                        time.time() + 10 + index / 1000,
+                        "out",
+                        f"large-{index:03d}-" + ("x" * 1000),
+                        origin="weflow",
+                    )
+                    for index in range(60)
+                ]
+                await store.upsert_messages(contact.id, large_messages)
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="first bounded append",
+                    system_prompt="persona",
+                    request_key="request-4",
+                )
+                partial = appended_contents(client)
+                self.assertGreater(len(partial), 0)
+                self.assertLess(len(partial), len(large_messages))
+                await manager.respond(
+                    contact,
+                    prompt="second bounded append",
+                    system_prompt="persona",
+                    request_key="request-5",
+                )
+                self.assertEqual(
+                    [message.content for message in large_messages],
+                    appended_contents(client),
+                )
+                self.assertEqual(
+                    await store.contact_memory_revision(contact.id),
+                    (await store.active_qwen_session(contact.id)).memory_revision,
+                )
+
+                oversized = "oversized-" + ("长" * 40_000)
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:oversized",
+                            time.time() + 20,
+                            "in",
+                            oversized,
+                            origin="weflow",
+                        ),
+                        MemoryMessage(
+                            "raw:after-oversized",
+                            time.time() + 21,
+                            "in",
+                            "small after oversized",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="first oversized append",
+                    system_prompt="persona",
+                    request_key="request-6",
+                )
+                await manager.respond(
+                    contact,
+                    prompt="second oversized append",
+                    system_prompt="persona",
+                    request_key="request-7",
+                )
+                oversized_delta = appended_contents(client)
+                self.assertEqual(2, len(oversized_delta))
+                self.assertTrue(
+                    oversized_delta[0].startswith("【单条消息过长")
+                )
+                self.assertLess(len(oversized_delta[0]), len(oversized))
+                self.assertEqual(
+                    "small after oversized",
+                    oversized_delta[1],
+                )
+                self.assertEqual(
+                    await store.contact_memory_revision(contact.id),
+                    (await store.active_qwen_session(contact.id)).memory_revision,
+                )
+
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:native-prompt",
+                            time.time() + 30,
+                            "in",
+                            "native prompt",
+                            origin="bridge",
+                            pending=True,
+                        ),
+                    ),
+                )
+                await manager.respond(
+                    contact,
+                    prompt="native prompt",
+                    system_prompt="persona",
+                    request_key="request-8",
+                    exclude_source_uids=("raw:native-prompt",),
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:native-prompt",
+                            time.time() + 31,
+                            "in",
+                            "native prompt",
+                            origin="weflow",
+                        ),
+                        MemoryMessage(
+                            "raw:after-native-prompt",
+                            time.time() + 32,
+                            "in",
+                            "external after native prompt",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after native prompt observation",
+                    system_prompt="persona",
+                    request_key="request-9",
+                )
+                self.assertEqual(
+                    ["external after native prompt"],
+                    appended_contents(client),
+                )
+
+                await manager.archive_fallback_output(
+                    contact.id,
+                    "late fallback reply",
+                )
+                await manager.respond(
+                    contact,
+                    prompt="turn before fallback confirmation",
+                    system_prompt="persona",
+                    request_key="request-10",
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ("late fallback reply",),
+                    )
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="turn after fallback confirmation",
+                    system_prompt="persona",
+                    request_key="request-11",
+                )
+                self.assertEqual(
+                    ["late fallback reply"],
+                    appended_contents(client),
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:late-fallback",
+                            time.time() + 40,
+                            "out",
+                            "late fallback reply",
+                            origin="weflow",
+                        ),
+                        MemoryMessage(
+                            "raw:after-fallback",
+                            time.time() + 41,
+                            "out",
+                            "external after fallback",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after fallback observation",
+                    system_prompt="persona",
+                    request_key="request-12",
+                )
+                self.assertEqual(
+                    ["external after fallback"],
+                    appended_contents(client),
+                )
+
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:corrected",
+                            time.time() + 50,
+                            "out",
+                            "old authoritative content",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="before correction",
+                    system_prompt="persona",
+                    request_key="request-13",
+                )
+                self.assertEqual(
+                    ["old authoritative content"],
+                    appended_contents(client),
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:corrected",
+                            time.time() + 51,
+                            "out",
+                            "corrected authoritative content",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after correction",
+                    system_prompt="persona",
+                    request_key="request-14",
+                )
+                self.assertEqual(
+                    ["corrected authoritative content"],
+                    appended_contents(client),
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:corrected",
+                            time.time() + 52,
+                            "out",
+                            "old authoritative content",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after correction rollback",
+                    system_prompt="persona",
+                    request_key="request-15",
+                )
+                self.assertEqual(
+                    ["old authoritative content"],
+                    appended_contents(client),
+                )
+
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:semantic-correction",
+                            time.time() + 53,
+                            "in",
+                            "[图片]",
+                            semantic_content="[图片: cat]",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after semantic image",
+                    system_prompt="persona",
+                    request_key="request-16",
+                )
+                self.assertEqual(
+                    ["[图片: cat]"],
+                    appended_contents(client),
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:semantic-correction",
+                            time.time() + 54,
+                            "in",
+                            "[图片]",
+                            semantic_content="[图片: dog]",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="after semantic correction",
+                    system_prompt="persona",
+                    request_key="request-17",
+                )
+                self.assertEqual(
+                    ["[图片: dog]"],
+                    appended_contents(client),
+                )
+                self.assertEqual(client.created, ["conv-1"])
+
+        asyncio.run(scenario())
+
+    def test_send_failure_preserves_earlier_submitted_generated_turn(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-failure-scope-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=time.time(),
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="submitted-a",
+                    content="reply A",
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ("reply A",),
+                    )
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="failed-b",
+                    content="reply B",
+                )
+
+                deleted = await store.invalidate_unconfirmed_outputs(contact.id)
+
+                self.assertEqual(1, deleted)
+                self.assertEqual(
+                    ["reply A"],
+                    [
+                        message.content
+                        for message in await store.recent_messages(contact.id)
+                        if message.origin == "generated"
+                    ],
+                )
+                self.assertTrue(
+                    (await store.active_qwen_session(contact.id)).dirty
+                )
+
+        asyncio.run(scenario())
+
+    def test_delta_marker_survives_concurrent_fallback_identity_change(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class BlockingClient:
+            def __init__(self):
+                self.calls = []
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def add_items(self, conversation_id, items):
+                copied = [dict(item) for item in items]
+                self.calls.append((conversation_id, copied))
+                if len(self.calls) == 1:
+                    self.entered.set()
+                    await self.release.wait()
+                return [
+                    f"item-{len(self.calls)}-{index}"
+                    for index in range(len(copied))
+                ]
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-delta-race-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                created_at = time.time() - 60
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=created_at,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                session = await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="fallback-race",
+                    content="fallback race",
+                    id_quality="fallback_response",
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ("fallback race",),
+                    )
+                )
+                client = BlockingClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+                append_task = asyncio.create_task(
+                    manager._append_external_delta(
+                        session,
+                        contact_id=contact.id,
+                        target_memory_revision=1,
+                        current_prompt="",
+                        exclude_source_uids=(),
+                    )
+                )
+                await asyncio.wait_for(client.entered.wait(), timeout=2)
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:fallback-race",
+                            time.time(),
+                            "out",
+                            "fallback race",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.release.set()
+                session = await asyncio.wait_for(append_task, timeout=2)
+                self.assertEqual(
+                    [["fallback race"]],
+                    [
+                        [item["content"] for item in items]
+                        for _conversation_id, items in client.calls
+                    ],
+                )
+
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:after-race",
+                            time.time() + 1,
+                            "out",
+                            "after race",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                session = await manager._append_external_delta(
+                    session,
+                    contact_id=contact.id,
+                    target_memory_revision=2,
+                    current_prompt="",
+                    exclude_source_uids=(),
+                )
+                self.assertEqual(
+                    [["fallback race"], ["after race"]],
+                    [
+                        [item["content"] for item in items]
+                        for _conversation_id, items in client.calls
+                    ],
+                )
+                self.assertEqual(2, session.memory_revision)
+
+        asyncio.run(scenario())
+
+    def test_delta_marker_records_the_version_actually_sent_during_correction(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class BlockingClient:
+            def __init__(self):
+                self.calls = []
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def add_items(self, conversation_id, items):
+                copied = [dict(item) for item in items]
+                self.calls.append((conversation_id, copied))
+                if len(self.calls) == 1:
+                    self.entered.set()
+                    await self.release.wait()
+                return [
+                    f"item-{len(self.calls)}-{index}"
+                    for index in range(len(copied))
+                ]
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-content-race-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                created_at = time.time() - 60
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=created_at,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                session = await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:corrected-race",
+                            time.time(),
+                            "out",
+                            "old content",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client = BlockingClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+                append_task = asyncio.create_task(
+                    manager._append_external_delta(
+                        session,
+                        contact_id=contact.id,
+                        target_memory_revision=1,
+                        current_prompt="",
+                        exclude_source_uids=(),
+                    )
+                )
+                await asyncio.wait_for(client.entered.wait(), timeout=2)
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:corrected-race",
+                            time.time() + 1,
+                            "out",
+                            "corrected content",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.release.set()
+                session = await asyncio.wait_for(append_task, timeout=2)
+                self.assertEqual(
+                    [["old content"], ["corrected content"]],
+                    [
+                        [item["content"] for item in items]
+                        for _conversation_id, items in client.calls
+                    ],
+                )
+
+                session = await manager._append_external_delta(
+                    session,
+                    contact_id=contact.id,
+                    target_memory_revision=2,
+                    current_prompt="",
+                    exclude_source_uids=(),
+                )
+                self.assertEqual(2, len(client.calls))
+                self.assertEqual(2, session.memory_revision)
+
+        asyncio.run(scenario())
+
+    def test_split_reconcile_during_remote_add_does_not_append_twice(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class BlockingClient:
+            def __init__(self):
+                self.calls = []
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def add_items(self, conversation_id, items):
+                copied = [dict(item) for item in items]
+                self.calls.append((conversation_id, copied))
+                if len(self.calls) == 1:
+                    self.entered.set()
+                    await self.release.wait()
+                return [
+                    f"item-{len(self.calls)}-{index}"
+                    for index in range(len(copied))
+                ]
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-split-add-race-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                created_at = time.time() - 60
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=created_at,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                session = await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="fallback-split-race",
+                    content="part Apart B",
+                    id_quality="fallback_response",
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ("part A", "part B"),
+                    )
+                )
+                client = BlockingClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+                append_task = asyncio.create_task(
+                    manager._append_external_delta(
+                        session,
+                        contact_id=contact.id,
+                        target_memory_revision=1,
+                        current_prompt="",
+                        exclude_source_uids=(),
+                    )
+                )
+                await asyncio.wait_for(client.entered.wait(), timeout=2)
+                now = time.time()
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:split-race-a",
+                            now,
+                            "out",
+                            "part A",
+                            origin="weflow",
+                        ),
+                        MemoryMessage(
+                            "raw:split-race-b",
+                            now + 1,
+                            "out",
+                            "part B",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                resolved, dirty = await store.reconcile_pending_outputs(
+                    contact.id,
+                )
+                self.assertEqual(1, resolved)
+                self.assertFalse(dirty)
+                client.release.set()
+                session = await asyncio.wait_for(append_task, timeout=2)
+
+                self.assertEqual(
+                    [["part Apart B"]],
+                    [
+                        [item["content"] for item in items]
+                        for _conversation_id, items in client.calls
+                    ],
+                )
+                self.assertEqual(1, session.memory_revision)
+                self.assertEqual(
+                    [],
+                    await store.session_delta_messages(
+                        contact.id,
+                        session_id=session.id,
+                        after_created_at=session.created_at,
+                        recent_source_floor=session.created_at - 300,
+                    ),
+                )
+
+        asyncio.run(scenario())
+
+    def test_prompt_snapshot_survives_bridge_to_weflow_uid_rewrite(self):
+        fake_client_module = types.ModuleType("akasha_memory.qwen_client")
+        fake_client_module.QwenClient = object
+        original = sys.modules.get("akasha_memory.qwen_client")
+        sys.modules["akasha_memory.qwen_client"] = fake_client_module
+        try:
+            from akasha_memory.qwen_session import QwenSessionManager, stable_hash
+        finally:
+            if original is None:
+                sys.modules.pop("akasha_memory.qwen_client", None)
+            else:
+                sys.modules["akasha_memory.qwen_client"] = original
+
+        class FakeClient:
+            def __init__(self):
+                self.add_calls = []
+                self.responses = 0
+
+            async def add_items(self, conversation_id, items):
+                copied = [dict(item) for item in items]
+                self.add_calls.append((conversation_id, copied))
+                return [
+                    f"item-{len(self.add_calls)}-{index}"
+                    for index in range(len(copied))
+                ]
+
+            async def respond(
+                self,
+                *,
+                conversation_id,
+                model,
+                prompt,
+                input_items=None,
+                tools=None,
+                tool_choice="auto",
+                request_max_retries=None,
+            ):
+                self.responses += 1
+                return QwenResult(
+                    response_id=f"response-{self.responses}",
+                    text=f"reply-{self.responses}",
+                    input_tokens=100,
+                    output_tokens=10,
+                )
+
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-prompt-id-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                created_at = time.time() - 60
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash=stable_hash("persona"),
+                    tool_hash=stable_hash(""),
+                    created_at=created_at,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                source_time = time.time()
+                _changed, snapshots = (
+                    await store.upsert_messages_with_snapshots(
+                        contact.id,
+                        (
+                            MemoryMessage(
+                                "bridge:fp:1",
+                                source_time,
+                                "in",
+                                "native prompt",
+                                origin="bridge",
+                                pending=True,
+                            ),
+                        ),
+                    )
+                )
+                self.assertEqual(1, len(snapshots))
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:observed",
+                            source_time,
+                            "in",
+                            "native prompt",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                observed = next(
+                    message
+                    for message in await store.recent_messages(contact.id)
+                    if message.content == "native prompt"
+                )
+                self.assertEqual(snapshots[0].id, observed.id)
+                self.assertNotEqual(snapshots[0].source_uid, observed.source_uid)
+
+                client = FakeClient()
+                manager = QwenSessionManager(
+                    store=store,
+                    context_builder=ContextBuilder(store),
+                    client=client,
+                )
+                await manager.respond(
+                    contact,
+                    prompt="native prompt",
+                    system_prompt="persona",
+                    request_key="request-1",
+                    exclude_source_uids=("bridge:fp:1",),
+                    represented_prompt_messages=snapshots,
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:after-prompt",
+                            source_time + 1,
+                            "in",
+                            "external after prompt",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                client.add_calls.clear()
+                await manager.respond(
+                    contact,
+                    prompt="next prompt",
+                    system_prompt="persona",
+                    request_key="request-2",
+                )
+                self.assertEqual(
+                    ["external after prompt"],
+                    [
+                        item["content"]
+                        for _conversation_id, items in client.add_calls
+                        for item in items
+                    ],
+                )
+
+        asyncio.run(scenario())
+
+    def test_context_seed_keeps_new_semantic_version_of_current_prompt(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-semantic-prompt-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                source_time = time.time()
+                _changed, prompt_snapshots = (
+                    await store.upsert_messages_with_snapshots(
+                        contact.id,
+                        (
+                            MemoryMessage(
+                                "raw:semantic-prompt",
+                                source_time,
+                                "in",
+                                "[图片]",
+                                semantic_content="[图片: cat]",
+                                origin="weflow",
+                            ),
+                        ),
+                    )
+                )
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:semantic-prompt",
+                            source_time + 1,
+                            "in",
+                            "[图片]",
+                            semantic_content="[图片: dog]",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+
+                bundle = await ContextBuilder(store).build(
+                    contact.id,
+                    current_prompt="[图片: cat]",
+                    represented_prompt_messages=prompt_snapshots,
+                )
+
+                self.assertEqual(
+                    ["[图片: dog]"],
+                    [
+                        item["content"]
+                        for item in bundle.items
+                        if item.get("role") == "user"
+                    ],
+                )
+                self.assertEqual(
+                    ["[图片: dog]"],
+                    [
+                        message.effective_content
+                        for message in bundle.represented_messages
+                    ],
+                )
+
+        asyncio.run(scenario())
+
+    def test_session_markers_cannot_cross_contact_boundaries(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-marker-contact-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact_a = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session-a"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session-a"),
+                    routing_name="contact-a",
+                )
+                contact_b = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session-b"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session-b"),
+                    routing_name="contact-b",
+                )
+                created_at = time.time() - 60
+                session_a = await store.create_qwen_session(
+                    contact_a.id,
+                    conversation_id="contact-a-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=created_at,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                await store.activate_qwen_session(
+                    session_a.id,
+                    expected_memory_revision=0,
+                )
+                await store.upsert_messages(
+                    contact_b.id,
+                    (
+                        MemoryMessage(
+                            "raw:contact-b-secret",
+                            time.time(),
+                            "in",
+                            "contact B message",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                message_b = (await store.recent_messages(contact_b.id))[0]
+
+                await store.record_qwen_external_messages(
+                    session_a.id,
+                    (message_b,),
+                )
+                delta = await store.session_delta_messages(
+                    contact_b.id,
+                    session_id=session_a.id,
+                    after_created_at=created_at,
+                    recent_source_floor=created_at - 300,
+                )
+                self.assertEqual(
+                    ["contact B message"],
+                    [message.content for message in delta],
+                )
+
+        asyncio.run(scenario())
+
+    def test_unrepresented_fallback_split_remains_queued_for_delta(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-unrepresented-split-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                created_at = time.time() - 60
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=created_at,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                session = await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="fallback-not-yet-appended",
+                    content="part Apart B",
+                    id_quality="fallback_response",
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ("part A", "part B"),
+                    )
+                )
+                now = time.time()
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:unrepresented-a",
+                            now,
+                            "out",
+                            "part A",
+                            origin="weflow",
+                        ),
+                        MemoryMessage(
+                            "raw:unrepresented-b",
+                            now + 1,
+                            "out",
+                            "part B",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                resolved, dirty = await store.reconcile_pending_outputs(
+                    contact.id,
+                )
+                self.assertEqual(1, resolved)
+                self.assertFalse(dirty)
+                delta = await store.session_delta_messages(
+                    contact.id,
+                    session_id=session.id,
+                    after_created_at=session.created_at,
+                    recent_source_floor=session.created_at - 300,
+                )
+                self.assertEqual(
+                    ["part A", "part B"],
+                    [message.content for message in delta],
+                )
+
+        asyncio.run(scenario())
+
+    def test_split_weflow_confirmation_inherits_session_representation(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory(
+                prefix="akasha-memory-split-marker-"
+            ) as temp:
+                root = pathlib.Path(temp)
+                secrets = SecretManager(root)
+                store = MemoryStore(root)
+                await store.initialize()
+                contact = await store.ensure_contact(
+                    contact_hmac=secrets.contact_hmac("account", "session"),
+                    account_enc=secrets.encrypt_text("account"),
+                    session_enc=secrets.encrypt_text("session"),
+                    routing_name="contact",
+                )
+                created_at = time.time() - 60
+                session = await store.create_qwen_session(
+                    contact.id,
+                    conversation_id="persistent-conversation",
+                    model="qwen3.7-max",
+                    persona_hash="persona",
+                    tool_hash="tools",
+                    created_at=created_at,
+                    expires_at=time.time() + 3600,
+                    estimated_tokens=100,
+                    expected_memory_revision=0,
+                )
+                session = await store.activate_qwen_session(
+                    session.id,
+                    expected_memory_revision=0,
+                )
+                await store.archive_generated(
+                    contact.id,
+                    response_id="fallback-split",
+                    content="part Apart B",
+                    id_quality="fallback_response",
+                )
+                self.assertTrue(
+                    await store.confirm_generated_delivery(
+                        contact.id,
+                        ("part A", "part B"),
+                    )
+                )
+                generated = next(
+                    message
+                    for message in await store.recent_messages(contact.id)
+                    if message.origin == "generated"
+                )
+                await store.record_qwen_external_messages(
+                    session.id,
+                    (generated,),
+                )
+                now = time.time()
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:split-a",
+                            now,
+                            "out",
+                            "part A",
+                            origin="weflow",
+                        ),
+                        MemoryMessage(
+                            "raw:split-b",
+                            now + 1,
+                            "out",
+                            "part B",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                resolved, dirty = await store.reconcile_pending_outputs(
+                    contact.id,
+                )
+                self.assertEqual(1, resolved)
+                self.assertFalse(dirty)
+                await store.upsert_messages(
+                    contact.id,
+                    (
+                        MemoryMessage(
+                            "raw:after-split",
+                            now + 2,
+                            "out",
+                            "after split",
+                            origin="weflow",
+                        ),
+                    ),
+                )
+                delta = await store.session_delta_messages(
+                    contact.id,
+                    session_id=session.id,
+                    after_created_at=session.created_at,
+                    recent_source_floor=session.created_at - 300,
+                )
+                self.assertEqual(["after split"], [item.content for item in delta])
+
+        asyncio.run(scenario())
+
+    def test_media_xml_is_replaced_with_short_semantic_placeholders(self):
+        original_aiohttp = sys.modules.get("aiohttp")
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+        try:
+            from akasha_memory.weflow_sync import parse_weflow_messages
+        finally:
+            if original_aiohttp is None:
+                sys.modules.pop("aiohttp", None)
+            else:
+                sys.modules["aiohttp"] = original_aiohttp
+
+        records = [
+            {
+                "rawid": "app-1",
+                "localType": "49",
+                "parsedContent": "<msg><appmsg><title>secret</title></appmsg></msg>",
+            },
+            {
+                "rawid": "file-1",
+                "localType": "49",
+                "mediaType": "file",
+                "fileName": "report.pdf",
+                "rawContent": "<msg><appmsg><type>6</type></appmsg></msg>",
+            },
+            {
+                "rawid": "image-1",
+                "localType": "3",
+                "rawContent": "<msg><img aeskey=\"private\" /></msg>",
+            },
+            {
+                "rawid": "video-1",
+                "localType": "43",
+                "content": "<msg><videomsg cdnthumburl=\"private\" /></msg>",
+            },
+            {
+                "rawid": "sticker-1",
+                "localType": "47",
+                "mediaType": "emoji",
+                "rawContent": (
+                    "<msg><emoji md5=\"private\" "
+                    "cdnurl=\"https://private.example/sticker\" /></msg>"
+                ),
+            },
+        ]
+
+        messages = parse_weflow_messages(records)
+
+        self.assertEqual(
+            [message.content for message in messages],
+            [
+                "[微信应用消息]",
+                "[文件: report.pdf]",
+                "[图片]",
+                "[图片]",
+                "[视频]",
+            ],
+        )
+        serialized = "\n".join(message.content for message in messages)
+        self.assertNotIn("<msg", serialized)
+        self.assertNotIn("private", serialized)
+        self.assertTrue(all(len(message.content) <= 120 for message in messages))
+
+    def test_memory_defaults_keep_initial_seed_well_below_context_limit(self):
+        schema = json.loads(
+            (PLUGIN / "_conf_schema.json").read_text(encoding="utf-8")
+        )
+        builder = ContextBuilder(MemoryStore(pathlib.Path(".")))
+
+        self.assertEqual(schema["seed_max_tokens"]["default"], 24_000)
+        self.assertEqual(schema["soft_context_tokens"]["default"], 120_000)
+        self.assertEqual(schema["fallback_context_tokens"]["default"], 24_000)
+        self.assertEqual(builder.seed_max_tokens, 24_000)
+        self.assertEqual(builder.recent_query_limit, 200)
+        self.assertEqual(builder.retrieval_limit, 0)
 
 
 if __name__ == "__main__":

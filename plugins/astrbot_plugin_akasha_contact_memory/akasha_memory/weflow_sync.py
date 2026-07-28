@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -58,19 +59,73 @@ def _backfill_watermark(records: list[dict[str, Any]]) -> float:
 
 
 def _message_content(record: dict[str, Any]) -> str:
+    message_type = _as_text(
+        record.get("localType") or record.get("type") or record.get("msgType")
+    ).casefold()
+    media_type = _as_text(
+        record.get("mediaType") or record.get("messageType")
+    ).casefold()
+
+    if message_type in {"3", "image"} or media_type in {
+        "image",
+        "photo",
+    }:
+        return "[图片]"
+    if message_type in {"43", "video"} or media_type == "video":
+        return "[视频]"
+    if message_type in {"34", "voice", "audio"} or media_type in {
+        "voice",
+        "audio",
+    }:
+        return "[语音]"
+    if message_type in {"47", "sticker", "emoji"} or media_type in {
+        "sticker",
+        "emoji",
+    }:
+        # Custom stickers are exported as GIF/WebP image media. Normalizing
+        # them as images lets the bridge's short visual description survive
+        # the later authoritative WeFlow sync for the same source message.
+        return "[图片]"
+    if message_type in {"49", "app"} or media_type in {
+        "app",
+        "file",
+        "document",
+    }:
+        filename = ""
+        for key in ("fileName", "filename", "name"):
+            candidate = _as_text(record.get(key))
+            if candidate:
+                filename = candidate
+                break
+        filename = re.sub(r"[\x00-\x1f\x7f]+", " ", filename)
+        filename = re.split(r"[\\/]", filename)[-1].strip()
+        if filename and media_type in {"file", "document"}:
+            return f"[文件: {filename[:80]}]"
+        return "[微信应用消息]"
+
     for key in ("parsedContent", "content", "rawContent"):
         value = record.get(key)
         if isinstance(value, dict):
             for nested_key in ("text", "content", "title", "description"):
                 nested = _as_text(value.get(nested_key))
                 if nested:
+                    normalized = nested.lstrip().casefold()
+                    if normalized.startswith(
+                        ("<?xml", "<msg", "<appmsg", "<xml")
+                    ):
+                        return "[微信应用消息]"
                     return nested
         text = _as_text(value)
         if text:
+            normalized = text.lstrip().casefold()
+            if (
+                normalized.startswith("<?xml")
+                or normalized.startswith("<msg")
+                or normalized.startswith("<appmsg")
+                or normalized.startswith("<xml")
+            ):
+                return "[微信应用消息]"
             return text
-    message_type = _as_text(
-        record.get("localType") or record.get("type") or record.get("msgType")
-    )
     return f"[{message_type or '非文本消息'}]"
 
 

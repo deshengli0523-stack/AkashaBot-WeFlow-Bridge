@@ -103,6 +103,8 @@ class UiaFixedSenderTests(unittest.TestCase):
         sender_module.state.running = True
         sender_module.state.paused.clear()
         sender_module.state.sender_instance = None
+        if hasattr(sender_module.state, "clear_last_send_result"):
+            sender_module.state.clear_last_send_result()
         with sender_module.state.send_preview_lock:
             sender_module.state.current_send_cancel_event = None
             sender_module.state.current_send_preview = None
@@ -112,13 +114,20 @@ class UiaFixedSenderTests(unittest.TestCase):
         sender_module.state.paused.clear()
 
     def _sender(self, driver=None, **changes):
-        return sender_module.UiaFixedSender(
-            calibration=copy.deepcopy(VALID_CALIBRATION),
-            driver=driver or self.driver,
-            sleep_fn=self.sleep_calls.append,
-            pre_paste_preview_delay=changes.get("pre_paste_preview_delay", 0),
-            pre_send_delay=changes.get("pre_send_delay", 0),
-        )
+        kwargs = {
+            "calibration": copy.deepcopy(VALID_CALIBRATION),
+            "driver": driver or self.driver,
+            "sleep_fn": self.sleep_calls.append,
+            "pre_paste_preview_delay": changes.get("pre_paste_preview_delay", 0),
+            "pre_send_delay": changes.get("pre_send_delay", 0),
+            "settle_jitter_max_seconds": changes.get(
+                "settle_jitter_max_seconds",
+                0,
+            ),
+        }
+        if "rng" in changes:
+            kwargs["rng"] = changes["rng"]
+        return sender_module.UiaFixedSender(**kwargs)
 
     def _runtime_validation(self, calibration, metrics):
         self.driver.events.append(("validate",))
@@ -169,6 +178,263 @@ class UiaFixedSenderTests(unittest.TestCase):
             self.assertEqual(sender._next_pre_send_delay(), 4.25)
         uniform.assert_called_once_with(3.0, 5.0)
 
+    def test_settle_jitter_is_injected_at_click_and_pre_paste_boundaries(self):
+        class FixedRng:
+            def __init__(self):
+                self.calls = []
+
+            def uniform(self, minimum, maximum):
+                self.calls.append((minimum, maximum))
+                return 0.2
+
+        rng = FixedRng()
+        sender = self._sender(
+            settle_jitter_max_seconds=0.3,
+            rng=rng,
+        )
+
+        sent = self._send_text(sender)
+
+        self.assertIs(sent, True)
+        self.assertGreaterEqual(rng.calls.count((0.0, 0.3)), 5)
+        self.assertIn(0.32, self.sleep_calls)
+        self.assertIn(0.2, self.sleep_calls)
+        self.assertIn(
+            0.50,
+            self.sleep_calls,
+            "clipboard ownership retention must remain unchanged",
+        )
+
+    def test_text_jitter_precedes_clipboard_and_cancel_prevents_copy(self):
+        class FixedRng:
+            def uniform(self, minimum, maximum):
+                return 0.2
+
+        cancel_event = threading.Event()
+        ordered_events = []
+
+        def pause(seconds):
+            ordered_events.append(("sleep", seconds))
+            if seconds == 0.2:
+                cancel_event.set()
+
+        clipboard = types.ModuleType("pyperclip")
+        clipboard.copy = lambda value: ordered_events.append(("copy", value))
+        clipboard.paste = lambda: ""
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            sleep_fn=pause,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+            settle_jitter_max_seconds=0.3,
+            rng=FixedRng(),
+        )
+
+        with mock.patch.dict(sys.modules, {"pyperclip": clipboard}):
+            pasted = sender._paste_text(
+                "private-body",
+                before_paste=lambda: not cancel_event.is_set(),
+            )
+
+        self.assertIs(pasted, False)
+        self.assertEqual(ordered_events, [("sleep", 0.2)])
+        self.assertNotIn(("hotkey_ctrl", sender_module.VK_V), self.driver.events)
+
+    def test_text_pause_during_jitter_waits_and_resumes_same_item(self):
+        class SequenceRng:
+            def __init__(self):
+                self.values = iter(
+                    (0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0)
+                )
+
+            def uniform(self, minimum, maximum):
+                return next(self.values)
+
+        paused_once = {"value": False}
+        resumed_wait = {"value": False}
+
+        def pause(seconds):
+            self.sleep_calls.append(seconds)
+            if seconds == 0.2 and not paused_once["value"]:
+                paused_once["value"] = True
+                sender_module.state.paused.set()
+            elif sender_module.state.paused.is_set():
+                resumed_wait["value"] = True
+                sender_module.state.paused.clear()
+
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            sleep_fn=pause,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+            settle_jitter_max_seconds=0.3,
+            rng=SequenceRng(),
+        )
+
+        sent = self._send_text(sender)
+
+        self.assertIs(sent, True)
+        self.assertTrue(paused_once["value"])
+        self.assertTrue(resumed_wait["value"])
+        self.assertEqual(
+            sum(
+                event == ("copy_text", "private-body")
+                for event in self.driver.events
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                event[:2] == ("click", "send_button")
+                for event in self.driver.events
+            ),
+            1,
+        )
+
+    def test_pause_after_body_copy_clears_clipboard_before_retry(self):
+        clipboard_value = {"value": ""}
+        paused_once = {"value": False}
+        cleared_before_resume = {"value": False}
+        clipboard = types.ModuleType("pyperclip")
+
+        def copy_text(value):
+            clipboard_value["value"] = value
+            self.driver.events.append(("copy_text", value))
+
+        clipboard.copy = copy_text
+        clipboard.paste = lambda: clipboard_value["value"]
+
+        def pause(seconds):
+            self.sleep_calls.append(seconds)
+            if (
+                seconds == 0.05
+                and clipboard_value["value"] == "private-body"
+                and not paused_once["value"]
+            ):
+                paused_once["value"] = True
+                sender_module.state.paused.set()
+            elif sender_module.state.paused.is_set():
+                cleared_before_resume["value"] = (
+                    clipboard_value["value"] == ""
+                )
+                sender_module.state.paused.clear()
+
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            sleep_fn=pause,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+            settle_jitter_max_seconds=0,
+        )
+
+        with mock.patch.object(
+            sender_module,
+            "validate_runtime_metrics",
+            side_effect=self._runtime_validation,
+        ), mock.patch.dict(sys.modules, {"pyperclip": clipboard}):
+            sent = sender.send_text("private-contact", "private-body")
+
+        self.assertIs(sent, True)
+        self.assertTrue(paused_once["value"])
+        self.assertTrue(cleared_before_resume["value"])
+        self.assertEqual(
+            sum(
+                event == ("copy_text", "private-body")
+                for event in self.driver.events
+            ),
+            2,
+            "the same FIFO item should retry once after resume",
+        )
+        self.assertEqual(
+            sum(
+                event == ("hotkey_ctrl", sender_module.VK_V)
+                for event in self.driver.events
+            ),
+            2,
+            "the aborted body copy must not send an extra paste hotkey",
+        )
+
+    def test_rapid_pause_resume_uses_stable_retry_reason(self):
+        sender = self._sender()
+        original_paste = sender._paste_text
+        blocked_once = {"value": False}
+
+        def paste_with_fast_resume(value, before_paste=None):
+            if before_paste is not None and not blocked_once["value"]:
+                blocked_once["value"] = True
+                sender_module.state.paused.set()
+                try:
+                    self.assertIs(before_paste(), False)
+                finally:
+                    sender_module.state.paused.clear()
+                return False
+            return original_paste(value, before_paste=before_paste)
+
+        with mock.patch.object(
+            sender,
+            "_paste_text",
+            side_effect=paste_with_fast_resume,
+        ):
+            sent = self._send_text(sender)
+
+        self.assertIs(sent, True)
+        self.assertTrue(blocked_once["value"])
+        self.assertEqual(
+            sender_module.state.get_last_send_result()["status"],
+            "sent",
+        )
+
+    def test_image_jitter_stop_prevents_clipboard_copy_and_paste(self):
+        class SequenceRng:
+            def __init__(self):
+                self.values = iter((0.0, 0.0, 0.0, 0.0, 0.2))
+
+            def uniform(self, minimum, maximum):
+                return next(self.values)
+
+        def pause(seconds):
+            self.sleep_calls.append(seconds)
+            if seconds == 0.2:
+                sender_module.state.running = False
+
+        sender = sender_module.UiaFixedSender(
+            calibration=copy.deepcopy(VALID_CALIBRATION),
+            driver=self.driver,
+            sleep_fn=pause,
+            pre_paste_preview_delay=0,
+            pre_send_delay=0,
+            settle_jitter_max_seconds=0.3,
+            rng=SequenceRng(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            image_path = str(pathlib.Path(temporary) / "private-image.png")
+            pathlib.Path(image_path).write_bytes(b"fake")
+            with mock.patch.object(
+                sender_module,
+                "validate_runtime_metrics",
+                side_effect=self._runtime_validation,
+            ), self._clipboard_boundary(
+                lambda value: self.driver.events.append(("copy_text", value))
+            ):
+                sent = sender.send_image("private-contact", image_path)
+
+        self.assertIs(sent, False)
+        self.assertFalse(
+            any(event[0] == "copy_image" for event in self.driver.events),
+            self.driver.events,
+        )
+        self.assertEqual(
+            sum(
+                event == ("hotkey_ctrl", sender_module.VK_V)
+                for event in self.driver.events
+            ),
+            1,
+            "only the contact search paste may occur before the stop",
+        )
+
     def test_text_send_uses_calibrated_first_result_without_ocr(self):
         sender = self._sender()
 
@@ -197,7 +463,10 @@ class UiaFixedSenderTests(unittest.TestCase):
         self.assertTrue(self.sleep_calls, "fake sleep boundary was not exercised")
 
     def test_image_send_uses_calibrated_first_result_without_ocr(self):
-        sender = self._sender(pre_send_delay=5)
+        sender = self._sender(
+            pre_send_delay=5,
+            settle_jitter_max_seconds=0,
+        )
         with tempfile.TemporaryDirectory() as temporary:
             image_path = str(pathlib.Path(temporary) / "private-image-path.png")
             pathlib.Path(image_path).write_bytes(b"fake-driver-does-not-open-this")
@@ -347,6 +616,27 @@ class UiaFixedSenderTests(unittest.TestCase):
                 )
                 self.assertFalse(any(event[0] == "click" for event in driver.events))
 
+    def test_sender_failure_publishes_safe_reason_for_control_panel(self):
+        self.driver.metrics = valid_metrics(foreground=False)
+        sender = self._sender()
+
+        with self.assertLogs("weflow-bridge", logging.ERROR):
+            sent = self._send_text(
+                sender,
+                contact="private-contact",
+                text="private-body",
+            )
+
+        self.assertIs(sent, False)
+        result = sender_module.state.get_last_send_result()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["code"], CALIBRATION_WINDOW)
+        self.assertEqual(result["stage"], "preflight")
+        self.assertTrue(result["message"])
+        serialized = str(result)
+        self.assertNotIn("private-contact", serialized)
+        self.assertNotIn("private-body", serialized)
+
     def test_unclassified_failure_logs_only_generic_code(self):
         sender = self._sender()
 
@@ -364,6 +654,26 @@ class UiaFixedSenderTests(unittest.TestCase):
             captured.output,
             ["ERROR:weflow-bridge:[UIA_FIXED] send failed"],
         )
+        self.assertEqual(
+            sender_module.state.get_last_send_result()["code"],
+            "E_UIA_CONTACT_SELECTION_FAILED",
+        )
+
+    def test_new_preview_clears_stale_send_result(self):
+        sender_module.state.record_send_result(
+            False,
+            code="E_UIA_SEND_FAILED",
+            stage="submit",
+        )
+
+        cancel_event = sender_module.state.begin_send_preview(
+            "private-contact",
+            "private-body",
+        )
+        try:
+            self.assertIsNone(sender_module.state.get_last_send_result())
+        finally:
+            sender_module.state.end_send_preview(cancel_event)
 
     def test_missing_image_returns_false_without_ui_or_clipboard_actions(self):
         sender = self._sender()
@@ -804,6 +1114,10 @@ class UiaFixedSenderTests(unittest.TestCase):
                 event[:2] == ("click", "send_button")
                 for event in self.driver.events
             )
+        )
+        self.assertEqual(
+            sender_module.state.get_last_send_result()["code"],
+            "E_UIA_SEND_CANCELLED",
         )
 
     def test_cancel_while_paused_drops_only_current_fifo_item(self):
