@@ -1,0 +1,9 @@
+name: astrbot_plugin_akasha_money_receiver
+display_name: Akasha 红包与转账接收
+desc: 使用 AstrBot 多模态 Provider 接管前台微信，领取收到的红包或转账。
+author: deshengli0523-stack
+version: 0.1.0
+repo: https://github.com/deshengli0523-stack/AkashaBot-WeFlow-Bridge
+astrbot_version: "==4.26.6"
+support_platforms:
+  - aiocqhttp

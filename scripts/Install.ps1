@@ -46,9 +46,9 @@ function Get-AkashaInstallPayload {
   $launchers = Get-AkashaLauncherNames
   $entries = New-Object System.Collections.Generic.List[object]
   foreach ($name in @(
-      'bridge_core.py', 'config.py', 'main.py', 'ob_client.py', 'ob_protocol.py', 'privacy.py',
-      'state.py', 'uia_contact_selector.py', 'uia_fixed_sender.py', 'uia_support.py',
-      'windows_ocr_selector.ps1', 'calibrate_uia_fixed.py', 'web_panel.py',
+      'bridge_core.py', 'config.py', 'main.py', 'money_action.py', 'money_service.py', 'ob_client.py', 'ob_protocol.py', 'privacy.py',
+      'state.py', 'uia_fixed_sender.py', 'uia_support.py',
+      'calibrate_uia_fixed.py', 'web_panel.py',
       'config.example.json', 'requirements.txt', 'requirements.lock'
     )) {
     $entries.Add([pscustomobject]@{ Source = Join-Path 'bridge' $name; Destination = Join-Path 'app\bridge' $name })
@@ -85,6 +85,18 @@ function Get-AkashaContactMemoryPluginPayload {
       'akasha_memory\runtime.py',
       'akasha_memory\security.py'
     )) {
+    $entries.Add([pscustomobject]@{
+      Source = Join-Path $pluginRoot $name
+      Relative = $name
+    })
+  }
+  return $entries.ToArray()
+}
+
+function Get-AkashaMoneyReceiverPluginPayload {
+  $pluginRoot = 'plugins\astrbot_plugin_akasha_money_receiver'
+  $entries = New-Object System.Collections.Generic.List[object]
+  foreach ($name in @('__init__.py', 'main.py', 'metadata.yaml', '_conf_schema.json')) {
     $entries.Add([pscustomobject]@{
       Source = Join-Path $pluginRoot $name
       Relative = $name
@@ -141,6 +153,35 @@ function Assert-AkashaContactMemoryPluginSource {
       @($actual | Where-Object { $expected -cnotcontains $_ }).Count -ne 0 -or
       @($expected | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
     throw 'E_SOURCE_PLUGIN: The contact-memory plugin source does not match the exact payload allowlist.'
+  }
+}
+
+function Assert-AkashaMoneyReceiverPluginSource {
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][object[]]$Payload
+  )
+
+  $pluginRoot = Join-Path $Root 'plugins\astrbot_plugin_akasha_money_receiver'
+  if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) {
+    throw 'E_SOURCE_PLUGIN: The money-receiver plugin source directory is missing.'
+  }
+  foreach ($item in @(Get-Item -LiteralPath $pluginRoot -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $pluginRoot -Recurse -Force -ErrorAction Stop)) {
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      throw 'E_SOURCE_PLUGIN: The money-receiver plugin source contains a reparse point.'
+    }
+  }
+  $expected = @($Payload | ForEach-Object { [string]$_.Source } | Sort-Object)
+  $rootPrefixLength = $Root.TrimEnd('\', '/').Length + 1
+  $actual = @(
+    Get-ChildItem -LiteralPath $pluginRoot -Recurse -Force -File -ErrorAction Stop |
+      ForEach-Object { $_.FullName.Substring($rootPrefixLength) } |
+      Sort-Object
+  )
+  if ($actual.Count -ne $expected.Count -or
+      @($actual | Where-Object { $expected -cnotcontains $_ }).Count -ne 0 -or
+      @($expected | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
+    throw 'E_SOURCE_PLUGIN: The money-receiver plugin source does not match the exact payload allowlist.'
   }
 }
 
@@ -517,21 +558,22 @@ function Install-AkashaContactMemoryPlugin {
     [Parameter(Mandatory)][string]$SourceRoot,
     [Parameter(Mandatory)]$Paths,
     [Parameter(Mandatory)][object[]]$Payload,
+    [string]$PluginName = 'astrbot_plugin_akasha_contact_memory',
+    [string]$PluginLabel = 'contact-memory',
     [scriptblock]$ReplacementHook
   )
 
   $astrBotConfig = Join-Path $Paths.AstrBotData 'data\cmd_config.json'
   if (-not (Test-AkashaCanonicalFile -Root $Paths.Root -Path $astrBotConfig)) {
-    throw 'E_PLUGIN_INSTALL: AstrBot must be initialized before the contact-memory plugin is deployed.'
+    throw "E_PLUGIN_INSTALL: AstrBot must be initialized before the $PluginLabel plugin is deployed."
   }
 
-  $pluginName = 'astrbot_plugin_akasha_contact_memory'
   $pluginsRoot = Join-Path $Paths.AstrBotData 'data\plugins'
-  $target = Join-Path $pluginsRoot $pluginName
+  $target = Join-Path $pluginsRoot $PluginName
   $transactionId = [guid]::NewGuid().ToString('N')
   $stageRoot = Join-Path $Paths.State ('.plugin-stage-' + $transactionId)
-  $stagedPlugin = Join-Path $stageRoot $pluginName
-  $backup = Join-Path $Paths.Backups ('plugin-' + $pluginName + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + $transactionId.Substring(0, 8))
+  $stagedPlugin = Join-Path $stageRoot $PluginName
+  $backup = Join-Path $Paths.Backups ('plugin-' + $PluginName + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + $transactionId.Substring(0, 8))
   Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @(
     $Paths.AstrBotData, $pluginsRoot, $target, $Paths.State, $stageRoot, $stagedPlugin, $Paths.Backups, $backup
   )
@@ -542,7 +584,7 @@ function Install-AkashaContactMemoryPlugin {
   try {
     if (Test-Path -LiteralPath $target) {
       if (-not (Test-Path -LiteralPath $target -PathType Container)) {
-        throw 'E_PLUGIN_INSTALL: The contact-memory plugin target is not a directory.'
+        throw "E_PLUGIN_INSTALL: The $PluginLabel plugin target is not a directory."
       }
       Assert-AkashaInstallTreeSafe -Paths $Paths -Path $target
     }
@@ -550,7 +592,7 @@ function Install-AkashaContactMemoryPlugin {
     foreach ($entry in $Payload) {
       $source = Join-Path $SourceRoot ([string]$entry.Source)
       if (-not (Test-AkashaCanonicalFile -Root $SourceRoot -Path $source)) {
-        throw 'E_SOURCE_PAYLOAD: Contact-memory plugin source changed during installation.'
+        throw "E_SOURCE_PAYLOAD: $PluginLabel plugin source changed during installation."
       }
       $destination = Join-Path $stagedPlugin ([string]$entry.Relative)
       Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($stageRoot, $stagedPlugin, $destination)
@@ -558,7 +600,7 @@ function Install-AkashaContactMemoryPlugin {
       Copy-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
     }
     if (-not (Test-Path -LiteralPath (Join-Path $stagedPlugin 'main.py') -PathType Leaf)) {
-      throw 'E_PLUGIN_INSTALL: The staged contact-memory plugin is missing main.py.'
+      throw "E_PLUGIN_INSTALL: The staged $PluginLabel plugin is missing main.py."
     }
 
     if (Test-Path -LiteralPath $target -PathType Container) {
@@ -603,7 +645,7 @@ function Install-AkashaContactMemoryPlugin {
     throw $operationError
   }
   if (-not $cleanupSucceeded) {
-    throw 'E_PLUGIN_CLEANUP: Contact-memory plugin staging cleanup failed.'
+    throw "E_PLUGIN_CLEANUP: $PluginLabel plugin staging cleanup failed."
   }
 }
 
@@ -815,6 +857,7 @@ function Invoke-AkashaInstall {
 
   $payload = @(Get-AkashaInstallPayload)
   $pluginPayload = @(Get-AkashaContactMemoryPluginPayload)
+  $moneyPluginPayload = @(Get-AkashaMoneyReceiverPluginPayload)
   $sourceContext = Open-AkashaLifecycleRootContext -Root $SourceRoot
   $rootContext = $null
   $stateContext = $null
@@ -826,8 +869,9 @@ function Invoke-AkashaInstall {
   $calibrationRequired = $false
   $installStateActive = $false
   try {
-    $version = Assert-AkashaInstallSource -Root $sourceContext.RootPath -Payload (@($payload) + @($pluginPayload))
+    $version = Assert-AkashaInstallSource -Root $sourceContext.RootPath -Payload (@($payload) + @($pluginPayload) + @($moneyPluginPayload))
     Assert-AkashaContactMemoryPluginSource -Root $sourceContext.RootPath -Payload $pluginPayload
+    Assert-AkashaMoneyReceiverPluginSource -Root $sourceContext.RootPath -Payload $moneyPluginPayload
     $sourcePath = [System.IO.Path]::GetFullPath($sourceContext.RootPath).TrimEnd('\', '/')
     $installPath = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\', '/')
     $sourcePrefix = $sourcePath + [System.IO.Path]::DirectorySeparatorChar
@@ -905,6 +949,7 @@ function Invoke-AkashaInstall {
     Write-AkashaInstallLog -Paths $paths -Message 'phase=configuration status=completed'
     Write-AkashaInstallLog -Paths $paths -Message 'phase=plugin status=started'
     Install-AkashaContactMemoryPlugin -SourceRoot $sourceContext.RootPath -Paths $paths -Payload $pluginPayload -ReplacementHook $ReplacementHook
+    Install-AkashaContactMemoryPlugin -SourceRoot $sourceContext.RootPath -Paths $paths -Payload $moneyPluginPayload -PluginName 'astrbot_plugin_akasha_money_receiver' -PluginLabel 'money-receiver' -ReplacementHook $ReplacementHook
     Write-AkashaInstallLog -Paths $paths -Message 'phase=plugin status=completed'
 
     $launchers = Get-AkashaLauncherNames

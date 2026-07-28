@@ -1374,6 +1374,82 @@ class BridgeRuntimeTests(unittest.TestCase):
         ):
             self.assertNotIn(private_name, serialized)
 
+    def test_money_agent_http_surface_requires_capability_and_routes_steps(self):
+        invalid = {"schema_version": 1, "completed": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, state_module, _ = self._load_web_panel(
+                invalid,
+                config_path,
+                log_path,
+            )
+            calls = []
+
+            class Service:
+                def get_frame(self, **kwargs):
+                    calls.append(("frame", kwargs))
+                    return {
+                        "status": "active",
+                        "frame_sha256": "a" * 64,
+                    }
+
+                def submit_step(self, **kwargs):
+                    calls.append(("step", kwargs))
+                    return {"status": "active"}
+
+                def public_status(self):
+                    return {"active": True}
+
+            state_module.bridge_lock = threading.Lock()
+            state_module.bridge_instance = types.SimpleNamespace(
+                money_actions=Service(),
+                _sse_session=None,
+            )
+            denied = self._invoke_web_handler(
+                panel,
+                "do_GET",
+                "/api/money-action/frame?request_id=req-1",
+            )
+            frame = self._invoke_web_handler(
+                panel,
+                "do_GET",
+                "/api/money-action/frame?request_id=req-1",
+                request_headers={"Authorization": "Bearer capability"},
+            )
+            step_body = {
+                "request_id": "req-1",
+                "frame_sha256": "a" * 64,
+                "action": {"type": "wait"},
+            }
+            step = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/api/money-action/step?request_id=req-1",
+                step_body,
+                request_headers={"Authorization": "Bearer capability"},
+            )
+
+        self.assertEqual(denied["code"], 403)
+        self.assertEqual(frame["data"]["status"], "active")
+        self.assertEqual(step["data"]["status"], "active")
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "frame",
+                    {"request_id": "req-1", "token": "capability"},
+                ),
+                (
+                    "step",
+                    {"token": "capability", "payload": step_body},
+                ),
+            ],
+        )
+
     def test_text_preview_and_exact_cancel_are_exposed_in_control_panel(self):
         invalid = {"schema_version": 1, "completed": True}
         with tempfile.TemporaryDirectory() as temporary:
@@ -3084,6 +3160,100 @@ class BridgeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(bridge.add_to_buffer.call_count, 2)
         self.assertEqual(bridge.processed_ids, set())
+
+    def test_money_sse_markers_and_unresolved_receipts_are_panel_only(self):
+        timestamp = 2_000_000_000
+        payloads = [
+            {
+                "content": "[红包]",
+                "sourceName": "测试联系人",
+                "sessionId": "wxid-contact",
+                "sessionType": "private",
+                "timestamp": timestamp,
+                "rawid": "candidate-1",
+            },
+            {
+                "content": "[转账]",
+                "sourceName": "测试联系人",
+                "sessionId": "wxid-contact",
+                "sessionType": "private",
+                "timestamp": timestamp + 1,
+                "rawid": "candidate-2",
+            },
+            {
+                "content": "你领取了$wxid_unresolved123$的红包",
+                "sourceName": "测试联系人",
+                "sessionId": "wxid-contact",
+                "sessionType": "private",
+                "timestamp": timestamp + 2,
+                "rawid": "receipt-1",
+            },
+        ]
+
+        class FakeResponse:
+            status_code = 200
+
+            def iter_lines(self, decode_unicode=False):
+                self.decode_unicode = decode_unicode
+                return [
+                    "data:" + json.dumps(payload, ensure_ascii=False)
+                    for payload in payloads
+                ]
+
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = ""
+        config_module.BUFFER_SECONDS = 5
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "test-token"
+        ob_protocol_module = types.ModuleType("ob_protocol")
+        ob_protocol_module.make_message_event = lambda *_args, **_kwargs: {}
+        ob_protocol_module.push_event = lambda _event: 1
+        requests_module = types.ModuleType("requests")
+        requests_module.get = lambda *_args, **_kwargs: FakeResponse()
+        requests_module.exceptions = types.SimpleNamespace(
+            ConnectionError=ConnectionError,
+        )
+
+        spec = importlib.util.spec_from_file_location(
+            "bridge_money_panel_sse_test",
+            BRIDGE / "bridge_core.py",
+        )
+        bridge_core = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "state": state_module,
+                "config": config_module,
+                "ob_protocol": ob_protocol_module,
+                "requests": requests_module,
+            },
+        ):
+            spec.loader.exec_module(bridge_core)
+
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge.start_timestamp = timestamp - 1
+        bridge.money_actions = types.SimpleNamespace(
+            handle_sse=lambda data: data.get("content")
+            in {"[红包]", "[转账]"}
+        )
+
+        with self.assertLogs("ob11-bridge", level="INFO") as logs:
+            bridge.listen_sse()
+
+        records = [
+            json.loads(line.split("CHAT ", 1)[1])
+            for line in logs.output
+            if "CHAT " in line
+        ]
+        self.assertEqual(
+            [record["body"] for record in records],
+            ["[红包]", "[转账]", "红包领取成功"],
+        )
+        self.assertNotIn("wxid_unresolved123", "\n".join(logs.output))
+        self.assertEqual(bridge.pending_buffers, {})
 
     def test_inbound_chat_logs_keep_complete_contacts_and_bodies(self):
         class FakeTimer:

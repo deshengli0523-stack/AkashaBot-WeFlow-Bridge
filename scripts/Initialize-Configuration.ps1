@@ -696,6 +696,15 @@ function Initialize-AkashaConfiguration {
       if ($weFlow.GetType() -ne [System.Management.Automation.PSCustomObject]) {
         throw 'E_CONFIGURATION_SCHEMA: WeFlow configuration must be a JSON object.'
       }
+      if ($null -eq $bridge.PSObject.Properties['money_receive_enabled']) {
+        Set-JsonProperty -Object $bridge -Name 'money_receive_enabled' -Value $true
+      }
+      if ($null -eq $bridge.PSObject.Properties['money_receive_timeout_seconds']) {
+        Set-JsonProperty -Object $bridge -Name 'money_receive_timeout_seconds' -Value 180
+      }
+      if ($null -eq $bridge.PSObject.Properties['money_receipt_poll_seconds']) {
+        Set-JsonProperty -Object $bridge -Name 'money_receipt_poll_seconds' -Value 1
+      }
       $weFlowOriginalCanonical = ConvertTo-AkashaCanonicalJson -Value $weFlow
       Set-JsonProperty -Object $weFlow -Name 'httpApiEnabled' -Value $true
       Set-JsonProperty -Object $weFlow -Name 'httpApiHost' -Value '127.0.0.1'

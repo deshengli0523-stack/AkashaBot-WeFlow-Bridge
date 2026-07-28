@@ -27,6 +27,7 @@ import state
 import config
 from ob_protocol import push_event, make_message_event
 from privacy import chat_record
+from money_service import MoneyActionService, WeFlowMoneySource
 
 log = logging.getLogger("ob11-bridge")
 
@@ -107,6 +108,24 @@ def _account_identity() -> str:
     return _text_value(getattr(config, "BOT_WXID", "")) or "wechat_bot"
 
 
+def _is_red_packet_receipt_text(content: object) -> bool:
+    text = _text_value(content)
+    normalized = re.sub(r"\s+", "", text)
+    return (
+        normalized.startswith("你领取了")
+        and normalized.endswith("的红包")
+        and len(normalized) <= 256
+    )
+
+
+def _money_receipt_display(content: object) -> str:
+    """Hide unresolved WeFlow wxid identifiers from reader-facing history."""
+    text = _text_value(content)
+    if _is_red_packet_receipt_text(text):
+        return "红包领取成功"
+    return text
+
+
 class WeFlowBridge:
     """WeFlow ↔ AstrBot 桥接器（OneBot v11 版）。"""
 
@@ -124,6 +143,45 @@ class WeFlowBridge:
         self._sent_recently = {}
         self._sse_event_keys = {}
         self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
+        self.money_actions = None
+        if sender is not None and bool(
+            getattr(config, "MONEY_RECEIVE_ENABLED", False)
+        ):
+            self.money_actions = MoneyActionService(
+                sender=sender,
+                generation=int(generation or 0),
+                source=WeFlowMoneySource(
+                    base_url=config.WE_FLOW_BASE_URL,
+                    access_token=config.ACCESS_TOKEN,
+                    request_get=requests.get,
+                ),
+                notifier=self._notify_money_action,
+                timeout_seconds=float(
+                    getattr(config, "MONEY_RECEIVE_TIMEOUT_SECONDS", 180.0)
+                ),
+                receipt_poll_seconds=float(
+                    getattr(config, "MONEY_RECEIPT_POLL_SECONDS", 1.0)
+                ),
+                account_id=str(getattr(config, "BOT_WXID", "") or ""),
+            )
+
+    def _notify_money_action(self, payload: dict[str, object]) -> bool:
+        return push_event(
+            {
+                "time": int(time.time()),
+                "self_id": int(getattr(state, "_self_id_int", 0) or 0),
+                "post_type": "notice",
+                "notice_type": "akasha_money_action",
+                "sub_type": "start",
+                "user_id": int(getattr(state, "_self_id_int", 0) or 1),
+                "akasha_schema": 1,
+                **payload,
+            }
+        )
+
+    def stop_money_actions(self) -> None:
+        if self.money_actions is not None:
+            self.money_actions.stop()
 
     def _active(self):
         return (
@@ -147,11 +205,59 @@ class WeFlowBridge:
             return True
         return False
 
+    def log_money_event(self, data: dict, *, body: object | None = None) -> None:
+        """Record a money marker or receipt in the local panel without buffering it."""
+        source_name = _text_value(
+            data.get("sourceName", "") or data.get("talkerName", "")
+        ) or "未知"
+        raw_session_id = _text_value(data.get("sessionId"))
+        group_name_raw = _text_value(data.get("groupName"))
+        session_probe = raw_session_id or source_name
+        is_group = (
+            data.get("sessionType", "") == "group"
+            or bool(group_name_raw)
+            or "@chatroom" in session_probe
+        )
+        display_body = _money_receipt_display(
+            data.get("content", "") if body is None else body
+        )
+        if is_group:
+            group_raw = group_name_raw or source_name
+            contact = re.sub(r"\s*\(\d+\)\s*$", "", group_raw).strip()
+            sender = _text_value(
+                data.get("senderName", "")
+                or data.get("sender", "")
+                or data.get("sourceName", "")
+            )
+            log.info(
+                "CHAT %s",
+                chat_record(
+                    event="inbound",
+                    scope="group",
+                    contact=contact,
+                    sender=sender or source_name,
+                    status="received",
+                    body=display_body,
+                ),
+            )
+            return
+        log.info(
+            "CHAT %s",
+            chat_record(
+                event="inbound",
+                scope="private",
+                contact=source_name,
+                status="received",
+                body=display_body,
+            ),
+        )
+
     def add_to_buffer(self, data):
         """将消息加入缓冲区，等待合并后统一推送给 AstrBot。"""
         if not self._active():
             return
-        content = data.get("content", "")
+        raw_content = data.get("content", "")
+        content = _money_receipt_display(raw_content)
         source_name = _text_value(
             data.get("sourceName", "") or data.get("talkerName", "")
         ) or "未知"
@@ -206,6 +312,9 @@ class WeFlowBridge:
                     body=content,
                 ),
             )
+
+        if _is_red_packet_receipt_text(raw_content):
+            return
 
         if content == "[图片]":
             # 图片消息：下载 → ollama 描述 → 注入缓冲区
@@ -479,6 +588,13 @@ class WeFlowBridge:
                             if raw_id in self.processed_ids:
                                 continue
                             self.processed_ids.add(raw_id)
+                        if (
+                            self.money_actions is not None
+                            and self.money_actions.handle_sse(data)
+                        ):
+                            self.log_money_event(data)
+                            log.info("检测到红包/转账候选；普通 FIFO 已进入等待")
+                            continue
                         if not self.should_ignore(data):
                             log.info(
                                 "📩 收到 SSE 消息: content_length=%d",

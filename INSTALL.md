@@ -72,6 +72,19 @@ AstrBot 的 `tool_schema_mode` 请保持默认的 `full`；改成 `skills_like` 
 
 私聊回复仍通过昵称或备注名搜索微信，但发送前必须从 WeFlow 联系人接口唯一匹配到本轮稳定 `sessionId`。同名、目标不符或接口不可验证时不会调用 UIA 发送；请为同名联系人设置唯一备注名后再试。
 
+### 配置红包与转账接收
+
+安装器已经部署 `Akasha 红包与转账接收` 插件。进入 AstrBot 插件配置后：
+
+1. 保持 `enabled=true`。
+2. 将 `vision_provider_id` 选择为支持图片输入的 AstrBot Provider；插件引用该 Provider 的现有凭据，不保存第二份 API Key。
+3. `bridge_url` 保持 `http://127.0.0.1:8766`。该字段只允许本机回环 HTTP 地址。
+4. 默认单次最多执行 12 个视觉步骤；需要时可在 1–30 范围调整 `max_agent_steps`。
+5. 红包与收到的转账均直接进入 Agent 接收流程，不设置金额上限。
+6. 最大化并保持微信位于前台。接收链路不调用 Windows OCR；桥按来源联系人搜索固定首结果，AstrBot 多模态 Agent 从截图核对聊天标题并在不一致时要求重新选择。当前发送完成后，普通 FIFO 会等待到视觉正常页与 WeFlow 收款回执同时成立。
+
+Bridge 配置中的 `money_receive_enabled` 默认开启，`money_receive_timeout_seconds` 默认 180 秒，`money_receipt_poll_seconds` 默认 1 秒。插件的单次模型调用默认最多 60 秒，但不会超过桥层事务剩余期限。超时、停止、窗口状态不符或 Provider 失败都会结束本次事务并恢复普通 FIFO，但不会报告收款成功。
+
 ## 7. 日常启动、停止与检查
 
 安装目录中有 `校准.bat`、`启动.bat`、`停止.bat`、`健康检查.bat`。桌面只创建启动、停止、健康检查三个快捷方式。
@@ -95,7 +108,7 @@ AstrBot 的 `tool_schema_mode` 请保持默认的 `full`；改成 `skills_like` 
 4. 如果显示环境或微信布局变化，运行安装目录的 `校准.bat` 重新校准。
 5. 运行 `启动.bat` 和 `健康检查.bat`。
 
-安装器拒绝在已记录服务仍运行时覆盖文件，并返回 `E_INSTALL_RUNNING`。正常重装保留安装根目录下的 `data`、联系人记忆数据库和现有配置；旧桥接目录以及修改前的 WeFlow/AstrBot 配置会备份到 `data\backups`。联系人记忆插件代码在 AstrBot 初始化完成后单独暂存并原子替换，失败会恢复旧插件代码，不会删除 `data\astrbot\data\plugin_data`。
+安装器拒绝在已记录服务仍运行时覆盖文件，并返回 `E_INSTALL_RUNNING`。正常重装保留安装根目录下的 `data`、联系人记忆数据库和现有配置；旧桥接目录以及修改前的 WeFlow/AstrBot 配置会备份到 `data\backups`。两个 AstrBot 插件的代码都会在 AstrBot 初始化完成后分别暂存并原子替换，失败会恢复旧插件代码，不会删除 `data\astrbot\data\plugin_data`。
 
 ## 9. 常见错误
 

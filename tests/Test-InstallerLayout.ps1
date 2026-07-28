@@ -242,7 +242,7 @@ function Assert-NoTransactionResidue {
 function New-TestSourceFixture {
   param([string]$Path)
   New-Item -ItemType Directory -Force -Path $Path | Out-Null
-  foreach ($entry in @(@(Get-AkashaInstallPayload) + @(Get-AkashaContactMemoryPluginPayload))) {
+  foreach ($entry in @(@(Get-AkashaInstallPayload) + @(Get-AkashaContactMemoryPluginPayload) + @(Get-AkashaMoneyReceiverPluginPayload))) {
     $source = Join-Path $root ([string]$entry.Source)
     $destination = Join-Path $Path ([string]$entry.Source)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
@@ -336,10 +336,10 @@ Assert-Equal @($payload | Where-Object { $_.Source -like 'scripts\*' }).Count 9 
 Assert-Equal @($payload | Where-Object { $_.Source -notlike 'bridge\*' -and $_.Source -notlike 'scripts\*' }).Count 7 'Root payload count changed.'
 Assert-True (@($payload | Where-Object { $_.Source -ceq $launchers.Install }).Count -eq 0) 'Install launcher must not be installed.'
 $expectedPayloadSources = @(
-  'bridge\bridge_core.py', 'bridge\config.py', 'bridge\main.py', 'bridge\ob_client.py',
+  'bridge\bridge_core.py', 'bridge\config.py', 'bridge\main.py', 'bridge\money_action.py', 'bridge\money_service.py', 'bridge\ob_client.py',
   'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\state.py',
-  'bridge\uia_contact_selector.py', 'bridge\uia_fixed_sender.py', 'bridge\uia_support.py',
-  'bridge\windows_ocr_selector.ps1', 'bridge\calibrate_uia_fixed.py', 'bridge\web_panel.py',
+  'bridge\uia_fixed_sender.py', 'bridge\uia_support.py',
+  'bridge\calibrate_uia_fixed.py', 'bridge\web_panel.py',
   'bridge\config.example.json', 'bridge\requirements.txt', 'bridge\requirements.lock',
   'scripts\AkashaBot.Common.psm1', 'scripts\Test-Prerequisites.ps1',
   'scripts\Initialize-Environments.ps1', 'scripts\Initialize-Configuration.ps1',
@@ -367,6 +367,15 @@ $expectedPluginSources = @(
   'plugins\astrbot_plugin_akasha_contact_memory\akasha_memory\security.py'
 )
 Assert-SequenceEqual @($pluginPayload.Source | Sort-Object) @($expectedPluginSources | Sort-Object) 'Contact-memory plugin payload is not the frozen exact allowlist.'
+$moneyPluginPayload = @(Get-AkashaMoneyReceiverPluginPayload)
+Assert-Equal $moneyPluginPayload.Count 4 'Money-receiver plugin payload count changed.'
+$expectedMoneyPluginSources = @(
+  'plugins\astrbot_plugin_akasha_money_receiver\__init__.py',
+  'plugins\astrbot_plugin_akasha_money_receiver\main.py',
+  'plugins\astrbot_plugin_akasha_money_receiver\metadata.yaml',
+  'plugins\astrbot_plugin_akasha_money_receiver\_conf_schema.json'
+)
+Assert-SequenceEqual @($moneyPluginPayload.Source | Sort-Object) @($expectedMoneyPluginSources | Sort-Object) 'Money-receiver plugin payload is not the frozen exact allowlist.'
 
 try {
   New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
@@ -453,6 +462,9 @@ exit 0
   $installedPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\astrbot_plugin_akasha_contact_memory'
   $actualPluginFiles = @(Get-RelativeFiles -Base $installedPluginRoot)
   Assert-SequenceEqual $actualPluginFiles @($pluginPayload.Relative | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object) 'Installed contact-memory plugin payload is not exact.'
+  $installedMoneyPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\astrbot_plugin_akasha_money_receiver'
+  $actualMoneyPluginFiles = @(Get-RelativeFiles -Base $installedMoneyPluginRoot)
+  Assert-SequenceEqual $actualMoneyPluginFiles @($moneyPluginPayload.Relative | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object) 'Installed money-receiver plugin payload is not exact.'
   foreach ($name in @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $successRoot $name) -PathType Leaf) "Installed root payload is missing $name."
   }

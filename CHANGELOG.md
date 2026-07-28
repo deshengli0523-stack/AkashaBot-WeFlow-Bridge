@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0 - 2026-07-28
+
+- Add an AstrBot-native multimodal Agent plugin for receiving incoming WeChat
+  red packets and transfers. The Bridge exposes only the validated foreground
+  WeChat frame, relative clicks, Escape, and transaction status.
+- Keep the receive path free of Windows OCR. The Bridge searches the event
+  source and clicks the calibrated first result; the AstrBot multimodal Agent
+  checks the visible chat title and can request contact reselection.
+- Reserve a priority UI lease as soon as the Bridge sees an exact WeFlow money
+  marker. The current UI send finishes, the receive transaction runs before
+  all waiting ordinary FIFO items, and the original ordinary order resumes
+  afterward.
+- Require both an AstrBot visual confirmation of the normal chat page and a
+  correlated WeFlow receipt before reporting success. Transfer receipts use
+  the same session plus `transferid` and `transcationid`; red-packet receipts
+  use a later same-session own-receipt system message.
+- Add bounded timeout, stop, stale-frame, capability-token, Provider failure,
+  and worker-exception paths that release the priority lease without clearing
+  the operator's independent pause state.
+- Bind every model frame to a one-time nonce, recapture before UI actions,
+  bound Provider work to the transaction deadline, and allow every inbound
+  transfer into the receive Agent without an amount ceiling.
+- Deploy the new plugin transactionally beside the existing contact-memory
+  plugin and retain a strict release and installer allowlist.
+
+### Automated verification
+
+- Priority preemption, normal FIFO preservation, dual-signal completion,
+  receipt correlation, loopback capability authentication, AstrBot vision
+  calls, stale-frame rejection, and ChatLab cursor warm-up have focused tests.
+
 ## 0.3.7 - 2026-07-26
 
 - Remove every Windows OCR invocation from the fixed WeChat send path. Text

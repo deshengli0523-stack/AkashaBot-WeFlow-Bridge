@@ -66,8 +66,8 @@ function Assert-AkashaTask8Layout {
   }
 
   $publishedFiles = @(Get-AkashaPublishedFiles)
-  if ($publishedFiles.Count -ne 68) {
-    throw "Documentation/layout gate: expected 68 publish files, found $($publishedFiles.Count)."
+  if ($publishedFiles.Count -ne 74) {
+    throw "Documentation/layout gate: expected 74 publish files, found $($publishedFiles.Count)."
   }
 
   $updateLauncher = (Join-AkashaCharacters @(0x66F4, 0x65B0)) + '.bat'
@@ -211,10 +211,10 @@ jobs:
     }
   }
 
-  Assert-AkashaContains -Text $changelog -Expected '## 0.3.7 - 2026-07-26' -Context 'CHANGELOG.md'
+  Assert-AkashaContains -Text $changelog -Expected '## 0.4.0 - 2026-07-28' -Context 'CHANGELOG.md'
   $version = (Read-AkashaUtf8Strict -Path (Join-Path $root 'VERSION')).Trim()
-  if ($version -cne '0.3.7') {
-    throw "Documentation/layout gate: VERSION must be 0.3.7, found '$version'."
+  if ($version -cne '0.4.0') {
+    throw "Documentation/layout gate: VERSION must be 0.4.0, found '$version'."
   }
 
   foreach ($relativeLink in @('INSTALL.md', 'SECURITY.md')) {

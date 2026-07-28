@@ -95,6 +95,17 @@ VIDEO_CAPTION_PROMPT = config.get(
     "请用中文简洁描述这段视频发生了什么，包括关键人物、动作、场景和屏幕文字",
 )
 VIDEO_CAPTION_MAX_MIB = _bounded_int("video_caption_max_mib", 6, 1, 6)
+MONEY_RECEIVE_ENABLED = bool(config.get("money_receive_enabled", True))
+MONEY_RECEIVE_TIMEOUT_SECONDS = _bounded_float(
+    "money_receive_timeout_seconds", 180.0, 600.0
+)
+if MONEY_RECEIVE_TIMEOUT_SECONDS < 30.0:
+    MONEY_RECEIVE_TIMEOUT_SECONDS = 180.0
+MONEY_RECEIPT_POLL_SECONDS = _bounded_float(
+    "money_receipt_poll_seconds", 1.0, 5.0
+)
+if MONEY_RECEIPT_POLL_SECONDS < 0.2:
+    MONEY_RECEIPT_POLL_SECONDS = 1.0
 
 # Ollama 图片描述配置（provider=ollama 时使用）
 OLLAMA_BASE_URL = config.get("ollama_base_url", "http://127.0.0.1:61000")

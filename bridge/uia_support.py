@@ -170,6 +170,12 @@ class Win32WeChatDriver:
                 ctypes.c_int,
             ),
             "GetForegroundWindow": ([], wintypes.HWND),
+            "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
+            "BringWindowToTop": ([wintypes.HWND], wintypes.BOOL),
+            "AttachThreadInput": (
+                [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL],
+                wintypes.BOOL,
+            ),
             "SetProcessDpiAwarenessContext": (
                 [ctypes.c_void_p],
                 wintypes.BOOL,
@@ -287,6 +293,7 @@ class Win32WeChatDriver:
                 wintypes.BOOL,
             ),
             "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+            "GetCurrentThreadId": ([], wintypes.DWORD),
         }
         for name, (argtypes, restype) in signatures.items():
             function = getattr(self.kernel32, name)
@@ -424,6 +431,58 @@ class Win32WeChatDriver:
             maximized=bool(self.user32.IsZoomed(hwnd)),
             foreground=int(self.user32.GetForegroundWindow() or 0) == hwnd,
         )
+
+    def activate_receive_window(self, hwnd: int) -> None:
+        """Bring one identity-validated WeChat receive window to the foreground."""
+        self._ensure_bound_window_identity(hwnd)
+        if int(self.user32.GetForegroundWindow() or 0) == hwnd:
+            return
+
+        process_id = wintypes.DWORD()
+        target_thread = int(
+            self.user32.GetWindowThreadProcessId(
+                hwnd,
+                ctypes.byref(process_id),
+            )
+            or 0
+        )
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        foreground_thread = 0
+        if foreground:
+            foreground_process_id = wintypes.DWORD()
+            foreground_thread = int(
+                self.user32.GetWindowThreadProcessId(
+                    foreground,
+                    ctypes.byref(foreground_process_id),
+                )
+                or 0
+            )
+        current_thread = int(self.kernel32.GetCurrentThreadId() or 0)
+        attached_threads = []
+        try:
+            for thread_id in {foreground_thread, target_thread}:
+                if (
+                    thread_id
+                    and current_thread
+                    and thread_id != current_thread
+                    and self.user32.AttachThreadInput(
+                        current_thread,
+                        thread_id,
+                        True,
+                    )
+                ):
+                    attached_threads.append(thread_id)
+            self.user32.BringWindowToTop(hwnd)
+            self.user32.SetForegroundWindow(hwnd)
+        finally:
+            for thread_id in reversed(attached_threads):
+                self.user32.AttachThreadInput(
+                    current_thread,
+                    thread_id,
+                    False,
+                )
+        if int(self.user32.GetForegroundWindow() or 0) != hwnd:
+            raise CalibrationError(CALIBRATION_WINDOW)
 
     def _get_screen_rect(self, hwnd: int) -> ScreenRect:
         rect = _RECT()
@@ -633,6 +692,35 @@ class Win32WeChatDriver:
     def click_ratio(self, hwnd: int, point: Mapping[str, object]) -> None:
         """Revalidate the window, then move and click inside its client area."""
         metrics = self._validated_click_metrics(hwnd, point)
+        x, y = screen_point_from_ratio(point, metrics)
+        if not self._point_targets_bound_window(hwnd, (x, y)):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        if not self.user32.SetCursorPos(x, y):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    def click_receive_ratio(
+        self,
+        hwnd: int,
+        point: Mapping[str, object],
+        calibration: object,
+    ) -> None:
+        """Click inside a validated foreground receive window or popup."""
+        try:
+            ratio_x = point["x"]
+            ratio_y = point["y"]
+        except (KeyError, TypeError):
+            raise CalibrationError(CALIBRATION_INVALID) from None
+        if (
+            not _is_finite_number(ratio_x)
+            or not _is_finite_number(ratio_y)
+            or not 0 < ratio_x < 1
+            or not 0 < ratio_y < 1
+        ):
+            raise CalibrationError(CALIBRATION_INVALID)
+        metrics = self.get_client_metrics(hwnd)
+        validate_receive_runtime_metrics(calibration, metrics)
         x, y = screen_point_from_ratio(point, metrics)
         if not self._point_targets_bound_window(hwnd, (x, y)):
             raise CalibrationError(CALIBRATION_WINDOW)
@@ -959,3 +1047,27 @@ def validate_runtime_metrics(
         raise CalibrationError(RECALIBRATION_REQUIRED)
 
     return validated
+
+
+def validate_receive_runtime_metrics(
+    calibration: object,
+    metrics: ClientMetrics,
+    tolerance: float = 0.05,
+) -> dict[str, object]:
+    """Allow the calibrated main window or a foreground WeChat money popup."""
+    try:
+        return validate_runtime_metrics(calibration, metrics, tolerance)
+    except CalibrationError:
+        validated = validate_calibration(calibration)
+        is_receive_popup = (
+            metrics.visible
+            and metrics.foreground
+            and not metrics.maximized
+            and 240 <= metrics.width < 800
+            and 320 <= metrics.height <= 900
+        )
+        if not is_receive_popup:
+            raise
+        if metrics.dpi != validated["reference"]["dpi"]:
+            raise CalibrationError(RECALIBRATION_REQUIRED)
+        return validated

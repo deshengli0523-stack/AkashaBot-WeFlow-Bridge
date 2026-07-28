@@ -5,6 +5,8 @@ import os
 import random
 import threading
 import time
+from collections import deque
+from contextlib import contextmanager
 
 import state
 from uia_support import (
@@ -24,26 +26,138 @@ VK_BACKSPACE = 0x08
 
 
 class _FifoSendLock:
-    """Serialize UI sends in caller arrival order."""
+    """Serialize UI sends while allowing a reserved receive action to preempt."""
 
     def __init__(self):
         self._condition = threading.Condition()
         self._next_ticket = 0
         self._serving_ticket = 0
+        self._normal_active = False
+        self._priority_active = False
+        self._priority_waiters = deque()
 
     def __enter__(self):
         with self._condition:
             ticket = self._next_ticket
             self._next_ticket += 1
-            while ticket != self._serving_ticket:
+            while (
+                ticket != self._serving_ticket
+                or self._normal_active
+                or self._priority_active
+                or self._priority_waiters
+            ):
                 self._condition.wait()
+            self._normal_active = True
         return self
 
     def __exit__(self, exc_type, exc, traceback):
         with self._condition:
+            self._normal_active = False
             self._serving_ticket += 1
             self._condition.notify_all()
         return False
+
+    def priority_waiter_count(self) -> int:
+        with self._condition:
+            return len(self._priority_waiters)
+
+    def reserve_priority(
+        self,
+        *,
+        cancel_event: threading.Event,
+        timeout: float,
+    ):
+        return _PriorityReservation(
+            self,
+            cancel_event=cancel_event,
+            timeout=timeout,
+        )
+
+    @contextmanager
+    def priority(
+        self,
+        *,
+        cancel_event: threading.Event,
+        timeout: float,
+    ):
+        """Compatibility helper for callers that reserve at ``with`` time."""
+
+        with self.reserve_priority(
+            cancel_event=cancel_event,
+            timeout=timeout,
+        ) as acquired:
+            yield acquired
+
+
+class _PriorityReservation:
+    """A priority waiter whose barrier exists before its worker starts."""
+
+    def __init__(
+        self,
+        lock: _FifoSendLock,
+        *,
+        cancel_event: threading.Event,
+        timeout: float,
+    ):
+        self._lock = lock
+        self._cancel_event = cancel_event
+        self._timeout = max(0.0, float(timeout))
+        token = object()
+        self._token = token
+        self._acquired = False
+        self._closed = False
+        with lock._condition:
+            lock._priority_waiters.append(token)
+            lock._condition.notify_all()
+
+    def __enter__(self):
+        deadline = time.monotonic() + self._timeout
+        lock = self._lock
+        with lock._condition:
+            while True:
+                if self._closed:
+                    break
+                if self._cancel_event.is_set():
+                    if self._token in lock._priority_waiters:
+                        lock._priority_waiters.remove(self._token)
+                    lock._condition.notify_all()
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if self._token in lock._priority_waiters:
+                        lock._priority_waiters.remove(self._token)
+                    lock._condition.notify_all()
+                    break
+                if (
+                    lock._priority_waiters
+                    and lock._priority_waiters[0] is self._token
+                    and not lock._normal_active
+                    and not lock._priority_active
+                ):
+                    lock._priority_waiters.popleft()
+                    lock._priority_active = True
+                    self._acquired = True
+                    break
+                lock._condition.wait(min(remaining, 0.05))
+        return self._acquired
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
+
+    def close(self) -> None:
+        """Release an acquired lease or remove a reservation not yet entered."""
+
+        if self._closed:
+            return
+        self._closed = True
+        lock = self._lock
+        with lock._condition:
+            if self._acquired:
+                lock._priority_active = False
+            elif self._token in lock._priority_waiters:
+                lock._priority_waiters.remove(self._token)
+            lock._condition.notify_all()
 
 
 _SHARED_SEND_LOCK = _FifoSendLock()
@@ -79,6 +193,19 @@ class UiaFixedSender:
     def stop_pending(self) -> None:
         """Prevent this sender generation from resuming after a later restart."""
         self._stopped.set()
+
+    def reserve_receive_priority(
+        self,
+        *,
+        cancel_event: threading.Event,
+        timeout: float,
+    ):
+        """Install the receive barrier before its worker thread is scheduled."""
+
+        return self._lock.reserve_priority(
+            cancel_event=cancel_event,
+            timeout=timeout,
+        )
 
     def _preflight(self) -> int:
         hwnd = self.driver.find_wechat_window()
