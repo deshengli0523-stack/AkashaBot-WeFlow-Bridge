@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from .context_builder import ContextBuilder, estimate_tokens
-from .models import ContactRecord, QwenResult, QwenSessionRecord
+from .models import ContactRecord, MemoryMessage, QwenResult, QwenSessionRecord
 from .qwen_client import QwenClient
 from .store import MemoryRevisionChanged, MemoryStore
 
@@ -39,6 +39,60 @@ def _function_output_ids(
     return tuple(ids)
 
 
+def _normalized_content(value: str) -> str:
+    return "".join(str(value).split())
+
+
+def _as_conversation_item(message: MemoryMessage) -> dict[str, str]:
+    return {
+        "role": "user" if message.direction == "in" else "assistant",
+        "content": message.effective_content,
+    }
+
+
+def _bounded_conversation_item(
+    message: MemoryMessage,
+    token_budget: int,
+) -> tuple[dict[str, str], int] | None:
+    """Represent one oversized turn without consuming the full context."""
+
+    budget = max(0, int(token_budget))
+    prefix = "【单条消息过长，以下为节选；完整内容仍保存在本地】\n"
+    separator = "\n…\n"
+    minimum_cost = estimate_tokens(prefix + separator) + 8
+    if budget < max(128, minimum_cost):
+        return None
+    content = message.effective_content
+    low = 0
+    high = len(content)
+    best = prefix + separator
+    while low <= high:
+        length = (low + high) // 2
+        head_length = (length * 2) // 3
+        tail_length = length - head_length
+        tail = content[-tail_length:] if tail_length else ""
+        candidate = (
+            prefix
+            + content[:head_length]
+            + separator
+            + tail
+        )
+        cost = estimate_tokens(candidate) + 8
+        if cost <= budget:
+            best = candidate
+            low = length + 1
+        else:
+            high = length - 1
+    cost = estimate_tokens(best) + 8
+    return (
+        {
+            "role": "user" if message.direction == "in" else "assistant",
+            "content": best,
+        },
+        cost,
+    )
+
+
 class QwenSessionManager:
     def __init__(
         self,
@@ -47,7 +101,7 @@ class QwenSessionManager:
         context_builder: ContextBuilder,
         client: QwenClient,
         model: str = "qwen3.7-max",
-        soft_context_tokens: int = 700_000,
+        soft_context_tokens: int = 120_000,
         cloud_ttl_days: float = 7,
     ) -> None:
         self.store = store
@@ -70,20 +124,169 @@ class QwenSessionManager:
         session: QwenSessionRecord | None,
         *,
         persona_hash: str,
-        tool_hash: str,
         now: float,
-        memory_revision: int,
     ) -> bool:
         return bool(
             session
             and not session.dirty
             and session.model == self.model
             and session.persona_hash == persona_hash
-            and session.tool_hash == tool_hash
-            and session.memory_revision == memory_revision
             and session.expires_at > now + 60
-            and session.estimated_tokens < self.soft_context_tokens
         )
+
+    async def _append_external_delta(
+        self,
+        session: QwenSessionRecord,
+        *,
+        contact_id: int,
+        target_memory_revision: int,
+        current_prompt: str,
+        exclude_source_uids: Iterable[str],
+        represented_prompt_messages: Iterable[MemoryMessage] = (),
+    ) -> QwenSessionRecord:
+        excluded = {str(value) for value in exclude_source_uids if str(value)}
+        prompt_snapshots = tuple(represented_prompt_messages)
+        legacy_excluded = excluded if not prompt_snapshots else set()
+        normalized_prompt = _normalized_content(current_prompt)
+
+        delta_budget = max(
+            0,
+            min(
+                12_000,
+                self.soft_context_tokens
+                - session.estimated_tokens
+                - 2_000,
+            ),
+        )
+        added_tokens = 0
+
+        try:
+            # These source messages are represented by the prompt passed to
+            # respond(), so they must never be appended a second time.
+            await self.store.record_qwen_prompt_messages(
+                session.id,
+                prompt_snapshots,
+            )
+            await self.store.record_qwen_external_sources(
+                session.id,
+                contact_id,
+                legacy_excluded,
+            )
+            prompt_fallback_consumed = False
+            while True:
+                messages = await self.store.session_delta_messages(
+                    contact_id,
+                    session_id=session.id,
+                    after_created_at=session.created_at,
+                    recent_source_floor=max(0.0, session.created_at - 300.0),
+                    limit=200,
+                )
+                if not messages:
+                    break
+
+                if normalized_prompt and not prompt_fallback_consumed:
+                    for index in range(len(messages) - 1, -1, -1):
+                        candidate = messages[index]
+                        if (
+                            candidate.direction == "in"
+                            and _normalized_content(
+                                candidate.effective_content
+                            )
+                            == normalized_prompt
+                        ):
+                            await self.store.record_qwen_prompt_messages(
+                                session.id,
+                                (candidate,),
+                            )
+                            del messages[index]
+                            prompt_fallback_consumed = True
+                            break
+
+                selected: list[
+                    tuple[MemoryMessage, dict[str, str], int]
+                ] = []
+                blocked = False
+                for message in messages:
+                    if message.source_uid in legacy_excluded:
+                        await self.store.record_qwen_external_sources(
+                            session.id,
+                            contact_id,
+                            (message.source_uid,),
+                        )
+                        continue
+                    cost = estimate_tokens(message.effective_content) + 8
+                    if cost > delta_budget - added_tokens:
+                        bounded = (
+                            _bounded_conversation_item(
+                                message,
+                                delta_budget - added_tokens,
+                            )
+                            if added_tokens == 0
+                            else None
+                        )
+                        if bounded is None:
+                            blocked = True
+                            break
+                        item, cost = bounded
+                    else:
+                        item = _as_conversation_item(message)
+                    selected.append((message, item, cost))
+                    added_tokens += cost
+
+                for offset in range(0, len(selected), 20):
+                    chunk = selected[offset : offset + 20]
+                    item_ids = await self.client.add_items(
+                        session.conversation_id,
+                        [item for _message, item, _cost in chunk],
+                    )
+                    await self.store.record_qwen_items(session.id, item_ids)
+                    await self.store.record_qwen_external_messages(
+                        session.id,
+                        (message for message, _item, _cost in chunk),
+                    )
+                if blocked:
+                    break
+
+            if added_tokens:
+                session = await self.store.record_qwen_delta_tokens(
+                    session.id,
+                    expected_memory_revision=session.memory_revision,
+                    added_tokens=added_tokens,
+                )
+
+            remaining = await self.store.session_delta_messages(
+                contact_id,
+                session_id=session.id,
+                after_created_at=session.created_at,
+                recent_source_floor=max(0.0, session.created_at - 300.0),
+                limit=1,
+            )
+            if remaining:
+                return session
+            try:
+                return await self.store.advance_qwen_session_revision(
+                    session.id,
+                    expected_memory_revision=session.memory_revision,
+                    target_memory_revision=target_memory_revision,
+                    added_tokens=0,
+                )
+            except MemoryRevisionChanged:
+                current = await self.store.active_qwen_session(contact_id)
+                if current is not None and current.id == session.id:
+                    return current
+                raise
+        except asyncio.CancelledError:
+            dirty_task = asyncio.create_task(
+                self.store.mark_qwen_session_dirty(session.id)
+            )
+            try:
+                await asyncio.shield(dirty_task)
+            except asyncio.CancelledError:
+                await dirty_task
+            raise
+        except Exception:
+            await self.store.mark_qwen_session_dirty(session.id)
+            raise
 
     async def _create_session(
         self,
@@ -94,6 +297,7 @@ class QwenSessionManager:
         tool_hash: str,
         current_prompt: str,
         exclude_source_uids: Iterable[str],
+        represented_prompt_messages: Iterable[MemoryMessage],
     ) -> QwenSessionRecord:
         system_tokens = estimate_tokens(system_prompt) + (8 if system_prompt else 0)
         for attempt in range(3):
@@ -103,6 +307,7 @@ class QwenSessionManager:
             build_options = {
                 "current_prompt": current_prompt,
                 "exclude_source_uids": exclude_source_uids,
+                "represented_prompt_messages": represented_prompt_messages,
                 "token_budget": max(
                     1000,
                     self.context_builder.seed_max_tokens - system_tokens,
@@ -128,7 +333,7 @@ class QwenSessionManager:
                 metadata={
                     "contact_hmac": contact.contact_hmac,
                     "epoch": str(int(created_at * 1000)),
-                    "schema_version": "6",
+                    "schema_version": "10",
                 }
             )
             session: QwenSessionRecord | None = None
@@ -152,6 +357,10 @@ class QwenSessionManager:
                         seed_items[offset : offset + 20],
                     )
                     await self.store.record_qwen_items(session.id, item_ids)
+                await self.store.record_qwen_external_messages(
+                    session.id,
+                    getattr(bundle, "represented_messages", ()),
+                )
                 session = await self.store.activate_qwen_session(
                     session.id,
                     expected_memory_revision=memory_revision,
@@ -184,6 +393,7 @@ class QwenSessionManager:
         system_prompt: str,
         tool_fingerprint: str = "",
         exclude_source_uids: Iterable[str] = (),
+        represented_prompt_messages: Iterable[MemoryMessage] = (),
         request_key: str,
         input_items: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
@@ -198,6 +408,7 @@ class QwenSessionManager:
             raise StaleToolContinuation("invalid Qwen tool continuation")
         persona_hash = stable_hash(system_prompt)
         tool_hash = stable_hash(tool_fingerprint)
+        prompt_snapshots = tuple(represented_prompt_messages)
         async with self._lock_for(contact.id):
             if await self.store.is_contact_tombstoned(contact.id):
                 raise RuntimeError("contact memory is tombstoned")
@@ -223,9 +434,7 @@ class QwenSessionManager:
             if not self._valid(
                 session,
                 persona_hash=persona_hash,
-                tool_hash=tool_hash,
                 now=now,
-                memory_revision=memory_revision,
             ):
                 if input_items is not None:
                     if session:
@@ -240,7 +449,34 @@ class QwenSessionManager:
                     tool_hash=tool_hash,
                     current_prompt=prompt,
                     exclude_source_uids=exclude_source_uids,
+                    represented_prompt_messages=prompt_snapshots,
                 )
+            elif (
+                session is not None
+                and session.memory_revision != memory_revision
+            ):
+                if input_items is not None:
+                    await self.store.mark_qwen_session_dirty(session.id)
+                    raise RuntimeError(
+                        "contact history changed during a Qwen tool continuation"
+                    )
+                session = await self._append_external_delta(
+                    session,
+                    contact_id=contact.id,
+                    target_memory_revision=memory_revision,
+                    current_prompt=prompt,
+                    exclude_source_uids=exclude_source_uids,
+                    represented_prompt_messages=prompt_snapshots,
+                )
+            await self.store.record_qwen_prompt_messages(
+                session.id,
+                prompt_snapshots,
+            )
+            await self.store.record_qwen_external_sources(
+                session.id,
+                contact.id,
+                exclude_source_uids if not prompt_snapshots else (),
+            )
             response_id = ""
             try:
                 await self.store.set_qwen_session_inflight(
@@ -265,11 +501,16 @@ class QwenSessionManager:
                     result.input_tokens + result.output_tokens,
                 )
                 if result.text and not result.tool_calls:
-                    await self.store.archive_generated(
+                    generated = await self.store.archive_generated_snapshot(
                         contact.id,
                         response_id=result.response_id,
                         content=result.text,
                     )
+                    if generated is not None:
+                        await self.store.record_qwen_external_messages(
+                            session.id,
+                            (generated,),
+                        )
                 await self.store.update_qwen_session_usage(
                     session.id,
                     request_key=request_key,
@@ -315,12 +556,7 @@ class QwenSessionManager:
                 response_id=f"fallback-{uuid.uuid4().hex}",
                 content=content,
                 id_quality="fallback_response",
-                advance_memory_revision=True,
             )
-            # The fallback turn was produced outside Qwen Conversations. This
-            # second invalidation occurs after the fallback completed, so it
-            # also catches a newer session created during the fallback call.
-            await self.store.mark_contact_sessions_dirty(contact_id)
 
     async def mark_dirty(self, contact_id: int) -> None:
         await self.store.mark_contact_sessions_dirty(contact_id)

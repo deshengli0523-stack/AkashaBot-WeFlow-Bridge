@@ -125,7 +125,7 @@ class Main(Star):
         context_builder = ContextBuilder(
             store,
             seed_max_tokens=int(
-                _value(self.config, "seed_max_tokens", 150_000)
+                _value(self.config, "seed_max_tokens", 24_000)
             ),
         )
         synchronizer = WeFlowSync(
@@ -176,7 +176,7 @@ class Main(Star):
                     client=client,
                     model=model,
                     soft_context_tokens=int(
-                        _value(self.config, "soft_context_tokens", 700_000)
+                        _value(self.config, "soft_context_tokens", 120_000)
                     ),
                     cloud_ttl_days=float(
                         _value(self.config, "cloud_ttl_days", 7)
@@ -200,7 +200,7 @@ class Main(Star):
             context_builder=context_builder,
             qwen_sessions=qwen_sessions,
             fallback_context_tokens=int(
-                _value(self.config, "fallback_context_tokens", 120_000)
+                _value(self.config, "fallback_context_tokens", 24_000)
             ),
         )
 
@@ -287,7 +287,12 @@ class Main(Star):
             return
         # This bridge-only notice is control traffic, never a user message.
         event.stop_event()
-        if (
+        if self.runtime and raw.get("success") is True:
+            if await self.runtime.record_send_success(event):
+                logger.info(
+                    "Akasha 联系人云端回复已提交，等待 WeFlow 出站确认。"
+                )
+        elif (
             self.runtime
             and raw.get("success") is False
             and await self.runtime.record_send_failure(event)

@@ -77,6 +77,9 @@ UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = _bounded_float(
 UIA_FIXED_PRE_SEND_DELAY = _bounded_float(
     "uia_fixed_pre_send_delay", 5.0, 60.0
 )
+UIA_FIXED_SETTLE_JITTER_MAX_SECONDS = _bounded_float(
+    "uia_fixed_settle_jitter_max_seconds", 0.25, 0.5
+)
 BUFFER_SECONDS = config.get("buffer_seconds", 5)
 WEB_PORT = _bounded_int("web_port", 8766, 1024, 65535)
 GROUP_REPLY_MODE = config.get("group_reply_mode", "mention")  # "mention" / "all"

@@ -86,6 +86,7 @@ class ContextBundle:
     estimated_tokens: int
     recent_count: int
     retrieved_count: int
+    represented_messages: tuple[MemoryMessage, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

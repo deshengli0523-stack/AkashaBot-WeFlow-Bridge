@@ -55,6 +55,90 @@ def deactivate_generation(generation: int) -> bool:
             sender.stop_pending()
         return True
 
+# ============ Outbound send result ============
+
+_SEND_RESULT_MESSAGES = {
+    "OK": "发送操作已提交给微信",
+    "E_UIA_CALIBRATION_REQUIRED": "尚未完成固定坐标标定",
+    "E_UIA_CALIBRATION_INVALID": "固定坐标标定数据无效",
+    "E_UIA_CALIBRATION_WINDOW": "微信窗口未处于标定要求的前台最大化状态",
+    "E_UIA_CALIBRATION_BUSY": "标定期间检测到其他输入操作",
+    "E_UIA_RECALIBRATION_REQUIRED": "微信窗口环境已变化，需要重新标定",
+    "E_UIA_CONTACT_SELECTION_FAILED": "未能确认唯一的联系人搜索结果",
+    "E_UIA_INPUT_FOCUS_FAILED": "未能定位或清空微信消息输入框",
+    "E_UIA_SENDER_STOPPED": "桥接已停止，未执行发送",
+    "E_UIA_SEND_CANCELLED": "此条发送已取消",
+    "E_UIA_PASTE_FAILED": "剪贴板内容未能粘贴到微信",
+    "E_UIA_IMAGE_MISSING": "待发送图片不存在或不可读取",
+    "E_UIA_IMAGE_CLIPBOARD_FAILED": "图片未能写入微信粘贴所需的剪贴板",
+    "E_UIA_SUBMIT_FAILED": "未能完成微信发送按钮操作",
+    "E_UIA_SEND_FAILED": "微信界面发送操作未完成",
+    "E_OB_INVALID_REQUEST": "发送请求格式无效",
+    "E_OB_PRIVATE_ROUTE": "无法确认私聊联系人",
+    "E_OB_INVALID_SEGMENT": "消息中包含无效内容",
+    "E_OB_IMAGE_DECODE": "图片数据无法读取",
+    "E_OB_IMAGE_NOT_FOUND": "待发送图片未找到",
+    "E_OB_SEND_EXCEPTION": "发送组件执行异常",
+    "E_OB_NO_SENDABLE_SEGMENTS": "消息中没有可发送的内容",
+}
+_SEND_RESULT_STAGES = {
+    "request",
+    "route",
+    "preflight",
+    "select_contact",
+    "focus_input",
+    "paste",
+    "review",
+    "submit",
+    "image",
+    "complete",
+}
+send_result_lock = threading.Lock()
+last_send_result: Optional[dict[str, object]] = None
+send_result_sequence = 0
+
+
+def record_send_result(
+    success: bool,
+    *,
+    code: str,
+    stage: str,
+) -> dict[str, object]:
+    """Publish one privacy-safe result for the local control panel."""
+
+    global last_send_result, send_result_sequence
+    normalized_success = success is True
+    normalized_code = str(code)
+    if normalized_success:
+        normalized_code = "OK"
+    elif normalized_code not in _SEND_RESULT_MESSAGES:
+        normalized_code = "E_UIA_SEND_FAILED"
+    normalized_stage = (
+        str(stage) if str(stage) in _SEND_RESULT_STAGES else "complete"
+    )
+    with send_result_lock:
+        send_result_sequence += 1
+        last_send_result = {
+            "sequence": send_result_sequence,
+            "status": "sent" if normalized_success else "failed",
+            "code": normalized_code,
+            "stage": normalized_stage,
+            "message": _SEND_RESULT_MESSAGES[normalized_code],
+            "time": time.time(),
+        }
+        return dict(last_send_result)
+
+
+def get_last_send_result() -> Optional[dict[str, object]]:
+    with send_result_lock:
+        return None if last_send_result is None else dict(last_send_result)
+
+
+def clear_last_send_result() -> None:
+    global last_send_result
+    with send_result_lock:
+        last_send_result = None
+
 # ============ Outbound text review ============
 
 send_preview_lock = threading.Lock()
@@ -66,6 +150,7 @@ send_preview_sequence = 0
 def begin_send_preview(contact: str, content: str) -> threading.Event:
     """Publish one text item before any WeChat input is touched."""
     global current_send_cancel_event, current_send_preview, send_preview_sequence
+    clear_last_send_result()
     cancel_event = threading.Event()
     with send_preview_lock:
         send_preview_sequence += 1

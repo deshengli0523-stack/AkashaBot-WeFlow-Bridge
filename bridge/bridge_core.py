@@ -31,6 +31,14 @@ from money_service import MoneyActionService, WeFlowMoneySource
 
 log = logging.getLogger("ob11-bridge")
 
+_STICKER_CONTENT_TYPES = {
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+_STICKER_MAX_BYTES = 6 * 1024 * 1024
+
 
 # ============ 桥接核心 ============
 
@@ -60,10 +68,36 @@ def _source_timestamp(value):
             return text
 
 
+def _message_type_values(data: dict) -> set[str]:
+    return {
+        value.casefold()
+        for key in ("localType", "type", "msgType", "messageType")
+        if (value := _text_value(data.get(key)))
+    }
+
+
+def _is_sticker_message(data: dict) -> bool:
+    if _message_type_values(data) & {"47", "emoji", "sticker"}:
+        return True
+    media_type = _text_value(data.get("mediaType")).casefold()
+    if media_type in {"emoji", "sticker"}:
+        return True
+    for key in ("content", "parsedContent"):
+        if _text_value(data.get(key)) == "[表情]":
+            return True
+    for key in ("content", "rawContent", "parsedContent"):
+        candidate = _text_value(data.get(key)).casefold()
+        if candidate.startswith("<") and "<emoji" in candidate:
+            return True
+    return False
+
+
 def _event_fingerprint(data: dict) -> str:
     fingerprint_fields = {
         "content": _exact_text_value(data.get("content")),
-        "message_type": _text_value(data.get("type") or data.get("msgType")),
+        "message_type": _text_value(
+            data.get("localType") or data.get("type") or data.get("msgType")
+        ),
         "rawid": _text_value(data.get("rawid")),
         "sender": _text_value(data.get("senderName") or data.get("sender")),
         "session": _text_value(data.get("sessionId")),
@@ -191,17 +225,19 @@ class WeFlowBridge:
         )
 
     def should_ignore(self, data):
-        content = data.get("content", "")
-        msg_type = data.get("type", 0) or data.get("msgType", 0)
+        content = _text_value(data.get("content"))
+        msg_types = _message_type_values(data)
         if data.get("sourceName", "") in config.BOT_NICKNAMES:
             return True
         if config.BOT_WXID and data.get("talkerId", "") == config.BOT_WXID:
             return True
-        if msg_type in (34,):  # 34=语音
+        if "34" in msg_types:  # 34=语音
             return True
-        if content and ("[语音]" in content or "[表情]" in content):
+        if _is_sticker_message(data):
+            return False
+        if content and "[语音]" in content:
             return True
-        if not content or content.strip() == "":
+        if not content:
             return True
         return False
 
@@ -256,8 +292,9 @@ class WeFlowBridge:
         """将消息加入缓冲区，等待合并后统一推送给 AstrBot。"""
         if not self._active():
             return
+        is_sticker = _is_sticker_message(data)
         raw_content = data.get("content", "")
-        content = _money_receipt_display(raw_content)
+        content = "[表情]" if is_sticker else _money_receipt_display(raw_content)
         source_name = _text_value(
             data.get("sourceName", "") or data.get("talkerName", "")
         ) or "未知"
@@ -275,7 +312,12 @@ class WeFlowBridge:
         session_id_data = raw_session_id or source_name
 
         now = time.time()
-        if content and content in self._sent_recently and now - self._sent_recently[content] < 120:
+        if (
+            not is_sticker
+            and content
+            and content in self._sent_recently
+            and now - self._sent_recently[content] < 120
+        ):
             log.info("⏭️ 自回复去重跳过: content_length=%d", len(content))
             return
 
@@ -316,6 +358,13 @@ class WeFlowBridge:
         if _is_red_packet_receipt_text(raw_content):
             return
 
+        if is_sticker:
+            threading.Thread(
+                target=self.process_sticker_message,
+                args=(data,),
+                daemon=True,
+            ).start()
+            return
         if content == "[图片]":
             # 图片消息：下载 → ollama 描述 → 注入缓冲区
             threading.Thread(
@@ -665,6 +714,162 @@ class WeFlowBridge:
             log.error("获取微信图片异常")
             return None
 
+    def _fetch_wechat_sticker(self, data: dict) -> str | None:
+        """按 SSE 原始消息 ID 从 WeFlow 精确导出并受限下载表情媒体。"""
+
+        session_id = _text_value(data.get("sessionId"))
+        raw_id = _text_value(data.get("rawid"))
+        if not session_id or not raw_id:
+            return None
+        timestamp = _source_timestamp(data.get("timestamp"))
+        numeric_time = (
+            float(timestamp)
+            if isinstance(timestamp, (int, float))
+            else 0.0
+        )
+        delta = 2000 if numeric_time > 10_000_000_000 else 2
+        params = {
+            "access_token": config.ACCESS_TOKEN,
+            "talker": session_id,
+            "media": "true",
+            "image": "false",
+            "voice": "false",
+            "video": "false",
+            "emoji": "true",
+            "limit": 20,
+        }
+        if numeric_time:
+            params["start"] = numeric_time - delta
+            params["end"] = numeric_time + delta
+
+        part_path = ""
+        final_path = ""
+        download = None
+        try:
+            response = requests.get(
+                f"{config.WE_FLOW_BASE_URL}/api/v1/messages",
+                params=params,
+                headers={"Authorization": f"Bearer {config.ACCESS_TOKEN}"},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                log.warning("WeFlow 表情消息查询失败: status=%s", response.status_code)
+                return None
+            payload = response.json()
+            messages = (
+                payload
+                if isinstance(payload, list)
+                else payload.get("messages", payload.get("data", []))
+            )
+            if not isinstance(messages, list):
+                return None
+            sticker_rows = [
+                item
+                for item in messages
+                if isinstance(item, dict)
+                and item.get("mediaUrl")
+                and _text_value(item.get("isSend")).casefold()
+                not in {"1", "true", "yes", "on"}
+                and (
+                    _text_value(item.get("localType")) == "47"
+                    or _text_value(item.get("mediaType")).casefold()
+                    in {"emoji", "sticker"}
+                )
+            ]
+            selected = next(
+                (
+                    item
+                    for item in sticker_rows
+                    if _text_value(item.get("serverId")) == raw_id
+                ),
+                None,
+            )
+            if selected is None:
+                log.warning("WeFlow 未返回与原始消息匹配的表情媒体")
+                return None
+
+            media_url = _text_value(selected.get("mediaUrl"))
+            absolute_url = urljoin(
+                config.WE_FLOW_BASE_URL.rstrip("/") + "/",
+                media_url,
+            )
+            base_parts = urlsplit(config.WE_FLOW_BASE_URL)
+            media_parts = urlsplit(absolute_url)
+            if (
+                media_parts.scheme not in ("http", "https")
+                or media_parts.hostname != base_parts.hostname
+                or media_parts.port != base_parts.port
+                or not media_parts.path.startswith("/api/v1/media/")
+            ):
+                log.warning("拒绝非 WeFlow 本地来源的表情 URL")
+                return None
+
+            download = requests.get(
+                absolute_url,
+                headers={"Authorization": f"Bearer {config.ACCESS_TOKEN}"},
+                stream=True,
+                timeout=(5, 30),
+            )
+            if download.status_code != 200:
+                log.warning("WeFlow 表情下载失败: status=%s", download.status_code)
+                return None
+            content_type = (
+                _text_value(download.headers.get("Content-Type"))
+                .split(";", 1)[0]
+                .lower()
+            )
+            extension = _STICKER_CONTENT_TYPES.get(content_type)
+            if extension is None:
+                log.warning("拒绝非图片格式的表情响应")
+                return None
+            raw_length = _text_value(download.headers.get("Content-Length"))
+            if raw_length:
+                if int(raw_length) > _STICKER_MAX_BYTES:
+                    log.warning("表情超过描述大小上限")
+                    return None
+
+            save_root = config.ASTRBOT_ATTACHMENTS or tempfile.gettempdir()
+            save_dir = os.path.join(save_root, "wechat_stickers")
+            os.makedirs(save_dir, exist_ok=True)
+            identity = "\0".join((session_id, raw_id, str(timestamp)))
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            final_path = os.path.join(save_dir, f"wechat_{digest}{extension}")
+            part_path = final_path + ".part"
+            total = 0
+            with open(part_path, "wb") as output:
+                for chunk in download.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > _STICKER_MAX_BYTES:
+                        raise ValueError("sticker too large")
+                    output.write(chunk)
+            if total <= 0:
+                return None
+            os.replace(part_path, final_path)
+            part_path = ""
+            log.info("✅ 微信表情已临时下载: bytes=%d", total)
+            return final_path
+        except (TypeError, ValueError):
+            log.warning("表情超过描述大小上限或响应无效")
+            return None
+        except requests.Timeout:
+            log.warning("获取微信表情超时")
+            return None
+        except Exception:
+            log.warning("获取微信表情异常")
+            return None
+        finally:
+            if download is not None:
+                close = getattr(download, "close", None)
+                if callable(close):
+                    close()
+            if part_path:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+
     def _fetch_wechat_video(self, data: dict) -> str | None:
         """按 SSE 原始消息 ID 从 WeFlow 精确导出并受限下载视频。"""
 
@@ -836,8 +1041,13 @@ class WeFlowBridge:
                 except OSError:
                     pass
 
-    def _enqueue_video_caption(self, data: dict, caption_text: str) -> None:
-        """把一条视频语义作为文本消息送入既有缓冲链。"""
+    def _enqueue_media_caption(
+        self,
+        data: dict,
+        media_label: str,
+        caption_text: str,
+    ) -> None:
+        """把一条安全的媒体短转述作为文本消息送入既有缓冲链。"""
 
         session_id = _text_value(data.get("sessionId"))
         source_name = _text_value(data.get("sourceName")) or "未知"
@@ -848,7 +1058,7 @@ class WeFlowBridge:
             or "@chatroom" in session_id
         )
         talker_id = _text_value(data.get("talkerId")) or session_id
-        media_text = f"[视频: {caption_text}]"
+        media_text = f"[{media_label}: {caption_text}]"
         with self.buffer_lock:
             if is_group and state.group_reply_mode == "batch" and group_name:
                 base_name = re.sub(r"\s*\(\d+\)\s*$", "", group_name).strip()
@@ -889,6 +1099,52 @@ class WeFlowBridge:
             timer.start()
             self.pending_buffers[buffer_key]["timer"] = timer
             self.pending_buffers[buffer_key]["timer_version"] = 1
+
+    def _enqueue_video_caption(self, data: dict, caption_text: str) -> None:
+        self._enqueue_media_caption(data, "视频", caption_text)
+
+    def process_sticker_message(self, data: dict) -> None:
+        """导出自定义表情，以图片短转述注入既有文本链。"""
+
+        if not self._active():
+            return
+        session_id = _text_value(data.get("sessionId"))
+        group_name = _text_value(data.get("groupName"))
+        is_group = (
+            data.get("sessionType", "") == "group"
+            or bool(group_name)
+            or "@chatroom" in session_id
+        )
+        if not is_group and not session_id:
+            log.warning("跳过缺少稳定 sessionId 的私聊表情消息")
+            return
+
+        sticker_path = self._fetch_wechat_sticker(data)
+        try:
+            caption = (
+                caption_image_via_ollama(sticker_path)
+                if sticker_path
+                else None
+            )
+            normalized = " ".join(caption.split()) if caption else ""
+            if len(normalized) > 180:
+                normalized = normalized[:179].rstrip() + "…"
+            caption_text = (
+                f"微信表情包：{normalized}"
+                if normalized
+                else "微信表情包（内容无法描述）"
+            )
+            if not self._active():
+                return
+            # 自定义表情是 GIF/WebP 等图片媒体，沿用图片语义记忆链；
+            # 原生 Unicode emoji 仍然是普通文本，不会进入此路径。
+            self._enqueue_media_caption(data, "图片", caption_text)
+        finally:
+            if sticker_path:
+                try:
+                    os.remove(sticker_path)
+                except OSError:
+                    pass
 
     def process_video_message(self, data: dict) -> None:
         """从 WeFlow 取视频，经视觉模型转述后注入既有文本链。"""
@@ -1043,6 +1299,13 @@ def caption_image_via_ollama(image_path: str) -> str | None:
         import base64
         with open(image_path, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode("utf-8")
+        image_mime = {
+            ".gif": "image/gif",
+            ".jpeg": "image/jpeg",
+            ".jpg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }.get(os.path.splitext(image_path)[1].lower(), "image/jpeg")
 
         if config.IMAGE_CAPTION_PROVIDER == "openai":
             # OpenAI 兼容 API（mimo）
@@ -1059,7 +1322,7 @@ def caption_image_via_ollama(image_path: str) -> str | None:
                         "content": [
                             {"type": "text", "text": config.IMAGE_CAPTION_PROMPT},
                             {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_b64}"
+                                "url": f"data:{image_mime};base64,{img_b64}"
                             }},
                         ],
                     }],

@@ -25,6 +25,18 @@ from privacy import chat_record
 log = logging.getLogger("ob11-bridge")
 _CONTACTS_LIMIT = 10000
 _CONTACTS_TIMEOUT_SECONDS = 5
+_SAFE_SEND_STAGES = {
+    "request",
+    "route",
+    "preflight",
+    "select_contact",
+    "focus_input",
+    "paste",
+    "review",
+    "submit",
+    "image",
+    "complete",
+}
 
 
 def _write_outbound_log(scope: str, contact: object, body: object, sent: object) -> None:
@@ -39,6 +51,35 @@ def _write_outbound_log(scope: str, contact: object, body: object, sent: object)
         log.info("CHAT %s", entry)
     else:
         log.error("CHAT %s", entry)
+
+
+def _record_safe_send_failure(code: str, stage: str) -> None:
+    recorder = getattr(state, "record_send_result", None)
+    if callable(recorder):
+        recorder(False, code=code, stage=stage)
+
+
+def _normalize_safe_failure(code: object, stage: object) -> tuple[str, str]:
+    normalized_code = str(code or "")
+    normalized_stage = str(stage or "")
+    if not normalized_code.startswith(("E_UIA_", "E_OB_")):
+        normalized_code = "E_UIA_SEND_FAILED"
+    if normalized_stage not in _SAFE_SEND_STAGES:
+        normalized_stage = "complete"
+    return normalized_code, normalized_stage
+
+
+def _last_send_failure() -> tuple[str, str] | None:
+    getter = getattr(state, "get_last_send_result", None)
+    if not callable(getter):
+        return None
+    try:
+        result = getter()
+    except Exception:
+        return None
+    if not isinstance(result, dict) or result.get("status") != "failed":
+        return None
+    return _normalize_safe_failure(result.get("code"), result.get("stage"))
 
 
 def _normalize_target_id(value: object) -> int | None:
@@ -194,31 +235,68 @@ async def _send_api_response(response_data: dict) -> bool:
     return False
 
 
+async def _send_private_send_result(
+    target_id: int,
+    *,
+    routing_name: str,
+    account: str,
+    session: str,
+    success: bool,
+    delivered_parts: tuple[str, ...] = (),
+    error_code: str = "",
+    error_stage: str = "",
+) -> bool:
+    """Tell the memory plugin whether the private reply reached UIA submit."""
+
+    payload = {
+        "time": int(time.time()),
+        "self_id": int(getattr(state, "_self_id_int", 0) or 0),
+        "post_type": "notice",
+        "notice_type": "akasha_send_result",
+        "sub_type": "sent" if success else "failed",
+        "user_id": target_id,
+        "akasha_schema": 1,
+        "type": "private",
+        "account": account,
+        "session": session,
+        "routing_name": routing_name,
+        "source_messages": [],
+        "success": bool(success),
+    }
+    if success:
+        payload["delivered_parts"] = [
+            str(part)
+            for part in delivered_parts
+            if isinstance(part, str) and part
+        ]
+    else:
+        failure = (
+            _normalize_safe_failure(error_code, error_stage)
+            if error_code
+            else _last_send_failure()
+        )
+        if failure is not None:
+            payload["error_code"], payload["error_stage"] = failure
+    return await _send_api_response(payload)
+
+
 async def _send_private_send_failure(
     target_id: int,
     *,
     routing_name: str,
     account: str,
     session: str,
+    error_code: str,
+    error_stage: str,
 ) -> bool:
-    """Tell the memory plugin that a generated private reply was not sent."""
-
-    return await _send_api_response(
-        {
-            "time": int(time.time()),
-            "self_id": int(getattr(state, "_self_id_int", 0) or 0),
-            "post_type": "notice",
-            "notice_type": "akasha_send_result",
-            "sub_type": "failed",
-            "user_id": target_id,
-            "akasha_schema": 1,
-            "type": "private",
-            "account": account,
-            "session": session,
-            "routing_name": routing_name,
-            "source_messages": [],
-            "success": False,
-        }
+    return await _send_private_send_result(
+        target_id,
+        routing_name=routing_name,
+        account=account,
+        session=session,
+        success=False,
+        error_code=error_code,
+        error_stage=error_stage,
     )
 
 
@@ -260,6 +338,7 @@ async def _handle_ob_api(data: dict, generation=None):
         message = params.get("message", [])
         scope = "group" if is_group else "private"
         if not params_valid or target_id is None or not isinstance(message, list):
+            _record_safe_send_failure("E_OB_INVALID_REQUEST", "request")
             if not is_group and target_id is not None:
                 failure_identity = await asyncio.to_thread(
                     _private_failure_identity,
@@ -272,11 +351,16 @@ async def _handle_ob_api(data: dict, generation=None):
                         routing_name=routing_name,
                         account=account,
                         session=session,
+                        error_code="E_OB_INVALID_REQUEST",
+                        error_stage="request",
                     )
             failed_response = {
                 "status": "failed",
                 "retcode": 1400,
-                "data": {},
+                "data": {
+                    "error_code": "E_OB_INVALID_REQUEST",
+                    "error_stage": "request",
+                },
             }
             if echo:
                 failed_response["echo"] = echo
@@ -294,6 +378,7 @@ async def _handle_ob_api(data: dict, generation=None):
                 target_id,
             )
             if private_identity is None:
+                _record_safe_send_failure("E_OB_PRIVATE_ROUTE", "route")
                 failure_identity = await asyncio.to_thread(
                     _private_failure_identity,
                     target_id,
@@ -305,11 +390,16 @@ async def _handle_ob_api(data: dict, generation=None):
                         routing_name=routing_name,
                         account=account,
                         session=session,
+                        error_code="E_OB_PRIVATE_ROUTE",
+                        error_stage="route",
                     )
                 failed_response = {
                     "status": "failed",
                     "retcode": 1404,
-                    "data": {},
+                    "data": {
+                        "error_code": "E_OB_PRIVATE_ROUTE",
+                        "error_stage": "route",
+                    },
                 }
                 if echo:
                     failed_response["echo"] = echo
@@ -326,16 +416,34 @@ async def _handle_ob_api(data: dict, generation=None):
         # 逐段处理：文字和图片分别发送
         all_sent = True
         sendable_segments = 0
+        delivered_parts: list[str] = []
+        protocol_failure: tuple[str, str] | None = None
+
+        def remember_protocol_failure(code: str, stage: str) -> None:
+            nonlocal protocol_failure
+            if protocol_failure is None:
+                protocol_failure = (code, stage)
+
+        def remember_sender_failure() -> None:
+            remember_protocol_failure(
+                *(
+                    _last_send_failure()
+                    or ("E_UIA_SEND_FAILED", "submit")
+                )
+            )
+
         for seg in message:
             if not isinstance(seg, dict):
                 _write_outbound_log(scope, contact, "[无效消息]", False)
                 all_sent = False
+                remember_protocol_failure("E_OB_INVALID_SEGMENT", "request")
                 continue
             seg_type = seg.get("type", "")
             seg_data = seg.get("data", {})
             if not isinstance(seg_type, str):
                 _write_outbound_log(scope, contact, "[无效消息]", False)
                 all_sent = False
+                remember_protocol_failure("E_OB_INVALID_SEGMENT", "request")
                 continue
             if not isinstance(seg_data, dict):
                 invalid_body = {
@@ -346,6 +454,7 @@ async def _handle_ob_api(data: dict, generation=None):
                 if invalid_body:
                     _write_outbound_log(scope, contact, invalid_body, False)
                 all_sent = False
+                remember_protocol_failure("E_OB_INVALID_SEGMENT", "request")
                 continue
 
             if seg_type == "text":
@@ -353,6 +462,7 @@ async def _handle_ob_api(data: dict, generation=None):
                 if not isinstance(text, str):
                     _write_outbound_log(scope, contact, "[无效文本]", False)
                     all_sent = False
+                    remember_protocol_failure("E_OB_INVALID_SEGMENT", "request")
                     continue
                 if text:
                     sendable_segments += 1
@@ -365,20 +475,26 @@ async def _handle_ob_api(data: dict, generation=None):
                     except Exception:
                         _write_outbound_log(scope, contact, text, False)
                         all_sent = False
+                        remember_protocol_failure("E_OB_SEND_EXCEPTION", "submit")
                         continue
                     _write_outbound_log(scope, contact, text, sent)
                     if sent is not True:
                         all_sent = False
+                        remember_sender_failure()
+                    else:
+                        delivered_parts.append(text)
 
             elif seg_type == "image":
                 file_val = seg_data.get("file", "")
                 if not isinstance(file_val, str):
                     _write_outbound_log(scope, contact, "[图片]", False)
                     all_sent = False
+                    remember_protocol_failure("E_OB_INVALID_SEGMENT", "image")
                     continue
                 if not file_val:
                     _write_outbound_log(scope, contact, "[图片]", False)
                     all_sent = False
+                    remember_protocol_failure("E_OB_IMAGE_NOT_FOUND", "image")
                     continue
                 sendable_segments += 1
 
@@ -396,6 +512,7 @@ async def _handle_ob_api(data: dict, generation=None):
                             log.info("[OB11] 图片已解码")
                     except Exception:
                         log.warning("[OB11] base64 图片解码失败")
+                        remember_protocol_failure("E_OB_IMAGE_DECODE", "image")
                 else:
                     # 文件名模式：在附件目录找
                     if config.ASTRBOT_ATTACHMENTS:
@@ -413,6 +530,11 @@ async def _handle_ob_api(data: dict, generation=None):
                 if not img_path:
                     _write_outbound_log(scope, contact, "[图片]", False)
                     all_sent = False
+                    if protocol_failure is None:
+                        remember_protocol_failure(
+                            "E_OB_IMAGE_NOT_FOUND",
+                            "image",
+                        )
                     continue
 
                 try:
@@ -426,10 +548,14 @@ async def _handle_ob_api(data: dict, generation=None):
                     except Exception:
                         _write_outbound_log(scope, contact, "[图片]", False)
                         all_sent = False
+                        remember_protocol_failure("E_OB_SEND_EXCEPTION", "submit")
                         continue
                     _write_outbound_log(scope, contact, "[图片]", sent)
                     if sent is not True:
                         all_sent = False
+                        remember_sender_failure()
+                    else:
+                        delivered_parts.append("[图片]")
                 finally:
                     # 临时文件用完删除
                     if temporary_image:
@@ -449,32 +575,63 @@ async def _handle_ob_api(data: dict, generation=None):
                 except Exception:
                     _write_outbound_log(scope, contact, "[表情]", False)
                     all_sent = False
+                    remember_protocol_failure("E_OB_SEND_EXCEPTION", "submit")
                     continue
                 _write_outbound_log(scope, contact, "[表情]", sent)
                 if sent is not True:
                     all_sent = False
+                    remember_sender_failure()
+                else:
+                    delivered_parts.append("[表情]")
 
             # 其他类型（record, video 等）忽略
 
         send_succeeded = all_sent and sendable_segments > 0
+        final_failure: tuple[str, str] | None = None
+        if not send_succeeded:
+            if protocol_failure is not None:
+                final_failure = protocol_failure
+            elif sendable_segments == 0:
+                final_failure = (
+                    "E_OB_NO_SENDABLE_SEGMENTS",
+                    "request",
+                )
+            else:
+                final_failure = ("E_UIA_SEND_FAILED", "submit")
+            _record_safe_send_failure(*final_failure)
         if not send_succeeded and private_identity is not None:
             routing_name, account, session = private_identity
+            assert final_failure is not None
             await _send_private_send_failure(
                 target_id,
                 routing_name=routing_name,
                 account=account,
                 session=session,
+                error_code=final_failure[0],
+                error_stage=final_failure[1],
             )
-        response = (
-            resp_data
-            if send_succeeded
-            else {
+        elif send_succeeded and private_identity is not None:
+            routing_name, account, session = private_identity
+            await _send_private_send_result(
+                target_id,
+                routing_name=routing_name,
+                account=account,
+                session=session,
+                success=True,
+                delivered_parts=tuple(delivered_parts),
+            )
+        response = resp_data
+        if not send_succeeded:
+            assert final_failure is not None
+            response = {
                 "status": "failed",
                 "retcode": 1500,
-                "data": {},
+                "data": {
+                    "error_code": final_failure[0],
+                    "error_stage": final_failure[1],
+                },
                 **({"echo": echo} if echo else {}),
             }
-        )
         await _send_api_response(response)
 
     else:

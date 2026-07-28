@@ -232,6 +232,7 @@ def _start_bridge():
             config.UIA_FIXED_CALIBRATION,
             pre_paste_preview_delay=config.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY,
             pre_send_delay=config.UIA_FIXED_PRE_SEND_DELAY,
+            settle_jitter_max_seconds=config.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS,
         )
         state.lifecycle_generation += 1
         generation = state.lifecycle_generation
