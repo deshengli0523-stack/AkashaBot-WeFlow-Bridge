@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.1 - 2026-07-28
+
+- Show the latest outbound send result and actionable failure reason directly
+  in the local control panel.
+- Add bounded random timing around WeChat selection, paste, and submit actions
+  while preserving the existing global FIFO and cancellation behavior.
+- Reuse each contact's durable Qwen session, confirm successful cloud turns,
+  and rebuild only after send failure, model or persona changes, or session
+  expiry. Failed rebuilds remain limited to the latest 20 messages.
+- Keep normal session seeds bounded to cleaned recent text plus summaries.
+  Images, videos, files, stickers, and WeChat app messages contribute only
+  short descriptions; raw XML is never injected into the model context.
+- Resolve inbound custom-sticker media from WeFlow when the push event omits
+  the image bytes, then forward a concise image/sticker representation.
+
+### Automated and live verification
+
+- All PowerShell release suites and 262 Python tests pass.
+- The current 50-file install payload matches the local installation
+  byte-for-byte, and WeFlow, AstrBot, Bridge, and OneBot pass two consecutive
+  health checks.
+
 ## 0.4.0 - 2026-07-28
 
 - Add an AstrBot-native multimodal Agent plugin for receiving incoming WeChat
