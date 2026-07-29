@@ -173,7 +173,15 @@ function Invoke-AkashaUiaCalibration {
       }
 
       $preflight = Get-AkashaCalibrationPreflight -Paths $paths
-      $arguments = @($preflight.CalibrationScript, '--config', $paths.BridgeConfig, '--backup-dir', $paths.Backups)
+      $arguments = @(
+        $preflight.CalibrationScript,
+        '--config',
+        $paths.BridgeConfig,
+        '--backup-dir',
+        $paths.Backups,
+        '--favorite-state-dir',
+        $paths.State
+      )
       try {
         if ($null -eq $Runner) {
           & $paths.BridgePython @arguments | Out-Host

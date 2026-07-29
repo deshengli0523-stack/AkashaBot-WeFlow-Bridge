@@ -16,6 +16,16 @@ from uia_support import (
     validate_calibration,
     validate_runtime_metrics,
 )
+from favorite_sticker import (
+    STICKER_COMMIT_UNKNOWN,
+    STICKER_CONFIRMATION_UNKNOWN,
+    STICKER_KEYS,
+    STICKER_QUEUE_EXPIRED,
+    FavoriteStickerError,
+    FavoriteStickerLayout,
+    IdempotentResult,
+    RequestIdCache,
+)
 
 
 log = logging.getLogger("weflow-bridge")
@@ -23,6 +33,9 @@ log = logging.getLogger("weflow-bridge")
 VK_A = 0x41
 VK_V = 0x56
 VK_BACKSPACE = 0x08
+
+_FAVORITE_ENTRY_TO_TAB_DELAY_RANGE = (0.8, 1.3)
+_FAVORITE_TAB_TO_SLOT_DELAY_RANGE = (0.9, 1.5)
 
 
 class _FifoSendLock:
@@ -35,6 +48,12 @@ class _FifoSendLock:
         self._normal_active = False
         self._priority_active = False
         self._priority_waiters = deque()
+        self._cancelled_tickets = set()
+
+    def _advance_cancelled_tickets(self) -> None:
+        while self._serving_ticket in self._cancelled_tickets:
+            self._cancelled_tickets.remove(self._serving_ticket)
+            self._serving_ticket += 1
 
     def __enter__(self):
         with self._condition:
@@ -54,8 +73,12 @@ class _FifoSendLock:
         with self._condition:
             self._normal_active = False
             self._serving_ticket += 1
+            self._advance_cancelled_tickets()
             self._condition.notify_all()
         return False
+
+    def reserve_normal(self, *, deadline: float, monotonic):
+        return _NormalReservation(self, deadline=deadline, monotonic=monotonic)
 
     def priority_waiter_count(self) -> int:
         with self._condition:
@@ -160,7 +183,53 @@ class _PriorityReservation:
             lock._condition.notify_all()
 
 
+class _NormalReservation:
+    """A FIFO ticket that can expire without blocking every later ticket."""
+
+    def __init__(self, lock: _FifoSendLock, *, deadline: float, monotonic):
+        self._lock = lock
+        self._deadline = float(deadline)
+        self._monotonic = monotonic
+        self._acquired = False
+        with lock._condition:
+            self._ticket = lock._next_ticket
+            lock._next_ticket += 1
+
+    def __enter__(self) -> bool:
+        lock = self._lock
+        with lock._condition:
+            while True:
+                remaining = self._deadline - self._monotonic()
+                if remaining <= 0:
+                    lock._cancelled_tickets.add(self._ticket)
+                    lock._advance_cancelled_tickets()
+                    lock._condition.notify_all()
+                    return False
+                if (
+                    self._ticket == lock._serving_ticket
+                    and not lock._normal_active
+                    and not lock._priority_active
+                    and not lock._priority_waiters
+                ):
+                    lock._normal_active = True
+                    self._acquired = True
+                    return True
+                lock._condition.wait(min(remaining, 0.05))
+
+    def __exit__(self, exc_type, exc, traceback):
+        if not self._acquired:
+            return False
+        lock = self._lock
+        with lock._condition:
+            lock._normal_active = False
+            lock._serving_ticket += 1
+            lock._advance_cancelled_tickets()
+            lock._condition.notify_all()
+        return False
+
+
 _SHARED_SEND_LOCK = _FifoSendLock()
+_FAVORITE_REQUEST_CACHE = RequestIdCache()
 
 
 class UiaFixedSender:
@@ -173,6 +242,8 @@ class UiaFixedSender:
         pre_paste_preview_delay: float = 1.0,
         pre_send_delay: float = 5.0,
         settle_jitter_max_seconds: float = 0.25,
+        favorite_state_dir: str | None = None,
+        favorite_receipt=None,
         rng=None,
     ):
         self.calibration = validate_calibration(calibration)
@@ -186,6 +257,10 @@ class UiaFixedSender:
             max(0.0, float(settle_jitter_max_seconds)),
         )
         self.rng = rng or random
+        self.favorite_state_dir = str(favorite_state_dir or "")
+        self.favorite_receipt = favorite_receipt
+        self._favorite_layout = None
+        self._favorite_layout_lock = threading.Lock()
         self._lock = _SHARED_SEND_LOCK
         self._stopped = threading.Event()
 
@@ -330,6 +405,7 @@ class UiaFixedSender:
         seconds: float,
         cancel_event: threading.Event,
         stage: str,
+        deadline: float | None = None,
     ) -> bool:
         """Wait for active time only; paused time does not consume the timer."""
         remaining = max(0.0, float(seconds))
@@ -340,7 +416,13 @@ class UiaFixedSender:
             remaining_seconds=remaining,
         )
         while remaining > 0:
-            if not self._send_active(cancel_event):
+            if (
+                not self._send_active(cancel_event)
+                or (
+                    deadline is not None
+                    and self.monotonic() >= deadline
+                )
+            ):
                 return False
             now = self.monotonic()
             if state.paused.is_set():
@@ -359,12 +441,28 @@ class UiaFixedSender:
             self._pause(min(0.05, remaining))
         return self._send_active(cancel_event)
 
-    def _wait_until_resumed(self, cancel_event: threading.Event) -> bool:
+    def _wait_until_resumed(
+        self,
+        cancel_event: threading.Event,
+        deadline: float | None = None,
+    ) -> bool:
         while state.paused.is_set():
-            if not self._send_active(cancel_event):
+            if (
+                not self._send_active(cancel_event)
+                or (
+                    deadline is not None
+                    and self.monotonic() >= deadline
+                )
+            ):
                 return False
             self._pause(0.05)
-        return self._send_active(cancel_event)
+        return bool(
+            self._send_active(cancel_event)
+            and (
+                deadline is None
+                or self.monotonic() < deadline
+            )
+        )
 
     def _discard_pasted_text(self, hwnd: int, contact: str) -> None:
         try:
@@ -397,6 +495,9 @@ class UiaFixedSender:
         if isinstance(caught, CalibrationError):
             log.error(caught.code)
             code = caught.code
+        elif isinstance(caught, FavoriteStickerError):
+            log.error(caught.code)
+            code = caught.code
         else:
             log.error("[UIA_FIXED] send failed")
             code = {
@@ -407,6 +508,301 @@ class UiaFixedSender:
                 "submit": "E_UIA_SUBMIT_FAILED",
             }.get(stage, "E_UIA_SEND_FAILED")
         self._record_failure(code, stage)
+
+    def _get_favorite_layout(self) -> FavoriteStickerLayout:
+        with self._favorite_layout_lock:
+            if self._favorite_layout is None:
+                self._favorite_layout = FavoriteStickerLayout(
+                    self.favorite_state_dir
+                )
+            return self._favorite_layout
+
+    def _validate_favorite_runtime(self, layout, metrics) -> None:
+        reference = layout.manifest["reference"]
+        if metrics.dpi != reference["dpi"]:
+            raise CalibrationError("E_UIA_RECALIBRATION_REQUIRED")
+        current_aspect = metrics.width / metrics.height
+        expected_aspect = float(reference["aspect_ratio"])
+        if not expected_aspect * 0.95 <= current_aspect <= expected_aspect * 1.05:
+            raise CalibrationError("E_UIA_RECALIBRATION_REQUIRED")
+
+    def _finish_favorite_request(
+        self,
+        request_id: str,
+        identity: tuple[str, str, str],
+        result: IdempotentResult,
+    ) -> IdempotentResult:
+        _FAVORITE_REQUEST_CACHE.finish(request_id, identity, result)
+        state.record_send_result(
+            result.confirmed,
+            code=result.error_code or "OK",
+            stage=result.error_stage,
+        )
+        return result
+
+    def _favorite_interrupt_code(
+        self,
+        cancel_event: threading.Event,
+        deadline: float,
+    ) -> str:
+        if self.monotonic() >= deadline:
+            return STICKER_QUEUE_EXPIRED
+        if cancel_event.is_set():
+            return "E_UIA_SEND_CANCELLED"
+        return "E_UIA_SENDER_STOPPED"
+
+    def send_favorite_sticker(
+        self,
+        contact: str,
+        session: str,
+        sticker_key: str,
+        request_id: str,
+        deadline: float,
+    ) -> IdempotentResult:
+        """Click one calibrated native favorite-sticker slot exactly once."""
+        identity = (str(contact), str(session), str(sticker_key))
+        cached = _FAVORITE_REQUEST_CACHE.begin(request_id, identity)
+        if cached is not None:
+            return cached
+        result = None
+        try:
+            with self._lock.reserve_normal(
+                deadline=deadline,
+                monotonic=self.monotonic,
+            ) as acquired:
+                if not acquired:
+                    result = IdempotentResult(
+                        False,
+                        STICKER_QUEUE_EXPIRED,
+                        "request",
+                        False,
+                    )
+                    return self._finish_favorite_request(
+                        request_id, identity, result
+                    )
+                if sticker_key not in STICKER_KEYS:
+                    result = IdempotentResult(
+                        False, "E_OB_INVALID_REQUEST", "request", False
+                    )
+                    return self._finish_favorite_request(
+                        request_id, identity, result
+                    )
+                if not state.running or self._stopped.is_set():
+                    result = IdempotentResult(
+                        False, "E_UIA_SENDER_STOPPED", "request", False
+                    )
+                    return self._finish_favorite_request(
+                        request_id, identity, result
+                    )
+
+                cancel_event = state.begin_send_preview(
+                    contact,
+                    f"[收藏表情 {sticker_key}]",
+                    message_type="favorite_sticker",
+                )
+                hwnd = None
+                panel_open = False
+                committed = False
+                stage = "review"
+                try:
+                    if not self._wait_for_review(
+                        self.pre_paste_preview_delay,
+                        cancel_event,
+                        "before_paste",
+                        deadline,
+                    ):
+                        code = self._favorite_interrupt_code(
+                            cancel_event,
+                            deadline,
+                        )
+                        result = IdempotentResult(False, code, stage, False)
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+                    if not self._wait_for_review(
+                        self._next_pre_send_delay(),
+                        cancel_event,
+                        "pasted_waiting",
+                        deadline,
+                    ):
+                        code = self._favorite_interrupt_code(
+                            cancel_event,
+                            deadline,
+                        )
+                        result = IdempotentResult(False, code, stage, False)
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+                    if not self._wait_until_resumed(cancel_event, deadline):
+                        result = IdempotentResult(
+                            False,
+                            self._favorite_interrupt_code(
+                                cancel_event,
+                                deadline,
+                            ),
+                            stage,
+                            False,
+                        )
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+
+                    layout = self._get_favorite_layout()
+                    if self.favorite_receipt is None:
+                        raise FavoriteStickerError(
+                            "E_UIA_STICKER_CONFIRMATION_UNAVAILABLE"
+                        )
+                    baseline = self.favorite_receipt.baseline(session)
+                    if self.monotonic() >= deadline:
+                        raise FavoriteStickerError(STICKER_QUEUE_EXPIRED)
+                    stage = "preflight"
+                    hwnd = self._preflight()
+                    metrics = self.driver.get_client_metrics(hwnd)
+                    self._validate_favorite_runtime(layout, metrics)
+                    stage = "select_contact"
+                    self._select_contact(hwnd, contact)
+                    if not self._wait_until_resumed(cancel_event, deadline):
+                        result = IdempotentResult(
+                            False,
+                            self._favorite_interrupt_code(
+                                cancel_event,
+                                deadline,
+                            ),
+                            stage,
+                            False,
+                        )
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+
+                    stage = "sticker"
+                    self.driver.click_ratio(
+                        hwnd,
+                        layout.manifest["points"]["smile_entry"],
+                    )
+                    panel_open = True
+                    self._pause(
+                        self.rng.uniform(
+                            *_FAVORITE_ENTRY_TO_TAB_DELAY_RANGE
+                        )
+                    )
+                    if not self._wait_until_resumed(cancel_event, deadline):
+                        result = IdempotentResult(
+                            False,
+                            self._favorite_interrupt_code(
+                                cancel_event,
+                                deadline,
+                            ),
+                            stage,
+                            False,
+                        )
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+                    self.driver.click_bound_process_ratio(
+                        hwnd,
+                        layout.manifest["points"]["favorite_tab"],
+                    )
+                    self._pause(
+                        self.rng.uniform(
+                            *_FAVORITE_TAB_TO_SLOT_DELAY_RANGE
+                        )
+                    )
+                    if not self._wait_until_resumed(cancel_event, deadline):
+                        result = IdempotentResult(
+                            False,
+                            self._favorite_interrupt_code(
+                                cancel_event,
+                                deadline,
+                            ),
+                            stage,
+                            False,
+                        )
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+                    target_point = layout.point(sticker_key)
+                    # Refresh immediately before the fixed slot click so a
+                    # concurrent manual sticker sent during UI preparation is
+                    # not mistaken for this request.
+                    baseline = self.favorite_receipt.baseline(session)
+                    if self.monotonic() >= deadline:
+                        raise FavoriteStickerError(STICKER_QUEUE_EXPIRED)
+
+                    stage = "submit"
+                    if (
+                        self.monotonic() >= deadline
+                        or not state.try_commit_send(cancel_event)
+                    ):
+                        result = IdempotentResult(
+                            False,
+                            self._favorite_interrupt_code(
+                                cancel_event,
+                                deadline,
+                            ),
+                            stage,
+                            False,
+                        )
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+                    committed = True
+                    try:
+                        self.driver.click_bound_process_ratio(hwnd, target_point)
+                    except Exception:
+                        result = IdempotentResult(
+                            False,
+                            STICKER_COMMIT_UNKNOWN,
+                            stage,
+                            True,
+                        )
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+                    panel_open = False
+                    if not self.favorite_receipt.confirm(session, baseline):
+                        result = IdempotentResult(
+                            False,
+                            STICKER_CONFIRMATION_UNKNOWN,
+                            "complete",
+                            True,
+                        )
+                        return self._finish_favorite_request(
+                            request_id, identity, result
+                        )
+                    result = IdempotentResult(True, "", "complete", True)
+                    return self._finish_favorite_request(
+                        request_id, identity, result
+                    )
+                except Exception as caught:
+                    code = (
+                        caught.code
+                        if isinstance(caught, (CalibrationError, FavoriteStickerError))
+                        else (
+                            STICKER_COMMIT_UNKNOWN
+                            if committed
+                            else "E_UIA_STICKER_PANEL_FAILED"
+                        )
+                    )
+                    result = IdempotentResult(
+                        False,
+                        code,
+                        stage,
+                        committed,
+                    )
+                    return self._finish_favorite_request(
+                        request_id, identity, result
+                    )
+                finally:
+                    if panel_open and not committed and hwnd is not None:
+                        try:
+                            self.driver.press_key_bound_process(hwnd, 0x1B)
+                        except Exception:
+                            pass
+                    state.end_send_preview(cancel_event)
+        finally:
+            if result is None:
+                _FAVORITE_REQUEST_CACHE.abandon(request_id, identity)
 
     def send_text(self, contact: str, text: str) -> bool:
         """Preview, paste, and submit one cancellable FIFO text item."""

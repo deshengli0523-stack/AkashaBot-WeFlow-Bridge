@@ -346,7 +346,15 @@ try {
   Assert-Equal ([int]$runnerResult) 0 'Successful runner did not return 0.'
   Assert-Equal $runnerState.Calls 1 'Calibration runner call count changed.'
   Assert-Equal $runnerState.FilePath $runnerFixture.Paths.BridgePython 'Calibration used the wrong Python interpreter.'
-  $expectedArguments = @((Join-Path $runnerFixture.Paths.Bridge 'calibrate_uia_fixed.py'), '--config', $runnerFixture.Paths.BridgeConfig, '--backup-dir', $runnerFixture.Paths.Backups)
+  $expectedArguments = @(
+    (Join-Path $runnerFixture.Paths.Bridge 'calibrate_uia_fixed.py'),
+    '--config',
+    $runnerFixture.Paths.BridgeConfig,
+    '--backup-dir',
+    $runnerFixture.Paths.Backups,
+    '--favorite-state-dir',
+    $runnerFixture.Paths.State
+  )
   Assert-Equal ($runnerState.Arguments -join '|') ($expectedArguments -join '|') 'Calibration runner arguments changed.'
 
   $heldLockState = [pscustomobject]@{ Blocked = $false; Calls = 0 }

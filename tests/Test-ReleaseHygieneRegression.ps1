@@ -476,6 +476,11 @@ try {
   Assert-GateFail -Case 'missing bridge file' -ExpectedMessage 'Missing publish file: bridge/web_panel.py'
   Copy-RepositoryFileToFixture -RelativePath 'bridge/web_panel.py'
 
+  $requiredFavoriteBridgePath = Get-FixturePath -RelativePath 'bridge/favorite_sticker.py'
+  Remove-Item -LiteralPath $requiredFavoriteBridgePath -Force
+  Assert-GateFail -Case 'missing favorite-sticker bridge file' -ExpectedMessage 'Missing publish file: bridge/favorite_sticker.py'
+  Copy-RepositoryFileToFixture -RelativePath 'bridge/favorite_sticker.py'
+
   $extraPluginPath = Get-FixturePath -RelativePath 'plugins/astrbot_plugin_akasha_contact_memory/unexpected.py'
   Set-Content -LiteralPath $extraPluginPath -Value '# unexpected plugin file' -Encoding UTF8
   Assert-GateFail -Case 'unexpected contact-memory plugin file' -ExpectedMessage 'Unexpected publish file: plugins/astrbot_plugin_akasha_contact_memory/unexpected.py'
@@ -485,6 +490,16 @@ try {
   Remove-Item -LiteralPath $requiredPluginPath -Force
   Assert-GateFail -Case 'missing contact-memory plugin main' -ExpectedMessage 'Missing publish file: plugins/astrbot_plugin_akasha_contact_memory/main.py'
   Copy-RepositoryFileToFixture -RelativePath 'plugins/astrbot_plugin_akasha_contact_memory/main.py'
+
+  $extraFavoritePluginPath = Get-FixturePath -RelativePath 'plugins/astrbot_plugin_akasha_favorite_stickers/private-template.png'
+  [System.IO.File]::WriteAllBytes($extraFavoritePluginPath, [byte[]](0x89, 0x50, 0x4E, 0x47))
+  Assert-GateFail -Case 'private favorite-sticker template in publish tree' -ExpectedMessage 'Unexpected publish file: plugins/astrbot_plugin_akasha_favorite_stickers/private-template.png'
+  Remove-Item -LiteralPath $extraFavoritePluginPath -Force
+
+  $requiredFavoritePluginPath = Get-FixturePath -RelativePath 'plugins/astrbot_plugin_akasha_favorite_stickers/catalog.json'
+  Remove-Item -LiteralPath $requiredFavoritePluginPath -Force
+  Assert-GateFail -Case 'missing favorite-sticker catalog seed' -ExpectedMessage 'Missing publish file: plugins/astrbot_plugin_akasha_favorite_stickers/catalog.json'
+  Copy-RepositoryFileToFixture -RelativePath 'plugins/astrbot_plugin_akasha_favorite_stickers/catalog.json'
 
   $unexpectedRootPath = Get-FixturePath -RelativePath 'unexpected-root.txt'
   Set-Content -LiteralPath $unexpectedRootPath -Value 'unexpected' -Encoding UTF8

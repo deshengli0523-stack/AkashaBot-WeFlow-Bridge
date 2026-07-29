@@ -944,6 +944,38 @@ class Win32CaptureTests(unittest.TestCase):
         self.assertEqual(runner.mouse_results, [1, 1])
         self.assertIn(("PostQuitMessage", 0), user32.calls)
 
+    def test_same_process_popup_click_requires_explicit_capture_permission(self):
+        for allow_popup, expected_code in ((False, CALIBRATION_WINDOW), (True, None)):
+            with self.subTest(allow_popup=allow_popup):
+                user32 = FakeUser32()
+                user32.windows[20] = {
+                    "class": "WeChatStickerPopup",
+                    "title": "",
+                    "visible": True,
+                }
+                user32.pids[20] = 100
+                user32.roots[11] = 20
+                runner = FakeHookRunner(
+                    [
+                        ("mouse", WM_LBUTTONDOWN, (260, 140)),
+                        ("mouse", WM_LBUTTONUP, (260, 140)),
+                    ]
+                )
+                driver = self.make_driver(user32, runner)
+                if expected_code is None:
+                    self.assertEqual(
+                        driver.capture_swallowed_click(
+                            10,
+                            allow_same_process_popup=True,
+                        ),
+                        (260, 140),
+                    )
+                else:
+                    with self.assertRaises(CalibrationError) as raised:
+                        driver.capture_swallowed_click(10)
+                    self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(runner.mouse_results, [1, 1])
+
     def test_capture_revalidates_bound_process_identity(self):
         user32 = FakeUser32()
         kernel32 = FakeKernel32()
@@ -1246,6 +1278,73 @@ class Win32InputAndClipboardTests(unittest.TestCase):
         self.assertFalse(
             any(call[0] == "mouse_event" for call in user32.calls)
         )
+
+    def test_bound_process_click_move_and_key_accept_only_same_process_popup(self):
+        user32 = FakeUser32()
+        user32.windows[20] = {
+            "class": "WeChatStickerPopup",
+            "title": "",
+            "visible": True,
+        }
+        user32.pids[20] = 100
+        user32.roots[11] = 20
+        user32.foreground = 20
+        driver = self.make_driver(user32=user32)
+
+        driver.move_bound_process_ratio(10, {"x": 0.1, "y": 0.1})
+        driver.click_bound_process_ratio(10, {"x": 0.2, "y": 0.2})
+        driver.press_key_bound_process(10, VK_ESCAPE)
+
+        self.assertIn(("SetCursorPos", 260, 140), user32.calls)
+        self.assertIn(("SetCursorPos", 420, 230), user32.calls)
+        self.assertEqual(
+            sum(call[0] == "mouse_event" for call in user32.calls),
+            2,
+        )
+        self.assertIn(("keybd_event", VK_ESCAPE, 0, 0, 0), user32.calls)
+        self.assertIn(
+            ("keybd_event", VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0),
+            user32.calls,
+        )
+
+        user32.pids[20] = 200
+        before = len(user32.calls)
+        with self.assertRaises(CalibrationError) as raised:
+            driver.click_bound_process_ratio(10, {"x": 0.2, "y": 0.2})
+        self.assertEqual(raised.exception.code, CALIBRATION_WINDOW)
+        self.assertFalse(
+            any(
+                call[0] in {"SetCursorPos", "mouse_event"}
+                for call in user32.calls[before:]
+            )
+        )
+
+    def test_bound_process_client_capture_requires_same_process_foreground(self):
+        user32 = FakeUser32()
+        user32.windows[20] = {
+            "class": "WeChatStickerPopup",
+            "title": "",
+            "visible": True,
+        }
+        user32.pids[20] = 100
+        user32.foreground = 20
+        image = FakeImage()
+        driver = self.make_driver(user32=user32)
+
+        with mock.patch("PIL.ImageGrab.grab", return_value=image) as grab:
+            self.assertIs(driver.capture_bound_process_client(10), image)
+        grab.assert_called_once_with(
+            bbox=(100, 50, 1700, 950),
+            all_screens=True,
+        )
+        self.assertEqual(image.mode, "RGB")
+
+        user32.pids[20] = 200
+        with mock.patch("PIL.ImageGrab.grab") as rejected_grab:
+            with self.assertRaises(CalibrationError) as raised:
+                driver.capture_bound_process_client(10)
+        self.assertEqual(raised.exception.code, CALIBRATION_WINDOW)
+        rejected_grab.assert_not_called()
 
     def test_every_click_revalidates_bound_process_identity(self):
         user32 = FakeUser32()

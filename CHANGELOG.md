@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.2 - 2026-07-29
+
+- Add an AstrBot 4.26.6 model tool for sending one native WeChat favorite
+  sticker to the current private or group conversation.
+- Extend the existing calibration flow with the smile entry, favorites tab,
+  and first/last centers of a fixed 4-by-5 grid without capturing or selecting
+  a sticker.
+- Limit the usable catalog to the 20 fully exposed slots; legacy 5-row
+  calibration manifests now require recalibration.
+- Restore the exact calibrated WeChat window to the foreground after the
+  console confirmation before starting favorite-sticker calibration.
+- Temporarily bypass runtime visual matching and click the calibrated fixed
+  slot directly. Existing matcher code and legacy private templates remain
+  untouched for a reversible follow-up, but the active send path never reads
+  or captures sticker images.
+- Randomize the emoji-entry-to-favorites delay between 0.8 and 1.3 seconds,
+  and the favorites-to-slot delay between 0.9 and 1.5 seconds.
+- Keep the semantic catalog under the preserved local state directory. Slot
+  order is now a strict contract and must be reviewed after any favorite-panel
+  content or ordering change.
+- Require a bounded UUID idempotency key, the shared UI FIFO/commit boundary,
+  and a new same-session outgoing native-sticker WeFlow receipt before
+  reporting confirmation.
+- Filter both channel sessions and contacts resolved as `official` before
+  buffering or forwarding an inbound event to AstrBot.
+- Register the model tool with an unbound handler so AstrBot can bind the
+  plugin instance exactly once when invoking it.
+
+### Automated verification
+
+- All PowerShell release suites and 301 Python tests pass. Dedicated timing
+  tests assert both favorite-sticker delay ranges.
+
 ## 0.4.1 - 2026-07-28
 
 - Show the latest outbound send result and actionable failure reason directly

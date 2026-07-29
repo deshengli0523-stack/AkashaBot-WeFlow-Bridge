@@ -1,0 +1,9 @@
+name: astrbot_plugin_akasha_favorite_stickers
+display_name: Akasha 微信收藏表情
+desc: 让模型从固定语义目录中选择并通过 Akasha Bridge 发送微信原生收藏表情。
+author: deshengli0523-stack
+version: 0.1.0
+repo: https://github.com/deshengli0523-stack/AkashaBot-WeFlow-Bridge
+astrbot_version: "==4.26.6"
+support_platforms:
+  - aiocqhttp

@@ -72,14 +72,28 @@ _SEND_RESULT_MESSAGES = {
     "E_UIA_IMAGE_MISSING": "待发送图片不存在或不可读取",
     "E_UIA_IMAGE_CLIPBOARD_FAILED": "图片未能写入微信粘贴所需的剪贴板",
     "E_UIA_SUBMIT_FAILED": "未能完成微信发送按钮操作",
+    "E_UIA_STICKER_CALIBRATION_REQUIRED": "尚未完成收藏表情标定",
+    "E_UIA_STICKER_CALIBRATION_INVALID": "收藏表情标定数据无效",
+    "E_UIA_STICKER_PANEL_FAILED": "未能确认微信收藏表情面板",
+    "E_UIA_STICKER_TEMPLATE_MISSING": "收藏表情本机模板缺失",
+    "E_UIA_STICKER_MATCH_LOW_CONFIDENCE": "收藏表情识别置信度不足",
+    "E_UIA_STICKER_MATCH_AMBIGUOUS": "收藏表情识别出现并列候选",
+    "E_UIA_STICKER_CONFIRMATION_UNAVAILABLE": "发送前无法建立 WeFlow 回执基线",
+    "E_UIA_STICKER_CONFIRMATION_UNKNOWN": "收藏表情已点击但未获得 WeFlow 回执",
+    "E_UIA_STICKER_COMMIT_UNKNOWN": "收藏表情提交结果未知，禁止自动重试",
+    "E_UIA_STICKER_REQUEST_IN_PROGRESS": "同一收藏表情请求仍在处理中",
+    "E_UIA_STICKER_REQUEST_CAPACITY": "收藏表情请求队列已满",
+    "E_UIA_STICKER_QUEUE_EXPIRED": "收藏表情请求在提交前已过期",
     "E_UIA_SEND_FAILED": "微信界面发送操作未完成",
     "E_OB_INVALID_REQUEST": "发送请求格式无效",
     "E_OB_PRIVATE_ROUTE": "无法确认私聊联系人",
+    "E_OB_GROUP_ROUTE": "无法确认群聊会话",
     "E_OB_INVALID_SEGMENT": "消息中包含无效内容",
     "E_OB_IMAGE_DECODE": "图片数据无法读取",
     "E_OB_IMAGE_NOT_FOUND": "待发送图片未找到",
     "E_OB_SEND_EXCEPTION": "发送组件执行异常",
     "E_OB_NO_SENDABLE_SEGMENTS": "消息中没有可发送的内容",
+    "E_OB_UNSUPPORTED_ACTION": "不支持的 OneBot 操作",
 }
 _SEND_RESULT_STAGES = {
     "request",
@@ -91,6 +105,7 @@ _SEND_RESULT_STAGES = {
     "review",
     "submit",
     "image",
+    "sticker",
     "complete",
 }
 send_result_lock = threading.Lock()
@@ -147,7 +162,12 @@ current_send_preview: Optional[dict[str, object]] = None
 send_preview_sequence = 0
 
 
-def begin_send_preview(contact: str, content: str) -> threading.Event:
+def begin_send_preview(
+    contact: str,
+    content: str,
+    *,
+    message_type: str = "text",
+) -> threading.Event:
     """Publish one text item before any WeChat input is touched."""
     global current_send_cancel_event, current_send_preview, send_preview_sequence
     clear_last_send_result()
@@ -159,7 +179,7 @@ def begin_send_preview(contact: str, content: str) -> threading.Event:
             "preview_id": send_preview_sequence,
             "contact": str(contact),
             "content": str(content),
-            "message_type": "text",
+            "message_type": str(message_type),
             "stage": "before_paste",
             "remaining_seconds": None,
         }
@@ -253,6 +273,10 @@ _identity_db_lock = threading.RLock()
 # route table keeps only HMACs, while this binding lets a failed outbound
 # preflight notify AstrBot about the exact private contact that triggered it.
 _private_route_bindings: dict[int, tuple[str, str, str]] = {}
+_group_route_bindings: dict[int, tuple[str, str, str, float]] = {}
+_group_route_lock = threading.Lock()
+_GROUP_ROUTE_CAPACITY = 2048
+_GROUP_ROUTE_TTL_SECONDS = 24 * 60 * 60
 
 
 def _identity_db_path() -> str:
@@ -656,6 +680,73 @@ def private_route_matches(
         finally:
             connection.close()
     return hmac.compare_digest(expected, candidate)
+
+
+def remember_group_route(
+    ob_id: object,
+    *,
+    account: str,
+    session: str,
+    routing_name: str,
+) -> None:
+    """Keep one bounded process-local group route for safe outbound confirmation."""
+    if isinstance(ob_id, bool):
+        raise ValueError("invalid group id")
+    normalized_id = int(ob_id)
+    account_id = str(account).strip()
+    session_id = str(session).strip()
+    route_name = str(routing_name).strip()
+    if (
+        normalized_id <= 0
+        or normalized_id > _ONEBOT_ID_MAX
+        or not account_id
+        or not session_id
+        or not route_name
+    ):
+        raise ValueError("invalid group route")
+    now = time.monotonic()
+    with _group_route_lock:
+        expired = [
+            key
+            for key, (_, _, _, created) in _group_route_bindings.items()
+            if now - created > _GROUP_ROUTE_TTL_SECONDS
+        ]
+        for key in expired:
+            _group_route_bindings.pop(key, None)
+        _group_route_bindings.pop(normalized_id, None)
+        _group_route_bindings[normalized_id] = (
+            account_id,
+            session_id,
+            route_name,
+            now,
+        )
+        while len(_group_route_bindings) > _GROUP_ROUTE_CAPACITY:
+            oldest = next(iter(_group_route_bindings))
+            _group_route_bindings.pop(oldest, None)
+
+
+def get_group_route_binding(ob_id: object) -> Optional[dict[str, object]]:
+    if isinstance(ob_id, bool):
+        return None
+    try:
+        normalized_id = int(ob_id)
+    except (TypeError, ValueError):
+        return None
+    now = time.monotonic()
+    with _group_route_lock:
+        binding = _group_route_bindings.get(normalized_id)
+        if binding is None:
+            return None
+        account, session, routing_name, created = binding
+        if now - created > _GROUP_ROUTE_TTL_SECONDS:
+            _group_route_bindings.pop(normalized_id, None)
+            return None
+        return {
+            "ob_id": normalized_id,
+            "account": account,
+            "session": session,
+            "routing_name": routing_name,
+        }
 
 
 # ============ 桥接实例 / 发送器 ============

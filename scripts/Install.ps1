@@ -46,7 +46,7 @@ function Get-AkashaInstallPayload {
   $launchers = Get-AkashaLauncherNames
   $entries = New-Object System.Collections.Generic.List[object]
   foreach ($name in @(
-      'bridge_core.py', 'config.py', 'main.py', 'money_action.py', 'money_service.py', 'ob_client.py', 'ob_protocol.py', 'privacy.py',
+      'bridge_core.py', 'config.py', 'favorite_sticker.py', 'main.py', 'money_action.py', 'money_service.py', 'ob_client.py', 'ob_protocol.py', 'privacy.py',
       'state.py', 'uia_fixed_sender.py', 'uia_support.py',
       'calibrate_uia_fixed.py', 'web_panel.py',
       'config.example.json', 'requirements.txt', 'requirements.lock'
@@ -97,6 +97,18 @@ function Get-AkashaMoneyReceiverPluginPayload {
   $pluginRoot = 'plugins\astrbot_plugin_akasha_money_receiver'
   $entries = New-Object System.Collections.Generic.List[object]
   foreach ($name in @('__init__.py', 'main.py', 'metadata.yaml', '_conf_schema.json')) {
+    $entries.Add([pscustomobject]@{
+      Source = Join-Path $pluginRoot $name
+      Relative = $name
+    })
+  }
+  return $entries.ToArray()
+}
+
+function Get-AkashaFavoriteStickerPluginPayload {
+  $pluginRoot = 'plugins\astrbot_plugin_akasha_favorite_stickers'
+  $entries = New-Object System.Collections.Generic.List[object]
+  foreach ($name in @('__init__.py', 'main.py', 'catalog.py', 'catalog.json', 'metadata.yaml', '_conf_schema.json', 'README.md')) {
     $entries.Add([pscustomobject]@{
       Source = Join-Path $pluginRoot $name
       Relative = $name
@@ -182,6 +194,35 @@ function Assert-AkashaMoneyReceiverPluginSource {
       @($actual | Where-Object { $expected -cnotcontains $_ }).Count -ne 0 -or
       @($expected | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
     throw 'E_SOURCE_PLUGIN: The money-receiver plugin source does not match the exact payload allowlist.'
+  }
+}
+
+function Assert-AkashaFavoriteStickerPluginSource {
+  param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][object[]]$Payload
+  )
+
+  $pluginRoot = Join-Path $Root 'plugins\astrbot_plugin_akasha_favorite_stickers'
+  if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) {
+    throw 'E_SOURCE_PLUGIN: The favorite-sticker plugin source directory is missing.'
+  }
+  foreach ($item in @(Get-Item -LiteralPath $pluginRoot -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $pluginRoot -Recurse -Force -ErrorAction Stop)) {
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      throw 'E_SOURCE_PLUGIN: The favorite-sticker plugin source contains a reparse point.'
+    }
+  }
+  $expected = @($Payload | ForEach-Object { [string]$_.Source } | Sort-Object)
+  $rootPrefixLength = $Root.TrimEnd('\', '/').Length + 1
+  $actual = @(
+    Get-ChildItem -LiteralPath $pluginRoot -Recurse -Force -File -ErrorAction Stop |
+      ForEach-Object { $_.FullName.Substring($rootPrefixLength) } |
+      Sort-Object
+  )
+  if ($actual.Count -ne $expected.Count -or
+      @($actual | Where-Object { $expected -cnotcontains $_ }).Count -ne 0 -or
+      @($expected | Where-Object { $actual -cnotcontains $_ }).Count -ne 0) {
+    throw 'E_SOURCE_PLUGIN: The favorite-sticker plugin source does not match the exact payload allowlist.'
   }
 }
 
@@ -858,6 +899,7 @@ function Invoke-AkashaInstall {
   $payload = @(Get-AkashaInstallPayload)
   $pluginPayload = @(Get-AkashaContactMemoryPluginPayload)
   $moneyPluginPayload = @(Get-AkashaMoneyReceiverPluginPayload)
+  $favoriteStickerPluginPayload = @(Get-AkashaFavoriteStickerPluginPayload)
   $sourceContext = Open-AkashaLifecycleRootContext -Root $SourceRoot
   $rootContext = $null
   $stateContext = $null
@@ -869,9 +911,10 @@ function Invoke-AkashaInstall {
   $calibrationRequired = $false
   $installStateActive = $false
   try {
-    $version = Assert-AkashaInstallSource -Root $sourceContext.RootPath -Payload (@($payload) + @($pluginPayload) + @($moneyPluginPayload))
+    $version = Assert-AkashaInstallSource -Root $sourceContext.RootPath -Payload (@($payload) + @($pluginPayload) + @($moneyPluginPayload) + @($favoriteStickerPluginPayload))
     Assert-AkashaContactMemoryPluginSource -Root $sourceContext.RootPath -Payload $pluginPayload
     Assert-AkashaMoneyReceiverPluginSource -Root $sourceContext.RootPath -Payload $moneyPluginPayload
+    Assert-AkashaFavoriteStickerPluginSource -Root $sourceContext.RootPath -Payload $favoriteStickerPluginPayload
     $sourcePath = [System.IO.Path]::GetFullPath($sourceContext.RootPath).TrimEnd('\', '/')
     $installPath = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\', '/')
     $sourcePrefix = $sourcePath + [System.IO.Path]::DirectorySeparatorChar
@@ -950,6 +993,7 @@ function Invoke-AkashaInstall {
     Write-AkashaInstallLog -Paths $paths -Message 'phase=plugin status=started'
     Install-AkashaContactMemoryPlugin -SourceRoot $sourceContext.RootPath -Paths $paths -Payload $pluginPayload -ReplacementHook $ReplacementHook
     Install-AkashaContactMemoryPlugin -SourceRoot $sourceContext.RootPath -Paths $paths -Payload $moneyPluginPayload -PluginName 'astrbot_plugin_akasha_money_receiver' -PluginLabel 'money-receiver' -ReplacementHook $ReplacementHook
+    Install-AkashaContactMemoryPlugin -SourceRoot $sourceContext.RootPath -Paths $paths -Payload $favoriteStickerPluginPayload -PluginName 'astrbot_plugin_akasha_favorite_stickers' -PluginLabel 'favorite-sticker' -ReplacementHook $ReplacementHook
     Write-AkashaInstallLog -Paths $paths -Message 'phase=plugin status=completed'
 
     $launchers = Get-AkashaLauncherNames

@@ -15,16 +15,24 @@ import os
 import tempfile
 import time
 import logging
+import uuid
 
 import requests
 
 import state
 import config
 from privacy import chat_record
+from favorite_sticker import STICKER_KEYS
 
 log = logging.getLogger("ob11-bridge")
 _CONTACTS_LIMIT = 10000
 _CONTACTS_TIMEOUT_SECONDS = 5
+_FAVORITE_STICKER_COMMIT_BUDGET_SECONDS = 25.0
+_READ_ONLY_ACTIONS = {
+    "get_login_info",
+    "get_status",
+    "get_version_info",
+}
 _SAFE_SEND_STAGES = {
     "request",
     "route",
@@ -35,6 +43,7 @@ _SAFE_SEND_STAGES = {
     "review",
     "submit",
     "image",
+    "sticker",
     "complete",
 }
 
@@ -93,6 +102,39 @@ def _normalize_target_id(value: object) -> int | None:
             parsed = int(normalized)
             return parsed if parsed > 0 else None
     return None
+
+
+def _parse_favorite_sticker_request(
+    submitted_params: object,
+) -> tuple[str, int, str, str] | None:
+    if not isinstance(submitted_params, dict):
+        return None
+    keys = set(submitted_params)
+    if keys == {"user_id", "sticker_key", "request_id"}:
+        scope = "private"
+        target_value = submitted_params.get("user_id")
+    elif keys == {"group_id", "sticker_key", "request_id"}:
+        scope = "group"
+        target_value = submitted_params.get("group_id")
+    else:
+        return None
+    target_id = _normalize_target_id(target_value)
+    sticker_key = submitted_params.get("sticker_key")
+    request_id = submitted_params.get("request_id")
+    if (
+        target_id is None
+        or not isinstance(sticker_key, str)
+        or sticker_key not in STICKER_KEYS
+        or not isinstance(request_id, str)
+    ):
+        return None
+    try:
+        parsed_request_id = uuid.UUID(request_id)
+    except (ValueError, AttributeError):
+        return None
+    if str(parsed_request_id) != request_id.lower():
+        return None
+    return scope, target_id, sticker_key, request_id.lower()
 
 
 def _private_failure_identity(target_id: int) -> tuple[str, str, str] | None:
@@ -302,28 +344,209 @@ async def _send_private_send_failure(
 
 async def _handle_ob_api(data: dict, generation=None):
     """处理 AstrBot 发来的 API 请求。"""
+    action = data.get("action", "")
+    has_echo = "echo" in data
+    echo = data.get("echo")
+    favorite_commit_deadline = (
+        time.monotonic() + _FAVORITE_STICKER_COMMIT_BUDGET_SECONDS
+        if action == "send_wechat_favorite_sticker"
+        else None
+    )
     if (
         generation is not None
         and not state.is_generation_running(generation)
     ):
         return
+    supported_actions = {
+        "send_msg",
+        "send_private_msg",
+        "send_group_msg",
+        "send_wechat_favorite_sticker",
+    } | _READ_ONLY_ACTIONS
+    if action not in supported_actions:
+        _record_safe_send_failure("E_OB_UNSUPPORTED_ACTION", "request")
+        response = {
+            "status": "failed",
+            "retcode": 1404,
+            "data": {
+                "confirmed": False,
+                "error_code": "E_OB_UNSUPPORTED_ACTION",
+                "error_stage": "request",
+                "committed": False,
+            },
+            **({"echo": echo} if has_echo else {}),
+        }
+        await _send_api_response(response)
+        log.warning("[OB11] 收到不支持的 API 操作")
+        return
+
+    if action in _READ_ONLY_ACTIONS:
+        if action == "get_login_info":
+            nicknames = getattr(config, "BOT_NICKNAMES", ())
+            nickname = (
+                str(nicknames[0]).strip()
+                if isinstance(nicknames, (list, tuple))
+                and nicknames
+                and str(nicknames[0]).strip()
+                else "AkashaBot"
+            )
+            response_data = {
+                "user_id": int(getattr(state, "_self_id_int", 0) or 0),
+                "nickname": nickname,
+            }
+        elif action == "get_status":
+            ready = bool(
+                getattr(state, "running", False)
+                and getattr(state, "sender_instance", None) is not None
+            )
+            response_data = {"online": ready, "good": ready}
+        else:
+            response_data = {
+                "app_name": "AkashaBot-WeFlow-Bridge",
+                "app_version": "native",
+                "protocol_version": "v11",
+            }
+        response = {
+            "status": "ok",
+            "retcode": 0,
+            "data": response_data,
+            **({"echo": echo} if has_echo else {}),
+        }
+        await _send_api_response(response)
+        return
+
     sender_instance = (
         state.sender_instance
         if generation is None
         else state.get_sender_for_generation(generation)
     )
     if sender_instance is None:
+        _record_safe_send_failure("E_UIA_SENDER_STOPPED", "request")
+        response = {
+            "status": "failed",
+            "retcode": 1503,
+            "data": {
+                "confirmed": False,
+                "error_code": "E_UIA_SENDER_STOPPED",
+                "error_stage": "request",
+                "committed": False,
+            },
+            **({"echo": echo} if has_echo else {}),
+        }
+        await _send_api_response(response)
         return
-    action = data.get("action", "")
     submitted_params = data.get("params", {})
     params_valid = isinstance(submitted_params, dict)
     params = submitted_params if params_valid else {}
-    echo = data.get("echo", "")
-    log.info("[OB11] 收到 API 请求: has_echo=%s", bool(echo))
+    log.info("[OB11] 收到 API 请求: has_echo=%s", has_echo)
 
     resp_data = {"status": "ok", "retcode": 0, "data": {}}
-    if echo:
+    if has_echo:
         resp_data["echo"] = echo
+
+    if action == "send_wechat_favorite_sticker":
+        parsed = _parse_favorite_sticker_request(submitted_params)
+        if parsed is None:
+            _record_safe_send_failure("E_OB_INVALID_REQUEST", "request")
+            response = {
+                "status": "failed",
+                "retcode": 1400,
+                "data": {
+                    "confirmed": False,
+                    "error_code": "E_OB_INVALID_REQUEST",
+                    "error_stage": "request",
+                    "committed": False,
+                },
+                **({"echo": echo} if has_echo else {}),
+            }
+            await _send_api_response(response)
+            return
+
+        scope, target_id, sticker_key, request_id = parsed
+        contact = ""
+        session = ""
+        if scope == "private":
+            private_identity = await asyncio.to_thread(
+                _resolve_private_contact,
+                target_id,
+            )
+            if private_identity is not None:
+                contact, _, session = private_identity
+        else:
+            binding = state.get_group_route_binding(target_id)
+            if isinstance(binding, dict):
+                contact = str(binding.get("routing_name") or "").strip()
+                session = str(binding.get("session") or "").strip()
+        if not contact or not session:
+            route_error = (
+                "E_OB_PRIVATE_ROUTE"
+                if scope == "private"
+                else "E_OB_GROUP_ROUTE"
+            )
+            _record_safe_send_failure(route_error, "route")
+            response = {
+                "status": "failed",
+                "retcode": 1404,
+                "data": {
+                    "confirmed": False,
+                    "error_code": route_error,
+                    "error_stage": "route",
+                    "committed": False,
+                    "request_id": request_id,
+                },
+                **({"echo": echo} if has_echo else {}),
+            }
+            await _send_api_response(response)
+            _write_outbound_log(scope, "未知", "[收藏表情]", False)
+            return
+
+        try:
+            result = await asyncio.to_thread(
+                sender_instance.send_favorite_sticker,
+                contact,
+                session,
+                sticker_key,
+                request_id,
+                favorite_commit_deadline,
+            )
+        except Exception:
+            _record_safe_send_failure("E_OB_SEND_EXCEPTION", "sticker")
+            response = {
+                "status": "failed",
+                "retcode": 1500,
+                "data": {
+                    "confirmed": False,
+                    "error_code": "E_OB_SEND_EXCEPTION",
+                    "error_stage": "sticker",
+                    "committed": False,
+                    "request_id": request_id,
+                },
+                **({"echo": echo} if has_echo else {}),
+            }
+            await _send_api_response(response)
+            _write_outbound_log(scope, contact, "[收藏表情]", False)
+            return
+
+        confirmed = result.confirmed is True
+        error_code = str(result.error_code or "")
+        error_stage = str(result.error_stage or "complete")
+        response = {
+            "status": "ok" if confirmed else "failed",
+            "retcode": 0 if confirmed else (1409 if result.in_progress else 1500),
+            "data": {
+                "confirmed": confirmed,
+                "error_code": None if confirmed else error_code,
+                "error_stage": error_stage,
+                "committed": result.committed is True,
+                "cached": result.cached is True,
+                "request_id": request_id,
+                "sticker_key": sticker_key,
+            },
+            **({"echo": echo} if has_echo else {}),
+        }
+        await _send_api_response(response)
+        _write_outbound_log(scope, contact, "[收藏表情]", confirmed)
+        return
 
     if action in ("send_msg", "send_private_msg", "send_group_msg"):
         is_group = action == "send_group_msg" or (
@@ -362,7 +585,7 @@ async def _handle_ob_api(data: dict, generation=None):
                     "error_stage": "request",
                 },
             }
-            if echo:
+            if has_echo:
                 failed_response["echo"] = echo
             await _send_api_response(failed_response)
             contact = "未知"
@@ -401,7 +624,7 @@ async def _handle_ob_api(data: dict, generation=None):
                         "error_stage": "route",
                     },
                 }
-                if echo:
+                if has_echo:
                     failed_response["echo"] = echo
                 await _send_api_response(failed_response)
                 _write_outbound_log(
@@ -630,13 +853,9 @@ async def _handle_ob_api(data: dict, generation=None):
                     "error_code": final_failure[0],
                     "error_stage": final_failure[1],
                 },
-                **({"echo": echo} if echo else {}),
+                **({"echo": echo} if has_echo else {}),
             }
         await _send_api_response(response)
-
-    else:
-        await _send_api_response(resp_data)
-        log.debug("[OB11] 收到未处理的 API 操作")
 
 
 def _extract_text(message: list) -> str:

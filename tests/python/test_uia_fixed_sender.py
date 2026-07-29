@@ -7,6 +7,7 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -16,6 +17,7 @@ if str(BRIDGE) not in sys.path:
     sys.path.insert(0, str(BRIDGE))
 
 import uia_fixed_sender as sender_module
+import favorite_sticker as favorite_module
 from uia_support import (
     CALIBRATION_INVALID,
     CALIBRATION_WINDOW,
@@ -92,6 +94,12 @@ class FakeDriver:
     def press_key(self, virtual_key):
         self.events.append(("press_key", virtual_key))
 
+    def move_bound_process_ratio(self, hwnd, point):
+        self.events.append(("move_bound", hwnd, dict(point)))
+
+    def press_key_bound_process(self, hwnd, virtual_key):
+        self.events.append(("press_key_bound", hwnd, virtual_key))
+
     def copy_image_to_clipboard(self, image_path):
         self.events.append(("copy_image", image_path))
 
@@ -127,6 +135,13 @@ class UiaFixedSenderTests(unittest.TestCase):
         }
         if "rng" in changes:
             kwargs["rng"] = changes["rng"]
+        for name in (
+            "monotonic_fn",
+            "favorite_state_dir",
+            "favorite_receipt",
+        ):
+            if name in changes:
+                kwargs[name] = changes[name]
         return sender_module.UiaFixedSender(**kwargs)
 
     def _runtime_validation(self, calibration, metrics):
@@ -1253,6 +1268,208 @@ class UiaFixedSenderTests(unittest.TestCase):
         self.assertNotIn("use_enter_to_send", source)
         self.assertNotIn("press_key(0x0D)", source)
         self.assertNotIn("VK_RETURN", source)
+
+    def test_favorite_sticker_clicks_fixed_slot_without_visual_capture(self):
+        events = []
+
+        class FixedRng:
+            def __init__(self):
+                self.calls = []
+
+            def uniform(self, minimum, maximum):
+                self.calls.append((minimum, maximum))
+                return (minimum + maximum) / 2
+
+        class FavoriteDriver(FakeDriver):
+            def click_bound_process_ratio(self, hwnd, point):
+                events.append(("bound_click", dict(point)))
+
+            def capture_bound_process_client(self, hwnd):
+                raise AssertionError("fixed-slot sending must not capture frames")
+
+            def move_bound_process_ratio(self, hwnd, point):
+                raise AssertionError("fixed-slot sending must not move for capture")
+
+            def press_key_bound_process(self, hwnd, virtual_key):
+                events.append(("guarded_key", virtual_key))
+
+        class Layout:
+            manifest = {
+                "reference": {
+                    "dpi": 96,
+                    "aspect_ratio": 1.5,
+                },
+                "points": {
+                    "smile_entry": {"x": 0.60, "y": 0.80},
+                    "favorite_tab": {"x": 0.22, "y": 0.88},
+                    "grid_first": {"x": 0.10, "y": 0.20},
+                    "grid_last": {"x": 0.90, "y": 0.80},
+                },
+            }
+
+            def point(self, sticker_key):
+                events.append(("fixed_point", sticker_key))
+                return {"x": 0.33, "y": 0.44}
+
+        class Receipt:
+            def baseline(self, session):
+                events.append(("baseline", session))
+                return frozenset()
+
+            def confirm(self, session, baseline):
+                events.append(("confirm", session))
+                return True
+
+        sender_module._FAVORITE_REQUEST_CACHE = favorite_module.RequestIdCache()
+        driver = FavoriteDriver()
+        layout = Layout()
+        rng = FixedRng()
+        sender = self._sender(
+            driver=driver,
+            favorite_receipt=Receipt(),
+            settle_jitter_max_seconds=0.3,
+            rng=rng,
+        )
+        sender._favorite_layout = layout
+        sender._select_contact = lambda _hwnd, contact: events.append(
+            ("select", contact)
+        )
+        result = sender.send_favorite_sticker(
+            "contact",
+            "session",
+            "slot_07",
+            str(uuid.uuid4()),
+            time.monotonic() + 25,
+        )
+
+        self.assertTrue(result.confirmed)
+        self.assertLess(
+            events.index(("baseline", "session")),
+            events.index(("select", "contact")),
+        )
+        self.assertEqual(events.count(("baseline", "session")), 2)
+        self.assertEqual(events.count(("fixed_point", "slot_07")), 1)
+        self.assertFalse(any(event[0] == "capture" for event in events))
+        self.assertFalse(any(event[0] == "move_bound" for event in events))
+        self.assertEqual(rng.calls, [(0.8, 1.3), (0.9, 1.5)])
+        self.assertIn(1.05, self.sleep_calls)
+        self.assertIn(1.2, self.sleep_calls)
+        self.assertEqual(events[-1], ("confirm", "session"))
+        self.assertEqual(
+            sum(
+                event[0] == "bound_click"
+                and event[1] == {"x": 0.33, "y": 0.44}
+                for event in events
+            ),
+            1,
+        )
+
+    def test_favorite_click_exception_is_cached_unknown_and_not_retried(self):
+        class Driver(FakeDriver):
+            def click_bound_process_ratio(self, _hwnd, point):
+                if point == {"x": 0.33, "y": 0.44}:
+                    self.events.append(("target_click",))
+                    raise CalibrationError(CALIBRATION_WINDOW)
+
+            def capture_bound_process_client(self, _hwnd):
+                return object()
+
+            def press_key_bound_process(self, _hwnd, _virtual_key):
+                self.events.append(("guarded_escape",))
+
+        layout = types.SimpleNamespace(
+            manifest={
+                "reference": {"dpi": 96, "aspect_ratio": 1.5},
+                "points": {
+                    "smile_entry": {"x": 0.60, "y": 0.80},
+                    "favorite_tab": {"x": 0.22, "y": 0.88},
+                },
+            },
+            point=lambda _key: {"x": 0.33, "y": 0.44},
+        )
+        receipt = types.SimpleNamespace(
+            baseline=lambda _session: frozenset(),
+            confirm=lambda _session, _baseline: False,
+        )
+        sender_module._FAVORITE_REQUEST_CACHE = favorite_module.RequestIdCache()
+        driver = Driver()
+        sender = self._sender(driver=driver, favorite_receipt=receipt)
+        sender._favorite_layout = layout
+        sender._select_contact = lambda *_args: None
+        request_id = str(uuid.uuid4())
+
+        first = sender.send_favorite_sticker(
+            "contact",
+            "session",
+            "slot_01",
+            request_id,
+            time.monotonic() + 25,
+        )
+        second = sender.send_favorite_sticker(
+            "contact",
+            "session",
+            "slot_01",
+            request_id,
+            time.monotonic() + 25,
+        )
+
+        self.assertTrue(first.committed)
+        self.assertEqual(
+            first.error_code,
+            favorite_module.STICKER_COMMIT_UNKNOWN,
+        )
+        self.assertTrue(second.cached)
+        self.assertEqual(driver.events.count(("target_click",)), 1)
+
+    def test_expired_favorite_review_never_touches_wechat(self):
+        class Clock:
+            def __init__(self):
+                self.value = 0.0
+
+            def monotonic(self):
+                return self.value
+
+            def sleep(self, seconds):
+                self.value += seconds
+
+        clock = Clock()
+        sender_module._FAVORITE_REQUEST_CACHE = favorite_module.RequestIdCache()
+        driver = FakeDriver()
+        sender = sender_module.UiaFixedSender(
+            copy.deepcopy(VALID_CALIBRATION),
+            driver=driver,
+            sleep_fn=clock.sleep,
+            monotonic_fn=clock.monotonic,
+            pre_paste_preview_delay=60,
+            pre_send_delay=60,
+            settle_jitter_max_seconds=0,
+        )
+        result = sender.send_favorite_sticker(
+            "contact",
+            "session",
+            "slot_01",
+            str(uuid.uuid4()),
+            5.0,
+        )
+
+        self.assertEqual(
+            result.error_code,
+            favorite_module.STICKER_QUEUE_EXPIRED,
+        )
+        self.assertEqual(driver.events, [])
+
+    def test_expired_fifo_ticket_is_skipped_for_the_next_sender(self):
+        lock = sender_module._FifoSendLock()
+        ticks = iter((0.0, 2.0, 2.0, 2.0))
+
+        with lock:
+            with lock.reserve_normal(
+                deadline=1.0,
+                monotonic=lambda: next(ticks),
+            ) as acquired:
+                self.assertFalse(acquired)
+        with lock:
+            self.assertTrue(True)
 
 
 if __name__ == "__main__":

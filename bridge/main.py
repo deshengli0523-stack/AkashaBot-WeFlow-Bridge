@@ -70,6 +70,7 @@ try:
     import state
     import config
     from uia_fixed_sender import UiaFixedSender
+    from favorite_sticker import WeFlowStickerReceipt
     from ob_client import _run_ob_client
     from bridge_core import WeFlowBridge
     from web_panel import WebHandler, PAGE
@@ -233,6 +234,21 @@ def _start_bridge():
             pre_paste_preview_delay=config.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY,
             pre_send_delay=config.UIA_FIXED_PRE_SEND_DELAY,
             settle_jitter_max_seconds=config.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS,
+            favorite_state_dir=getattr(
+                config,
+                "STATE_DIR",
+                os.path.dirname(os.path.abspath(__file__)),
+            ),
+            favorite_receipt=WeFlowStickerReceipt(
+                config.WE_FLOW_BASE_URL,
+                config.ACCESS_TOKEN,
+                request_get=requests.get,
+                timeout_seconds=getattr(
+                    config,
+                    "FAVORITE_STICKER_RECEIPT_TIMEOUT_SECONDS",
+                    8.0,
+                ),
+            ),
         )
         state.lifecycle_generation += 1
         generation = state.lifecycle_generation

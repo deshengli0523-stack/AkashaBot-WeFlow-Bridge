@@ -242,7 +242,7 @@ function Assert-NoTransactionResidue {
 function New-TestSourceFixture {
   param([string]$Path)
   New-Item -ItemType Directory -Force -Path $Path | Out-Null
-  foreach ($entry in @(@(Get-AkashaInstallPayload) + @(Get-AkashaContactMemoryPluginPayload) + @(Get-AkashaMoneyReceiverPluginPayload))) {
+  foreach ($entry in @(@(Get-AkashaInstallPayload) + @(Get-AkashaContactMemoryPluginPayload) + @(Get-AkashaMoneyReceiverPluginPayload) + @(Get-AkashaFavoriteStickerPluginPayload))) {
     $source = Join-Path $root ([string]$entry.Source)
     $destination = Join-Path $Path ([string]$entry.Source)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
@@ -330,13 +330,13 @@ Assert-Equal $stalledClockResult.Attempts 3 'Readiness polling did not apply its
 Assert-SequenceEqual @($stalledClockHealth.State.Calls) @('health', 'health-delay:11', 'health', 'health-delay:11', 'health') 'Stalled-clock readiness polling did not stop at its defensive attempt bound.'
 
 $payload = @(Get-AkashaInstallPayload)
-Assert-Equal $payload.Count 32 'Installed payload count changed.'
-Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 16 'Bridge payload count changed.'
+Assert-Equal $payload.Count 33 'Installed payload count changed.'
+Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 17 'Bridge payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -like 'scripts\*' }).Count 9 'Script payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -notlike 'bridge\*' -and $_.Source -notlike 'scripts\*' }).Count 7 'Root payload count changed.'
 Assert-True (@($payload | Where-Object { $_.Source -ceq $launchers.Install }).Count -eq 0) 'Install launcher must not be installed.'
 $expectedPayloadSources = @(
-  'bridge\bridge_core.py', 'bridge\config.py', 'bridge\main.py', 'bridge\money_action.py', 'bridge\money_service.py', 'bridge\ob_client.py',
+  'bridge\bridge_core.py', 'bridge\config.py', 'bridge\favorite_sticker.py', 'bridge\main.py', 'bridge\money_action.py', 'bridge\money_service.py', 'bridge\ob_client.py',
   'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\state.py',
   'bridge\uia_fixed_sender.py', 'bridge\uia_support.py',
   'bridge\calibrate_uia_fixed.py', 'bridge\web_panel.py',
@@ -376,6 +376,18 @@ $expectedMoneyPluginSources = @(
   'plugins\astrbot_plugin_akasha_money_receiver\_conf_schema.json'
 )
 Assert-SequenceEqual @($moneyPluginPayload.Source | Sort-Object) @($expectedMoneyPluginSources | Sort-Object) 'Money-receiver plugin payload is not the frozen exact allowlist.'
+$favoriteStickerPluginPayload = @(Get-AkashaFavoriteStickerPluginPayload)
+Assert-Equal $favoriteStickerPluginPayload.Count 7 'Favorite-sticker plugin payload count changed.'
+$expectedFavoriteStickerPluginSources = @(
+  'plugins\astrbot_plugin_akasha_favorite_stickers\__init__.py',
+  'plugins\astrbot_plugin_akasha_favorite_stickers\main.py',
+  'plugins\astrbot_plugin_akasha_favorite_stickers\catalog.py',
+  'plugins\astrbot_plugin_akasha_favorite_stickers\catalog.json',
+  'plugins\astrbot_plugin_akasha_favorite_stickers\metadata.yaml',
+  'plugins\astrbot_plugin_akasha_favorite_stickers\_conf_schema.json',
+  'plugins\astrbot_plugin_akasha_favorite_stickers\README.md'
+)
+Assert-SequenceEqual @($favoriteStickerPluginPayload.Source | Sort-Object) @($expectedFavoriteStickerPluginSources | Sort-Object) 'Favorite-sticker plugin payload is not the frozen exact allowlist.'
 
 try {
   New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
@@ -386,6 +398,10 @@ try {
     Install-AkashaContactMemoryPlugin -SourceRoot $root -Paths $preInitPaths -Payload $pluginPayload
   } 'E_PLUGIN_INSTALL:*' 'Contact-memory plugin deployment ran before AstrBot init.' | Out-Null
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $preInitPaths.AstrBotData 'data\plugins\astrbot_plugin_akasha_contact_memory'))) 'Pre-init plugin deployment created the AstrBot plugin target.'
+  Assert-ThrowsLike {
+    Install-AkashaContactMemoryPlugin -SourceRoot $root -Paths $preInitPaths -Payload $favoriteStickerPluginPayload -PluginName 'astrbot_plugin_akasha_favorite_stickers' -PluginLabel 'favorite-sticker'
+  } 'E_PLUGIN_INSTALL:*' 'Favorite-sticker plugin deployment ran before AstrBot init.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $preInitPaths.AstrBotData 'data\plugins\astrbot_plugin_akasha_favorite_stickers'))) 'Pre-init favorite-sticker deployment created the AstrBot plugin target.'
 
   $launcherProbeRoot = Join-Path $fixtureRoot 'launcher transport with spaces'
   $launcherProbeScripts = Join-Path $launcherProbeRoot 'scripts'
@@ -465,6 +481,9 @@ exit 0
   $installedMoneyPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\astrbot_plugin_akasha_money_receiver'
   $actualMoneyPluginFiles = @(Get-RelativeFiles -Base $installedMoneyPluginRoot)
   Assert-SequenceEqual $actualMoneyPluginFiles @($moneyPluginPayload.Relative | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object) 'Installed money-receiver plugin payload is not exact.'
+  $installedFavoriteStickerPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\astrbot_plugin_akasha_favorite_stickers'
+  $actualFavoriteStickerPluginFiles = @(Get-RelativeFiles -Base $installedFavoriteStickerPluginRoot)
+  Assert-SequenceEqual $actualFavoriteStickerPluginFiles @($favoriteStickerPluginPayload.Relative | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object) 'Installed favorite-sticker plugin payload is not exact.'
   foreach ($name in @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $successRoot $name) -PathType Leaf) "Installed root payload is missing $name."
   }
@@ -566,14 +585,37 @@ exit 0
   [System.IO.File]::WriteAllText((Join-Path $successRoot 'app\bridge\main.py'), $oldBridge, (New-Object System.Text.UTF8Encoding($false)))
   $oldPlugin = 'old contact-memory plugin sentinel'
   [System.IO.File]::WriteAllText((Join-Path $installedPluginRoot 'main.py'), $oldPlugin, (New-Object System.Text.UTF8Encoding($false)))
+  $oldFavoriteStickerPlugin = 'old favorite-sticker plugin sentinel'
+  [System.IO.File]::WriteAllText((Join-Path $installedFavoriteStickerPluginRoot 'main.py'), $oldFavoriteStickerPlugin, (New-Object System.Text.UTF8Encoding($false)))
   $pluginDataRoot = Join-Path $successRoot 'data\astrbot\data\plugin_data\astrbot_plugin_akasha_contact_memory'
   New-Item -ItemType Directory -Force -Path $pluginDataRoot | Out-Null
   $pluginDataSentinel = Join-Path $pluginDataRoot 'memory.db'
   [System.IO.File]::WriteAllText($pluginDataSentinel, 'plugin-data-preserved', (New-Object System.Text.UTF8Encoding($false)))
   $bridgeIdentitySentinel = Join-Path $successRoot 'data\state\bridge_identity.sqlite3'
   [System.IO.File]::WriteAllText($bridgeIdentitySentinel, 'bridge-identity-preserved', (New-Object System.Text.UTF8Encoding($false)))
+  $favoriteStickerStateRoot = Join-Path $successRoot 'data\state\favorite-sticker-templates'
+  New-Item -ItemType Directory -Force -Path $favoriteStickerStateRoot | Out-Null
+  $favoriteStickerTemplateSentinel = Join-Path $favoriteStickerStateRoot 'slot_01.png'
+  [System.IO.File]::WriteAllText($favoriteStickerTemplateSentinel, 'private-template-preserved', (New-Object System.Text.UTF8Encoding($false)))
+  $favoriteStickerCatalogSentinel = Join-Path $successRoot 'data\state\favorite-sticker-catalog.json'
+  [System.IO.File]::WriteAllText($favoriteStickerCatalogSentinel, '{"private":"catalog-preserved"}', (New-Object System.Text.UTF8Encoding($false)))
   $pluginDataFingerprint = Get-FileFingerprint $pluginDataSentinel
   $bridgeIdentityFingerprint = Get-FileFingerprint $bridgeIdentitySentinel
+  $favoriteStickerTemplateFingerprint = Get-FileFingerprint $favoriteStickerTemplateSentinel
+  $favoriteStickerCatalogFingerprint = Get-FileFingerprint $favoriteStickerCatalogSentinel
+  $favoriteStickerRollbackPaths = Get-AkashaBotPaths -Root $successRoot
+  $failAfterFavoriteStickerMove = {
+    param($phase)
+    if ($phase -ceq 'AfterPluginExistingMoved') {
+      throw 'E_FIXTURE_FAVORITE_STICKER_REPLACEMENT_FAILURE'
+    }
+  }
+  Assert-ThrowsLike {
+    Install-AkashaContactMemoryPlugin -SourceRoot $root -Paths $favoriteStickerRollbackPaths -Payload $favoriteStickerPluginPayload -PluginName 'astrbot_plugin_akasha_favorite_stickers' -PluginLabel 'favorite-sticker' -ReplacementHook $failAfterFavoriteStickerMove
+  } 'E_FIXTURE_FAVORITE_STICKER_REPLACEMENT_FAILURE*' 'Injected favorite-sticker replacement failure was not preserved.' | Out-Null
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $installedFavoriteStickerPluginRoot 'main.py') -Raw -Encoding UTF8) $oldFavoriteStickerPlugin 'Failed favorite-sticker replacement did not restore previous plugin code.'
+  Assert-Equal (Get-FileFingerprint $favoriteStickerTemplateSentinel) $favoriteStickerTemplateFingerprint 'Failed favorite-sticker replacement changed a private template.'
+  Assert-Equal (Get-FileFingerprint $favoriteStickerCatalogSentinel) $favoriteStickerCatalogFingerprint 'Failed favorite-sticker replacement changed the private catalog.'
   $otherPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\unrelated_plugin'
   New-Item -ItemType Directory -Force -Path $otherPluginRoot | Out-Null
   $otherPluginSentinel = Join-Path $otherPluginRoot 'main.py'
@@ -595,11 +637,15 @@ exit 0
   Assert-Equal (Get-FileFingerprint $installedBridgeConfig) $readyConfigFingerprint 'Ready schema 1 update changed bridge config bytes.'
   Assert-Equal (Get-FileFingerprint $pluginDataSentinel) $pluginDataFingerprint 'Ready update changed contact-memory plugin_data.'
   Assert-Equal (Get-FileFingerprint $bridgeIdentitySentinel) $bridgeIdentityFingerprint 'Ready update changed bridge identity state.'
+  Assert-Equal (Get-FileFingerprint $favoriteStickerTemplateSentinel) $favoriteStickerTemplateFingerprint 'Ready update changed a private favorite-sticker template.'
+  Assert-Equal (Get-FileFingerprint $favoriteStickerCatalogSentinel) $favoriteStickerCatalogFingerprint 'Ready update changed the private favorite-sticker catalog.'
   Assert-Equal (Get-FileFingerprint $otherPluginSentinel) $otherPluginFingerprint 'Ready update changed an unrelated AstrBot plugin.'
   $bridgeBackups = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'data\backups') -Directory -Filter 'bridge-*')
   Assert-True (@($bridgeBackups | Where-Object { (Get-Content -LiteralPath (Join-Path $_.FullName 'main.py') -Raw -Encoding UTF8) -ceq $oldBridge }).Count -ge 1) 'Rerun did not back up the previous bridge.'
   $pluginBackups = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'data\backups') -Directory -Filter 'plugin-astrbot_plugin_akasha_contact_memory-*')
   Assert-True (@($pluginBackups | Where-Object { (Get-Content -LiteralPath (Join-Path $_.FullName 'main.py') -Raw -Encoding UTF8) -ceq $oldPlugin }).Count -ge 1) 'Rerun did not back up the previous contact-memory plugin code.'
+  $favoriteStickerPluginBackups = @(Get-ChildItem -LiteralPath (Join-Path $successRoot 'data\backups') -Directory -Filter 'plugin-astrbot_plugin_akasha_favorite_stickers-*')
+  Assert-True (@($favoriteStickerPluginBackups | Where-Object { (Get-Content -LiteralPath (Join-Path $_.FullName 'main.py') -Raw -Encoding UTF8) -ceq $oldFavoriteStickerPlugin }).Count -ge 1) 'Rerun did not back up the previous favorite-sticker plugin code.'
   $safeArtifacts = (Get-Content -LiteralPath (Join-Path $successRoot 'data\state\install.json') -Raw -Encoding UTF8) + (Get-Content -LiteralPath (Join-Path $successRoot 'data\logs\install.log') -Raw -Encoding UTF8)
   Assert-True (-not $safeArtifacts.Contains($seededSecret) -and -not $safeArtifacts.Contains($weFlowExe)) 'A seeded secret or WeFlow executable path leaked into installer metadata.'
 
@@ -630,6 +676,8 @@ exit 0
   Assert-Equal (Get-Content -LiteralPath (Join-Path $installedPluginRoot 'main.py') -Raw -Encoding UTF8) $pluginRollbackOld 'Failed plugin replacement did not restore previous plugin code.'
   Assert-Equal (Get-FileFingerprint $pluginDataSentinel) $pluginDataFingerprint 'Failed plugin replacement changed plugin_data.'
   Assert-Equal (Get-FileFingerprint $bridgeIdentitySentinel) $bridgeIdentityFingerprint 'Failed plugin replacement changed bridge identity state.'
+  Assert-Equal (Get-FileFingerprint $favoriteStickerTemplateSentinel) $favoriteStickerTemplateFingerprint 'Failed plugin replacement changed a private favorite-sticker template.'
+  Assert-Equal (Get-FileFingerprint $favoriteStickerCatalogSentinel) $favoriteStickerCatalogFingerprint 'Failed plugin replacement changed the private favorite-sticker catalog.'
   Assert-NoTransactionResidue -InstallRoot $successRoot
 
   $partialOldBridge = 'partial rollback bridge sentinel'
@@ -674,6 +722,14 @@ exit 0
   Assert-True (-not (Test-Path -LiteralPath $missingPluginRoot)) 'Missing plugin payload mutated InstallRoot.'
   Assert-Equal $missingPluginBoundaries.State.Calls.Count 0 'Missing plugin payload crossed an external/heavy boundary.'
 
+  $missingFavoriteStickerSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source missing one favorite sticker file')
+  Remove-Item -LiteralPath (Join-Path $missingFavoriteStickerSource 'plugins\astrbot_plugin_akasha_favorite_stickers\catalog.py') -Force
+  $missingFavoriteStickerRoot = Join-Path $fixtureRoot 'missing favorite sticker install root'
+  $missingFavoriteStickerBoundaries = New-TestBoundaries -Discoveries @($weFlowExe)
+  Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $missingFavoriteStickerRoot -WeFlowConfigPath $weFlowConfig -Boundaries $missingFavoriteStickerBoundaries -SourceRoot $missingFavoriteStickerSource -SkipStart } 'E_SOURCE_PAYLOAD:*' 'Missing favorite-sticker payload was accepted.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath $missingFavoriteStickerRoot)) 'Missing favorite-sticker payload mutated InstallRoot.'
+  Assert-Equal $missingFavoriteStickerBoundaries.State.Calls.Count 0 'Missing favorite-sticker payload crossed an external/heavy boundary.'
+
   $extraPluginSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source with an extra plugin file')
   [System.IO.File]::WriteAllText((Join-Path $extraPluginSource 'plugins\astrbot_plugin_akasha_contact_memory\unexpected.txt'), 'unexpected', (New-Object System.Text.UTF8Encoding($false)))
   $extraPluginRoot = Join-Path $fixtureRoot 'extra plugin install root'
@@ -681,6 +737,25 @@ exit 0
   Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $extraPluginRoot -WeFlowConfigPath $weFlowConfig -Boundaries $extraPluginBoundaries -SourceRoot $extraPluginSource -SkipStart } 'E_SOURCE_PLUGIN:*' 'Unexpected plugin payload was accepted.' | Out-Null
   Assert-True (-not (Test-Path -LiteralPath $extraPluginRoot)) 'Unexpected plugin payload mutated InstallRoot.'
   Assert-Equal $extraPluginBoundaries.State.Calls.Count 0 'Unexpected plugin payload crossed an external/heavy boundary.'
+
+  $extraFavoriteStickerSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source with an extra favorite sticker file')
+  [System.IO.File]::WriteAllText((Join-Path $extraFavoriteStickerSource 'plugins\astrbot_plugin_akasha_favorite_stickers\unexpected.png'), 'private-template-must-not-ship', (New-Object System.Text.UTF8Encoding($false)))
+  $extraFavoriteStickerRoot = Join-Path $fixtureRoot 'extra favorite sticker install root'
+  $extraFavoriteStickerBoundaries = New-TestBoundaries -Discoveries @($weFlowExe)
+  Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $extraFavoriteStickerRoot -WeFlowConfigPath $weFlowConfig -Boundaries $extraFavoriteStickerBoundaries -SourceRoot $extraFavoriteStickerSource -SkipStart } 'E_SOURCE_PLUGIN:*' 'Unexpected favorite-sticker payload was accepted.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath $extraFavoriteStickerRoot)) 'Unexpected favorite-sticker payload mutated InstallRoot.'
+  Assert-Equal $extraFavoriteStickerBoundaries.State.Calls.Count 0 'Unexpected favorite-sticker payload crossed an external/heavy boundary.'
+
+  $junctionedFavoriteStickerSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source with junctioned favorite sticker plugin')
+  $outsideFavoriteStickerSource = Join-Path $fixtureRoot 'outside favorite sticker source'
+  Move-Item -LiteralPath (Join-Path $junctionedFavoriteStickerSource 'plugins\astrbot_plugin_akasha_favorite_stickers') -Destination $outsideFavoriteStickerSource
+  New-Item -ItemType Junction -Path (Join-Path $junctionedFavoriteStickerSource 'plugins\astrbot_plugin_akasha_favorite_stickers') -Target $outsideFavoriteStickerSource | Out-Null
+  $junctionedFavoriteStickerRoot = Join-Path $fixtureRoot 'junctioned favorite sticker install root'
+  $junctionedFavoriteStickerBoundaries = New-TestBoundaries -Discoveries @($weFlowExe)
+  Assert-ThrowsLike { Invoke-TestInstall -InstallRoot $junctionedFavoriteStickerRoot -WeFlowConfigPath $weFlowConfig -Boundaries $junctionedFavoriteStickerBoundaries -SourceRoot $junctionedFavoriteStickerSource -SkipStart } 'E_SOURCE_PAYLOAD:*' 'Junctioned favorite-sticker source was accepted.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath $junctionedFavoriteStickerRoot)) 'Junctioned favorite-sticker source mutated InstallRoot.'
+  Assert-Equal $junctionedFavoriteStickerBoundaries.State.Calls.Count 0 'Junctioned favorite-sticker source crossed an external/heavy boundary.'
+  [System.IO.Directory]::Delete((Join-Path $junctionedFavoriteStickerSource 'plugins\astrbot_plugin_akasha_favorite_stickers'))
 
   $unsafeSource = New-TestSourceFixture -Path (Join-Path $fixtureRoot 'source with junction')
   $outsideBridgeSource = Join-Path $fixtureRoot 'outside bridge source'

@@ -27,6 +27,7 @@ $expectedPublishFiles = @(
   'bridge/calibrate_uia_fixed.py',
   'bridge/config.example.json',
   'bridge/config.py',
+  'bridge/favorite_sticker.py',
   'bridge/main.py',
   'bridge/money_action.py',
   'bridge/money_service.py',
@@ -53,6 +54,13 @@ $expectedPublishFiles = @(
   'plugins/astrbot_plugin_akasha_contact_memory/akasha_memory/weflow_sync.py',
   'plugins/astrbot_plugin_akasha_contact_memory/main.py',
   'plugins/astrbot_plugin_akasha_contact_memory/metadata.yaml',
+  'plugins/astrbot_plugin_akasha_favorite_stickers/README.md',
+  'plugins/astrbot_plugin_akasha_favorite_stickers/__init__.py',
+  'plugins/astrbot_plugin_akasha_favorite_stickers/_conf_schema.json',
+  'plugins/astrbot_plugin_akasha_favorite_stickers/catalog.json',
+  'plugins/astrbot_plugin_akasha_favorite_stickers/catalog.py',
+  'plugins/astrbot_plugin_akasha_favorite_stickers/main.py',
+  'plugins/astrbot_plugin_akasha_favorite_stickers/metadata.yaml',
   'plugins/astrbot_plugin_akasha_money_receiver/__init__.py',
   'plugins/astrbot_plugin_akasha_money_receiver/_conf_schema.json',
   'plugins/astrbot_plugin_akasha_money_receiver/main.py',
@@ -76,6 +84,7 @@ $expectedPublishFiles = @(
   'tests/Run-All.ps1',
   'tests/python/test_bridge_runtime.py',
   'tests/python/test_contact_memory.py',
+  'tests/python/test_favorite_sticker_plugin.py',
   'tests/python/test_money_action.py',
   'tests/python/test_money_plugin.py',
   'tests/python/test_money_service.py',
@@ -88,12 +97,12 @@ $expectedPublishFiles = @(
   ((-join @([char]0x5065, [char]0x5EB7, [char]0x68C0, [char]0x67E5)) + '.bat'),
   ((-join @([char]0x6821, [char]0x51C6)) + '.bat')
 )
-if ($expectedPublishFiles.Count -ne 74) {
-  throw "Release allowlist invariant is not 74 files: $($expectedPublishFiles.Count)"
+if ($expectedPublishFiles.Count -ne 83) {
+  throw "Release allowlist invariant is not 83 files: $($expectedPublishFiles.Count)"
 }
 $uniqueExpectedPublishFiles = @($expectedPublishFiles | Sort-Object -Unique)
-if ($uniqueExpectedPublishFiles.Count -ne 74) {
-  throw "Release allowlist must contain 74 unique entries; duplicate entries were found."
+if ($uniqueExpectedPublishFiles.Count -ne 83) {
+  throw "Release allowlist must contain 83 unique entries; duplicate entries were found."
 }
 $publishFiles = @(
   foreach ($entry in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop |
@@ -121,8 +130,8 @@ foreach ($relativePath in $actualPublishFiles) {
   }
 }
 $uniqueActualPublishFiles = @($actualPublishFiles | Sort-Object -Unique)
-if ($actualPublishFiles.Count -ne 74 -or $uniqueActualPublishFiles.Count -ne 74) {
-  throw "Published files must contain exactly 74 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
+if ($actualPublishFiles.Count -ne 83 -or $uniqueActualPublishFiles.Count -ne 83) {
+  throw "Published files must contain exactly 83 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
 }
 
 $bridgeRoot = Join-Path $root 'bridge'
@@ -785,8 +794,8 @@ foreach ($file in $textFiles) {
 }
 
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
-if ($version -cne '0.4.1') {
-  throw "VERSION must be 0.4.1, found '$version'."
+if ($version -cne '0.4.2') {
+  throw "VERSION must be 0.4.2, found '$version'."
 }
 
 $template = Get-Content -LiteralPath (Join-Path $root 'bridge\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json

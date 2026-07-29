@@ -34,8 +34,9 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 1. 等待向导显示安装成功。对于尚未校准的全新安装，这是正常的成功状态，安装器不会越过校准直接启动服务或执行健康检查。
 2. 双击安装目录中的 `校准.bat`。
 3. 登录并最大化微信，保持微信窗口可见，不要在校准过程中改变窗口大小或显示缩放。
-4. 按校准向导依次点击搜索框、第一条搜索结果或会话、消息输入框、发送按钮。按 `Esc` 可以安全取消；只有四步全部完成并确认后才会原子保存校准。
-5. 校准成功后双击 `启动.bat`，再运行 `健康检查.bat`。
+4. 先按校准向导依次点击搜索框、第一条搜索结果或会话、消息输入框、发送按钮并确认。输入确认后，向导会把刚才完成标定的微信窗口重新切回前台；随后关闭表情面板，继续标定左下角笑脸、收藏心形标签、第 1 格中心和第 20 格中心。
+5. 收藏阶段的四次标定点击都会被吞掉，不会选中或发送表情。向导只保存完整暴露的前四行固定 4×5 网格比例坐标，不截图；按 `Esc` 或拒绝确认会取消本次保存。
+6. 校准成功后双击 `启动.bat`，再运行 `健康检查.bat`。
 
 校准点使用微信客户区比例保存。更换显示器、调整 DPI、改变微信窗口宽高比或界面布局后，先停止服务，运行 `校准.bat` 重新校准，再启动。校准数据不应手工编辑。
 
@@ -71,6 +72,31 @@ AstrBot 的 `tool_schema_mode` 请保持默认的 `full`；改成 `skills_like` 
 `/akasha_memory rebuild` 会让当前私聊联系人在下次回复时从本地记录重新播种；`/akasha_memory forget CONFIRM` 会删除当前联系人的云端会话和本地记忆。这两个命令只能从目标 Akasha 私聊执行，并要求管理员权限。
 
 私聊回复仍通过昵称或备注名搜索微信，但发送前必须从 WeFlow 联系人接口唯一匹配到本轮稳定 `sessionId`。同名、目标不符或接口不可验证时不会调用 UIA 发送；请为同名联系人设置唯一备注名后再试。
+
+### 配置原生收藏表情
+
+安装器已经部署 `Akasha 微信收藏表情` 插件。完成上述校准并首次启动
+AstrBot 后，编辑：
+
+`%LOCALAPPDATA%\AkashaBot-WeFlow-Bridge\data\state\favorite-sticker-catalog.json`
+
+文件必须保留恰好 20 项，并让 `sticker_key` 唯一覆盖 `slot_01` 到
+`slot_20`。把每项的 `id` 改成稳定、易懂的小写语义 ID，并填写
+`description`、`use_when`、`avoid_when`，然后在 AstrBot 中重载插件。
+插件更新不会覆盖该持久文件。
+
+模型工具每个消息事件最多调用一次，同一会话默认冷却 60 秒。Bridge 通过
+标定点打开笑脸和收藏标签，然后根据 `slot_01` 到 `slot_20` 直接计算完整
+暴露的固定 4×5 格子坐标并点击；发送时不截图、不读取模板，也不进行置信度或唯一性
+检查。路由不可信、窗口比例变化、暂停、取消或超时仍会失败关闭。点击后还
+必须由 WeFlow 在同一会话发现新的己方原生表情记录才报告确认；超时或结果
+未知时不要重试。笑脸到收藏标签及收藏标签到目标槽位的等待独立随机采样；
+默认范围分别为 0.8–1.3 秒和 0.9–1.5 秒。收藏项本身是动画时由微信原生链路
+发送，不转换为普通图片。
+
+添加、删除、替换或调整收藏顺序后请立即停止服务，重新校准并同步复核语义
+目录。固定槽位直点不能发现目标缺失或内容错位；WeFlow 回执只能确认发出了
+某个原生收藏表情，不能证明它就是语义目录描述的那一张。
 
 ### 配置红包与转账接收
 
@@ -108,7 +134,7 @@ Bridge 配置中的 `money_receive_enabled` 默认开启，`money_receive_timeou
 4. 如果显示环境或微信布局变化，运行安装目录的 `校准.bat` 重新校准。
 5. 运行 `启动.bat` 和 `健康检查.bat`。
 
-安装器拒绝在已记录服务仍运行时覆盖文件，并返回 `E_INSTALL_RUNNING`。正常重装保留安装根目录下的 `data`、联系人记忆数据库和现有配置；旧桥接目录以及修改前的 WeFlow/AstrBot 配置会备份到 `data\backups`。两个 AstrBot 插件的代码都会在 AstrBot 初始化完成后分别暂存并原子替换，失败会恢复旧插件代码，不会删除 `data\astrbot\data\plugin_data`。
+安装器拒绝在已记录服务仍运行时覆盖文件，并返回 `E_INSTALL_RUNNING`。正常重装保留安装根目录下的 `data`、联系人记忆数据库、收藏表情模板、持久语义目录和现有配置；旧桥接目录以及修改前的 WeFlow/AstrBot 配置会备份到 `data\backups`。三个 AstrBot 插件的代码都会在 AstrBot 初始化完成后分别暂存并原子替换，失败会恢复旧插件代码，不会删除 `data\astrbot\data\plugin_data` 或 `data\state` 中的收藏表情数据。
 
 ## 9. 常见错误
 
@@ -129,10 +155,15 @@ Bridge 配置中的 `money_receive_enabled` 默认开启，`money_receive_timeou
 | `E_UIA_CALIBRATION_WINDOW` | 未找到可用微信窗口，或窗口状态不满足校准要求。 |
 | `E_UIA_CALIBRATION_BUSY` | 校准或生命周期操作正在进行；等待结束后重试。 |
 | `E_UIA_RECALIBRATION_REQUIRED` | 当前 DPI 或宽高比与参考不兼容；重新校准。 |
+| `E_UIA_STICKER_CALIBRATION_REQUIRED` | 尚未生成收藏表情槽位标定；重新运行 `校准.bat`。 |
+| `E_UIA_STICKER_TEMPLATE_MISSING` | 旧识图模式兼容错误；当前固定槽位直点路径不产生。 |
+| `E_UIA_STICKER_MATCH_LOW_CONFIDENCE` | 旧识图模式兼容错误；当前固定槽位直点路径不产生。 |
+| `E_UIA_STICKER_MATCH_AMBIGUOUS` | 旧识图模式兼容错误；当前固定槽位直点路径不产生。 |
+| `E_UIA_STICKER_CONFIRMATION_UNKNOWN` | 已点击但未在期限内取得 WeFlow 回执；不要自动重试。 |
 
 ## 10. 日志、检测与安全排障
 
-安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`；`data\state` 还包含稳定身份映射和联系人记忆迁移前的一致性 SQLite 快照，不包含用于定位界面的校准细节。联系人消息数据库和 DPAPI 保护的本机密钥封装位于 `data\astrbot\data\plugin_data\astrbot_plugin_akasha_contact_memory`。`bridge.log` 默认记录私聊联系人、群名与群成员、收到的完整正文、Bot 尝试发送的完整正文及 `sent`/`failed` 状态；令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
+安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`；`data\state` 还包含稳定身份映射、联系人记忆迁移前的一致性 SQLite 快照、收藏表情槽位标定和 `favorite-sticker-catalog.json` 持久语义目录。旧版本生成的 `favorite-sticker-templates` 私有模板会原样保留，但当前直点路径不读取，也不会在更新时主动删除。联系人消息数据库和 DPAPI 保护的本机密钥封装位于 `data\astrbot\data\plugin_data\astrbot_plugin_akasha_contact_memory`。`bridge.log` 默认记录私聊联系人、群名与群成员、收到的完整正文、Bot 尝试发送的完整正文及 `sent`/`failed` 状态；令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
 
 Web 控制面板只解析结构化 `CHAT` 记录，不返回其他原始运行日志；聊天区域显示完整联系人、群名、群成员、方向、状态和正文。面板及接口只接受 `127.0.0.1` 或 `localhost` 的同源请求。任何能使用当前 Windows 账户打开该面板的人都可能看到聊天内容。
 

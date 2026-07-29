@@ -3,6 +3,7 @@ import ctypes
 import json
 import msvcrt
 import os
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from ctypes import wintypes
@@ -22,6 +23,11 @@ from uia_support import (
     build_calibration,
     validate_calibration,
 )
+from favorite_sticker import (
+    FAVORITE_POINT_NAMES,
+    build_manifest as build_favorite_manifest,
+    write_layout as write_favorite_layout,
+)
 
 
 STEP_LABELS = {
@@ -29,6 +35,13 @@ STEP_LABELS = {
     "first_result": "第一条搜索结果或会话",
     "message_input": "消息输入框",
     "send_button": "发送按钮",
+}
+
+FAVORITE_STEP_LABELS = {
+    "smile_entry": "左下角表情入口（笑脸）",
+    "favorite_tab": "收藏表情标签（心形）",
+    "grid_first": "收藏网格第 1 格中心",
+    "grid_last": "收藏网格第 20 格中心",
 }
 
 _EXIT_CODES = {
@@ -148,7 +161,11 @@ def _report_window_failure(output_fn) -> None:
 
 
 def collect_calibration(
-    driver, confirm_fn=input, output_fn=print
+    driver,
+    confirm_fn=input,
+    output_fn=print,
+    *,
+    reactivate_after_confirm=False,
 ) -> dict[str, object] | None:
     """Capture four swallowed clicks in POINT_NAMES order and ask for final confirmation."""
     points: dict[str, tuple[int, int]] = {}
@@ -183,6 +200,9 @@ def collect_calibration(
             if str(answer).strip().lower() not in {"y", "yes"}:
                 output_fn("失败: 用户取消")
                 return None
+            if reactivate_after_confirm:
+                output_fn("步骤: 正在切回目标微信窗口继续收藏表情标定")
+                driver.activate_receive_window(reference_metrics.hwnd)
             return calibration
 
         point_name = POINT_NAMES[step_index]
@@ -203,6 +223,58 @@ def collect_calibration(
         points[point_name] = point
         output_fn(f"成功: {label}")
         step_index += 1
+
+
+def collect_favorite_sticker_calibration(
+    driver,
+    confirm_fn=input,
+    output_fn=print,
+    sleep_fn=time.sleep,
+):
+    """Capture fixed entry/grid points without selecting a sticker."""
+    metrics = _capture_metrics(driver)
+    signature = _capture_signature(metrics)
+    points: dict[str, tuple[int, int]] = {}
+
+    output_fn("步骤: 请关闭表情面板并保持目标微信窗口前台最大化")
+    for point_name in FAVORITE_POINT_NAMES:
+        current = driver.get_client_metrics(metrics.hwnd)
+        if (
+            not current.visible
+            or not current.maximized
+            or current.width < 800
+            or current.height < 600
+            or _capture_signature(current) != signature
+        ):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        output_fn(f"步骤: {FAVORITE_STEP_LABELS[point_name]}")
+        point = driver.capture_swallowed_click(
+            metrics.hwnd,
+            allow_same_process_popup=point_name != "smile_entry",
+        )
+        if point is None:
+            output_fn("失败: 用户取消")
+            return None
+        points[point_name] = point
+        output_fn(f"成功: {FAVORITE_STEP_LABELS[point_name]}")
+
+        ratio = {
+            "x": (point[0] - metrics.left) / metrics.width,
+            "y": (point[1] - metrics.top) / metrics.height,
+        }
+        if point_name == "smile_entry":
+            driver.click_ratio(metrics.hwnd, ratio)
+            sleep_fn(0.45)
+        elif point_name == "favorite_tab":
+            driver.click_bound_process_ratio(metrics.hwnd, ratio)
+            sleep_fn(0.55)
+
+    manifest = build_favorite_manifest(points, metrics)
+    answer = confirm_fn("输入 y 确认保存收藏表情槽位标定，其他输入取消: ")
+    if str(answer).strip().lower() not in {"y", "yes"}:
+        output_fn("失败: 用户取消")
+        return None
+    return manifest
 
 
 def _backup_stamp() -> str:
@@ -436,6 +508,7 @@ def persist_calibration(
 def run_calibration(
     config_path: str,
     backup_dir: str,
+    favorite_state_dir: str | None = None,
     driver=None,
     confirm_fn=input,
     output_fn=print,
@@ -443,10 +516,30 @@ def run_calibration(
     """Return 0 on save, 2 on user cancellation, and raise CalibrationError otherwise."""
     try:
         active_driver = Win32WeChatDriver() if driver is None else driver
-        calibration = collect_calibration(active_driver, confirm_fn, output_fn)
+        calibration = collect_calibration(
+            active_driver,
+            confirm_fn,
+            output_fn,
+            reactivate_after_confirm=bool(favorite_state_dir),
+        )
         if calibration is None:
             return 2
+        favorite_manifest = None
+        if favorite_state_dir:
+            favorite_manifest = collect_favorite_sticker_calibration(
+                active_driver,
+                confirm_fn,
+                output_fn,
+            )
+            if favorite_manifest is None:
+                return 2
         persist_calibration(config_path, backup_dir, calibration)
+        if favorite_manifest is not None:
+            write_favorite_layout(
+                favorite_state_dir,
+                favorite_manifest,
+            )
+            output_fn("成功: 收藏表情槽位标定已保存到本机状态目录")
         output_fn("成功: 标定已保存")
         return 0
     except CalibrationError:
@@ -466,8 +559,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser = _FixedCodeArgumentParser(add_help=False)
         parser.add_argument("--config", required=True)
         parser.add_argument("--backup-dir", required=True)
+        parser.add_argument("--favorite-state-dir")
         arguments = parser.parse_args(argv)
-        return run_calibration(arguments.config, arguments.backup_dir)
+        return run_calibration(
+            arguments.config,
+            arguments.backup_dir,
+            favorite_state_dir=arguments.favorite_state_dir,
+        )
     except CalibrationError as error:
         exit_code = _EXIT_CODES.get(error.code, 20)
         code = error.code if error.code in _EXIT_CODES else CALIBRATION_INVALID
