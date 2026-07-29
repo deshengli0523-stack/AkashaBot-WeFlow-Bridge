@@ -417,8 +417,11 @@ function refreshDashboard() {
           ? preview.preview_id
           : null;
       previewPanel.classList.add('active');
-      var previewTitle = '即将粘贴';
-      if (preview.stage === 'pasted_waiting') previewTitle = '已粘贴，等待发送';
+      var isFavoriteSticker = preview.message_type === 'favorite_sticker';
+      var previewTitle = isFavoriteSticker ? '即将发送收藏表情' : '即将粘贴';
+      if (preview.stage === 'pasted_waiting') {
+        previewTitle = isFavoriteSticker ? '等待发送收藏表情' : '已粘贴，等待发送';
+      }
       if (preview.stage === 'paused') previewTitle = '已暂停，将从此条继续';
       if (preview.stage === 'submitting') previewTitle = '正在发送';
       if (typeof preview.remaining_seconds === 'number' && preview.stage !== 'submitting') {

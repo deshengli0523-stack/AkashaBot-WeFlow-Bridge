@@ -22,6 +22,7 @@ def _runtime_path(name: str, fallback: str) -> str:
 CONFIG_FILE = _runtime_path("AKASHABOT_CONFIG_PATH", os.path.join(MODULE_DIR, "config.json"))
 EXAMPLE_FILE = os.path.join(MODULE_DIR, "config.example.json")
 LOG_DIR = _runtime_path("AKASHABOT_LOG_DIR", MODULE_DIR)
+STATE_DIR = _runtime_path("AKASHABOT_STATE_DIR", MODULE_DIR)
 os.makedirs(LOG_DIR, exist_ok=True)
 BRIDGE_LOG_FILE = os.path.join(LOG_DIR, "bridge.log")
 
@@ -79,6 +80,9 @@ UIA_FIXED_PRE_SEND_DELAY = _bounded_float(
 )
 UIA_FIXED_SETTLE_JITTER_MAX_SECONDS = _bounded_float(
     "uia_fixed_settle_jitter_max_seconds", 0.25, 0.5
+)
+FAVORITE_STICKER_RECEIPT_TIMEOUT_SECONDS = _bounded_float(
+    "favorite_sticker_receipt_timeout_seconds", 8.0, 10.0
 )
 BUFFER_SECONDS = config.get("buffer_seconds", 5)
 WEB_PORT = _bounded_int("web_port", 8766, 1024, 65535)

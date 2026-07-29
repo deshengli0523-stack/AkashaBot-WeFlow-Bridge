@@ -8,9 +8,11 @@ import re
 import sys
 import tempfile
 import unittest
+import uuid
 from collections import deque
 from dataclasses import replace
 from unittest import mock
+from PIL import Image, ImageDraw
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -34,6 +36,7 @@ from uia_support import (  # noqa: E402
     CalibrationError,
     ClientMetrics,
 )
+import favorite_sticker as favorite_module  # noqa: E402
 
 
 METRICS = ClientMetrics(
@@ -95,6 +98,9 @@ class FakeDriver:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+    def activate_receive_window(self, hwnd):
+        self.calls.append(("activate", hwnd))
 
 
 def ordered_points(*, left=100, top=50):
@@ -290,6 +296,21 @@ class CalibrationCollectionTests(OutputPrivacyMixin, unittest.TestCase):
                     FakeDriver(ordered_points()), answer=answer
                 )
                 self.assertIsNone(calibration)
+
+    def test_confirmation_reactivates_exact_calibrated_window_when_requested(self):
+        driver = FakeDriver(ordered_points())
+        messages = []
+
+        calibration = collect_calibration(
+            driver,
+            confirm_fn=lambda _prompt: "y",
+            output_fn=messages.append,
+            reactivate_after_confirm=True,
+        )
+
+        self.assertIsNotNone(calibration)
+        self.assertEqual(driver.calls[-1], ("activate", METRICS.hwnd))
+        self.assertTrue(any("正在切回目标微信窗口" in item for item in messages))
 
 
 class CalibrationPersistenceTests(OutputPrivacyMixin, unittest.TestCase):
@@ -717,18 +738,75 @@ class CalibrationRunAndMainTests(OutputPrivacyMixin, unittest.TestCase):
 
     def test_run_success_writes_without_disclosing_path_or_metadata(self):
         messages = []
+        driver = FakeDriver(ordered_points())
 
         result = run_calibration(
             config_path=str(self.config_path),
             backup_dir=str(self.backup_dir),
-            driver=FakeDriver(ordered_points()),
+            driver=driver,
             confirm_fn=lambda _prompt: "yes",
             output_fn=messages.append,
         )
 
         self.assertEqual(result, 0)
+        self.assertFalse(any(call[0] == "activate" for call in driver.calls))
         self.assertTrue(any("成功" in message for message in messages))
         self.assert_safe_output(messages, self.config_path)
+
+    def test_run_reactivates_before_starting_favorite_calibration(self):
+        messages = []
+        driver = FakeDriver(ordered_points())
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        favorite_manifest = {"layout": "opaque"}
+
+        def collect_favorite(*_args, **_kwargs):
+            self.assertEqual(driver.calls[-1], ("activate", METRICS.hwnd))
+            return favorite_manifest
+
+        with mock.patch(
+            "calibrate_uia_fixed.collect_favorite_sticker_calibration",
+            side_effect=collect_favorite,
+        ) as collect_spy, mock.patch(
+            "calibrate_uia_fixed.write_favorite_layout"
+        ) as write_spy:
+            result = run_calibration(
+                config_path=str(self.config_path),
+                backup_dir=str(self.backup_dir),
+                favorite_state_dir=str(state_dir),
+                driver=driver,
+                confirm_fn=lambda _prompt: "yes",
+                output_fn=messages.append,
+            )
+
+        self.assertEqual(result, 0)
+        collect_spy.assert_called_once()
+        write_spy.assert_called_once_with(str(state_dir), favorite_manifest)
+        self.assert_safe_output(messages, self.config_path)
+
+    def test_reactivation_failure_writes_nothing(self):
+        class FailingActivationDriver(FakeDriver):
+            def activate_receive_window(self, hwnd):
+                super().activate_receive_window(hwnd)
+                raise CalibrationError(CALIBRATION_WINDOW)
+
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+
+        with self.assertRaises(CalibrationError) as raised:
+            run_calibration(
+                config_path=str(self.config_path),
+                backup_dir=str(self.backup_dir),
+                favorite_state_dir=str(state_dir),
+                driver=FailingActivationDriver(ordered_points()),
+                confirm_fn=lambda _prompt: "yes",
+                output_fn=lambda _message: None,
+            )
+
+        self.assertEqual(raised.exception.code, CALIBRATION_WINDOW)
+        self.assertEqual(self.config_path.read_bytes(), self.original_bytes)
+        self.assertFalse(self.backup_dir.exists())
+        self.assertEqual(list(state_dir.iterdir()), [])
 
     def test_main_maps_only_fixed_error_codes_to_integer_exit_codes(self):
         cases = (
@@ -805,6 +883,394 @@ class CalibrationRunAndMainTests(OutputPrivacyMixin, unittest.TestCase):
                 self.assertEqual(output.getvalue(), CALIBRATION_INVALID + "\n")
                 self.assertEqual(errors.getvalue(), "")
                 run_spy.assert_not_called()
+
+
+class FavoriteStickerBundleTests(unittest.TestCase):
+    def _manifest(self):
+        points = {
+            "smile_entry": (140, 900),
+            "favorite_tab": (260, 900),
+            "grid_first": (300, 220),
+            "grid_last": (1100, 670),
+        }
+        metrics = ClientMetrics(
+            hwnd=1,
+            left=0,
+            top=0,
+            width=1400,
+            height=1000,
+            dpi=96,
+            visible=True,
+            maximized=True,
+            foreground=True,
+        )
+        return favorite_module.build_manifest(points, metrics)
+
+    def _frame(self, order):
+        image = Image.new("RGB", (1400, 1000), "white")
+        draw = ImageDraw.Draw(image)
+        for cell, source in enumerate(order):
+            row, column = divmod(cell, 5)
+            center_x = 300 + column * 200
+            center_y = 220 + row * 150
+            color = (
+                (source * 47) % 220 + 20,
+                (source * 83) % 220 + 20,
+                (source * 131) % 220 + 20,
+            )
+            draw.rectangle(
+                (
+                    center_x - 58,
+                    center_y - 48,
+                    center_x + 58,
+                    center_y + 48,
+                ),
+                fill=color,
+                outline="black",
+                width=4,
+            )
+            draw.line(
+                (
+                    center_x - 45,
+                    center_y - 25 + source % 11,
+                    center_x + 42,
+                    center_y + 22 - source % 7,
+                ),
+                fill="black",
+                width=4,
+            )
+            draw.text(
+                (center_x - 12, center_y + 24),
+                f"{source + 1:02d}",
+                fill="black",
+            )
+        return image
+
+    def test_bundle_contains_exactly_twenty_times_four_templates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            frames = [self._frame(list(range(20))) for _ in range(4)]
+            root = favorite_module.write_bundle(
+                temporary,
+                self._manifest(),
+                frames,
+            )
+            images = sorted(root.glob("slot_*-frame_*.png"))
+            self.assertEqual(len(images), 80)
+            _, manifest = favorite_module.load_manifest(temporary)
+            self.assertEqual(set(manifest["templates"]), set(favorite_module.STICKER_KEYS))
+            self.assertTrue(all(len(names) == 4 for names in manifest["templates"].values()))
+
+    def test_favorite_calibration_collects_points_without_template_capture(self):
+        class Driver:
+            def __init__(self):
+                self.points = deque(
+                    (
+                        (180, 820),
+                        (260, 820),
+                        (300, 220),
+                        (1100, 670),
+                    )
+                )
+                self.events = []
+
+            def find_wechat_window(self):
+                return METRICS.hwnd
+
+            def get_client_metrics(self, _hwnd):
+                return METRICS
+
+            def capture_swallowed_click(
+                self,
+                _hwnd,
+                *,
+                allow_same_process_popup=False,
+            ):
+                self.events.append(("capture_point", allow_same_process_popup))
+                return self.points.popleft()
+
+            def click_ratio(self, _hwnd, _point):
+                self.events.append(("open_panel",))
+
+            def click_bound_process_ratio(self, _hwnd, _point):
+                self.events.append(("favorite_tab",))
+
+            def move_bound_process_ratio(self, _hwnd, _point):
+                raise AssertionError("fixed-slot calibration must not move for capture")
+
+            def capture_bound_process_client(self, _hwnd):
+                raise AssertionError("fixed-slot calibration must not capture frames")
+
+        driver = Driver()
+        captured = calibration_module.collect_favorite_sticker_calibration(
+            driver,
+            confirm_fn=lambda _prompt: "y",
+            output_fn=lambda _message: None,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertEqual(len(captured["templates"]), 20)
+        self.assertFalse(any(event[0] == "capture_frame" for event in driver.events))
+        self.assertFalse(any(event[0] == "park_pointer" for event in driver.events))
+
+    def test_runtime_matching_finds_a_template_after_grid_reordering(self):
+        original = list(range(20))
+        reordered = original[9:] + original[:9]
+        with tempfile.TemporaryDirectory() as temporary:
+            favorite_module.write_bundle(
+                temporary,
+                self._manifest(),
+                [self._frame(original) for _ in range(4)],
+            )
+            matcher = favorite_module.FavoriteStickerMatcher(temporary)
+            point = matcher.point(
+                [self._frame(reordered), self._frame(reordered)],
+                "slot_07",
+            )
+            cell = reordered.index(6)
+            row, column = divmod(cell, 5)
+            self.assertAlmostEqual(point["x"], (300 + column * 200) / 1400)
+            self.assertAlmostEqual(point["y"], (220 + row * 150) / 1000)
+
+    def test_fixed_layout_maps_slot_without_reading_template_images(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = favorite_module.write_layout(
+                temporary,
+                self._manifest(),
+            )
+
+            layout = favorite_module.FavoriteStickerLayout(temporary)
+            self.assertEqual(list(root.glob("slot_*-frame_*.png")), [])
+            expected = {
+                "slot_01": (300, 220),
+                "slot_05": (1100, 220),
+                "slot_07": (500, 370),
+                "slot_13": (700, 520),
+                "slot_16": (300, 670),
+                "slot_20": (1100, 670),
+            }
+            for sticker_key, (x, y) in expected.items():
+                with self.subTest(sticker_key=sticker_key):
+                    point = layout.point(sticker_key)
+                    self.assertAlmostEqual(point["x"], x / 1400)
+                    self.assertAlmostEqual(point["y"], y / 1000)
+            with self.assertRaises(favorite_module.FavoriteStickerError):
+                layout.point("slot_21")
+
+    def test_matching_rejects_nonfinite_threshold_and_different_frame_sizes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            frames = [self._frame(list(range(20))) for _ in range(4)]
+            favorite_module.write_bundle(temporary, self._manifest(), frames)
+            with self.assertRaises(favorite_module.FavoriteStickerError):
+                favorite_module.FavoriteStickerMatcher(
+                    temporary,
+                    minimum_similarity=float("nan"),
+                )
+            matcher = favorite_module.FavoriteStickerMatcher(temporary)
+            with self.assertRaises(favorite_module.FavoriteStickerError) as caught:
+                matcher.point(
+                    [frames[0], frames[0].resize((1200, 900))],
+                    "slot_01",
+                )
+            self.assertEqual(
+                caught.exception.code,
+                favorite_module.STICKER_PANEL_FAILED,
+            )
+
+    def test_bundle_reparse_is_rejected_before_template_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "favorite-sticker-templates"
+            root.mkdir()
+            with mock.patch("favorite_sticker._is_reparse", return_value=True):
+                with self.assertRaises(favorite_module.FavoriteStickerError):
+                    favorite_module.load_manifest(temporary)
+
+    def test_manifest_rejects_boolean_schema_and_overflowing_numbers(self):
+        manifest = self._manifest()
+        invalid_schema = copy.deepcopy(manifest)
+        invalid_schema["schema_version"] = True
+        invalid_ratio = copy.deepcopy(manifest)
+        invalid_ratio["points"]["smile_entry"]["x"] = 10**10000
+        invalid_aspect = copy.deepcopy(manifest)
+        invalid_aspect["reference"]["aspect_ratio"] = "1.4"
+        for value in (invalid_schema, invalid_ratio, invalid_aspect):
+            with self.subTest(value=value):
+                with self.assertRaises(favorite_module.FavoriteStickerError):
+                    favorite_module.validate_manifest(value)
+
+    def test_legacy_five_row_manifest_requires_recalibration(self):
+        manifest = self._manifest()
+        manifest["schema_version"] = 1
+        manifest["grid"]["rows"] = 5
+
+        with self.assertRaises(favorite_module.FavoriteStickerError) as caught:
+            favorite_module.validate_manifest(manifest)
+
+        self.assertEqual(
+            caught.exception.code,
+            favorite_module.STICKER_CALIBRATION_REQUIRED,
+        )
+
+    def test_low_confidence_and_ambiguous_matches_fail_closed(self):
+        original = list(range(20))
+        with tempfile.TemporaryDirectory() as temporary:
+            favorite_module.write_bundle(
+                temporary,
+                self._manifest(),
+                [self._frame(original) for _ in range(4)],
+            )
+            matcher = favorite_module.FavoriteStickerMatcher(temporary)
+            blank = Image.new("RGB", (1400, 1000), "white")
+            with self.assertRaises(favorite_module.FavoriteStickerError) as low:
+                matcher.point([blank, blank.copy()], "slot_01")
+            self.assertIn(
+                low.exception.code,
+                {
+                    favorite_module.STICKER_MATCH_LOW_CONFIDENCE,
+                    favorite_module.STICKER_MATCH_AMBIGUOUS,
+                },
+            )
+
+        identical = self._frame([0] * 20)
+        with tempfile.TemporaryDirectory() as temporary:
+            favorite_module.write_bundle(
+                temporary,
+                self._manifest(),
+                [identical.copy() for _ in range(4)],
+            )
+            matcher = favorite_module.FavoriteStickerMatcher(temporary)
+            with self.assertRaises(favorite_module.FavoriteStickerError) as tied:
+                matcher.point([identical, identical.copy()], "slot_01")
+            self.assertEqual(
+                tied.exception.code,
+                favorite_module.STICKER_MATCH_AMBIGUOUS,
+            )
+
+    def test_request_cache_is_bounded_when_all_entries_are_in_progress(self):
+        cache = favorite_module.RequestIdCache(capacity=32, ttl_seconds=60)
+        identity = ("contact", "session", "slot_01")
+        request_ids = [str(uuid.uuid4()) for _ in range(33)]
+        for request_id in request_ids[:32]:
+            self.assertIsNone(cache.begin(request_id, identity))
+        capacity = cache.begin(request_ids[32], identity)
+        self.assertEqual(
+            capacity.error_code,
+            favorite_module.STICKER_REQUEST_CAPACITY,
+        )
+        cache.finish(
+            request_ids[0],
+            identity,
+            favorite_module.IdempotentResult(
+                False,
+                favorite_module.STICKER_QUEUE_EXPIRED,
+                "request",
+                False,
+            ),
+        )
+        self.assertIsNone(cache.begin(request_ids[32], identity))
+
+    def test_weflow_receipt_requires_a_new_outgoing_type_47_in_same_session(self):
+        calls = []
+        payloads = deque(
+            (
+                [
+                    {"serverId": "old", "isSend": 1, "localType": 47},
+                    {"serverId": "incoming", "isSend": 0, "localType": 47},
+                    {"serverId": "image", "isSend": 1, "localType": 3},
+                ],
+                [
+                    {"serverId": "old", "isSend": 1, "localType": 47},
+                    {"serverId": "incoming-new", "isSend": 0, "localType": 47},
+                ],
+                [
+                    {"serverId": "old", "isSend": 1, "localType": 47},
+                    {"serverId": "new", "isSend": True, "mediaType": "emoji"},
+                ],
+            )
+        )
+
+        class Response:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def request_get(url, **kwargs):
+            calls.append((url, kwargs))
+            return Response(payloads.popleft())
+
+        class Clock:
+            value = 0.0
+
+            def monotonic(self):
+                return self.value
+
+            def sleep(self, seconds):
+                self.value += seconds
+
+        clock = Clock()
+        receipt = favorite_module.WeFlowStickerReceipt(
+            "http://127.0.0.1:5031",
+            "token",
+            request_get=request_get,
+            timeout_seconds=2,
+            poll_seconds=0.2,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        baseline = receipt.baseline("same-session")
+
+        self.assertEqual(baseline, frozenset({"old"}))
+        self.assertTrue(receipt.confirm("same-session", baseline))
+        self.assertTrue(
+            all(
+                call[1]["params"]["talker"] == "same-session"
+                for call in calls
+            )
+        )
+        self.assertTrue(
+            all(
+                call[1]["headers"]["Authorization"] == "Bearer token"
+                for call in calls
+            )
+        )
+        self.assertTrue(
+            all(0 < call[1]["timeout"] <= 5 for call in calls)
+        )
+
+    def test_weflow_receipt_baseline_fails_closed_and_poll_errors_time_out(self):
+        def request_get(*_args, **_kwargs):
+            raise OSError("synthetic offline failure")
+
+        class Clock:
+            value = 0.0
+
+            def monotonic(self):
+                return self.value
+
+            def sleep(self, seconds):
+                self.value += seconds
+
+        clock = Clock()
+        receipt = favorite_module.WeFlowStickerReceipt(
+            "http://127.0.0.1:5031",
+            "token",
+            request_get=request_get,
+            timeout_seconds=1,
+            poll_seconds=0.25,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        with self.assertRaises(favorite_module.FavoriteStickerError) as caught:
+            receipt.baseline("same-session")
+        self.assertEqual(
+            caught.exception.code,
+            favorite_module.STICKER_CONFIRMATION_UNAVAILABLE,
+        )
+        self.assertFalse(receipt.confirm("same-session", frozenset()))
+        self.assertGreaterEqual(clock.value, 1.0)
 
 
 if __name__ == "__main__":

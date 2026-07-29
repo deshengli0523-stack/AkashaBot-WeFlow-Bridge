@@ -1,0 +1,30 @@
+{
+  "enabled": {
+    "description": "启用微信收藏表情工具",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不向模型注册 send_wechat_favorite_sticker 工具。修改后请重载插件。"
+  },
+  "allow_private": {
+    "description": "允许在微信私聊发送",
+    "type": "bool",
+    "default": true
+  },
+  "allow_group": {
+    "description": "允许在微信群聊发送",
+    "type": "bool",
+    "default": true
+  },
+  "cooldown_seconds": {
+    "description": "同一会话发送冷却秒数",
+    "type": "float",
+    "default": 60.0,
+    "hint": "从一次发送尝试开始计时，防止结果未知时重复点击；范围 0-3600 秒。"
+  },
+  "action_timeout_seconds": {
+    "description": "等待 Bridge 返回秒数",
+    "type": "float",
+    "default": 45.0,
+    "hint": "超时后结果视为未知且不自动重试；安全范围 45-180 秒，低于 45 会按 45 处理。"
+  }
+}

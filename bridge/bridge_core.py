@@ -38,6 +38,9 @@ _STICKER_CONTENT_TYPES = {
     "image/webp": ".webp",
 }
 _STICKER_MAX_BYTES = 6 * 1024 * 1024
+_CONTACT_TYPE_CACHE_CAPACITY = 4096
+_CONTACT_TYPE_LOOKUP_LIMIT = 100
+_CONTACT_TYPE_TIMEOUT_SECONDS = 3
 
 
 # ============ 桥接核心 ============
@@ -177,6 +180,7 @@ class WeFlowBridge:
         self._sent_recently = {}
         self._sse_event_keys = {}
         self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
+        self._contact_type_cache = {}
         self.money_actions = None
         if sender is not None and bool(
             getattr(config, "MONEY_RECEIVE_ENABLED", False)
@@ -223,6 +227,88 @@ class WeFlowBridge:
             if self.generation is None
             else state.is_generation_running(self.generation)
         )
+
+    def _contact_type(self, data: dict) -> str:
+        for key in ("contactType", "sourceType", "talkerType"):
+            direct_type = _text_value(data.get(key)).casefold()
+            if direct_type:
+                return direct_type
+
+        session_id = _text_value(data.get("sessionId"))
+        session_type = _text_value(data.get("sessionType")).casefold()
+        if (
+            not session_id
+            or session_type == "group"
+            or "@chatroom" in session_id
+        ):
+            return ""
+
+        cached = self._contact_type_cache.get(session_id)
+        if cached is not None:
+            return cached
+
+        base_url = _text_value(getattr(config, "WE_FLOW_BASE_URL", "")).rstrip("/")
+        access_token = _text_value(getattr(config, "ACCESS_TOKEN", ""))
+        if not base_url or not access_token:
+            return ""
+
+        try:
+            response = requests.get(
+                f"{base_url}/api/v1/contacts",
+                params={
+                    "keyword": session_id,
+                    "limit": _CONTACT_TYPE_LOOKUP_LIMIT,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {access_token}",
+                },
+                timeout=_CONTACT_TYPE_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                return ""
+            payload = response.json()
+        except Exception:
+            return ""
+
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return ""
+        contacts = payload.get("contacts")
+        count = payload.get("count")
+        if (
+            not isinstance(contacts, list)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count != len(contacts)
+            or count >= _CONTACT_TYPE_LOOKUP_LIMIT
+            or any(not isinstance(contact, dict) for contact in contacts)
+        ):
+            return ""
+
+        exact_matches = [
+            contact
+            for contact in contacts
+            if _text_value(contact.get("username")) == session_id
+        ]
+        if len(exact_matches) != 1:
+            return ""
+        contact_type = _text_value(exact_matches[0].get("type")).casefold()
+        if not contact_type:
+            return ""
+
+        if len(self._contact_type_cache) >= _CONTACT_TYPE_CACHE_CAPACITY:
+            oldest = next(iter(self._contact_type_cache))
+            self._contact_type_cache.pop(oldest, None)
+        self._contact_type_cache[session_id] = contact_type
+        return contact_type
+
+    def _is_official_contact(self, data: dict) -> bool:
+        if _text_value(data.get("sessionType")).casefold() in {
+            "channel",
+            "official",
+        }:
+            return True
+        return self._contact_type(data) == "official"
 
     def should_ignore(self, data):
         content = _text_value(data.get("content"))
@@ -567,6 +653,15 @@ class WeFlowBridge:
                 identity_type="group",
             )
             state._ob_id_to_contact[group_id] = contact
+            try:
+                state.remember_group_route(
+                    group_id,
+                    account=account,
+                    session=session_id_data,
+                    routing_name=contact,
+                )
+            except Exception:
+                log.warning("群聊 route 绑定失败，本轮不允许原生收藏表情回复")
         else:
             state._ob_id_to_contact[user_id] = contact
 
@@ -637,6 +732,9 @@ class WeFlowBridge:
                             if raw_id in self.processed_ids:
                                 continue
                             self.processed_ids.add(raw_id)
+                        if self._is_official_contact(data):
+                            log.info("⏭️ 已过滤 official 类型入站消息")
+                            continue
                         if (
                             self.money_actions is not None
                             and self.money_actions.handle_sse(data)

@@ -47,9 +47,13 @@ function Assert-AkashaTask8Layout {
     'INSTALL.md',
     'SECURITY.md',
     'bridge\calibrate_uia_fixed.py',
+    'bridge\favorite_sticker.py',
     'bridge\uia_support.py',
     'plugins\astrbot_plugin_akasha_contact_memory\main.py',
+    'plugins\astrbot_plugin_akasha_favorite_stickers\main.py',
+    'plugins\astrbot_plugin_akasha_favorite_stickers\catalog.json',
     'tests\python\test_contact_memory.py',
+    'tests\python\test_favorite_sticker_plugin.py',
     'scripts\Calibrate-Uia.ps1',
     (((Join-AkashaCharacters @(0x6821, 0x51C6))) + '.bat')
   )
@@ -66,8 +70,8 @@ function Assert-AkashaTask8Layout {
   }
 
   $publishedFiles = @(Get-AkashaPublishedFiles)
-  if ($publishedFiles.Count -ne 74) {
-    throw "Documentation/layout gate: expected 74 publish files, found $($publishedFiles.Count)."
+  if ($publishedFiles.Count -ne 83) {
+    throw "Documentation/layout gate: expected 83 publish files, found $($publishedFiles.Count)."
   }
 
   $updateLauncher = (Join-AkashaCharacters @(0x66F4, 0x65B0)) + '.bat'
@@ -88,7 +92,7 @@ function Assert-AkashaTask8Layout {
     'push:',
     'pull_request:',
     'workflow_dispatch:',
-    'run: .\tests\Run-All.ps1'
+    '.\tests\Run-All.ps1'
   )) {
     Assert-AkashaContains -Text $ci -Expected $token -Context 'ci.yml'
   }
@@ -169,6 +173,15 @@ jobs:
     'E_UIA_CALIBRATION_WINDOW',
     'E_UIA_CALIBRATION_BUSY',
     'E_UIA_RECALIBRATION_REQUIRED',
+    'E_UIA_STICKER_CALIBRATION_REQUIRED',
+    'E_UIA_STICKER_TEMPLATE_MISSING',
+    'E_UIA_STICKER_MATCH_LOW_CONFIDENCE',
+    'E_UIA_STICKER_MATCH_AMBIGUOUS',
+    'E_UIA_STICKER_CONFIRMATION_UNKNOWN',
+    'favorite-sticker-catalog.json',
+    'favorite-sticker-templates',
+    'send_wechat_favorite_sticker',
+    'slot_20',
     'data\logs',
     'data\state',
     'data\bridge\config.json',
@@ -211,10 +224,10 @@ jobs:
     }
   }
 
-  Assert-AkashaContains -Text $changelog -Expected '## 0.4.1 - 2026-07-28' -Context 'CHANGELOG.md'
+  Assert-AkashaContains -Text $changelog -Expected '## 0.4.2 - 2026-07-29' -Context 'CHANGELOG.md'
   $version = (Read-AkashaUtf8Strict -Path (Join-Path $root 'VERSION')).Trim()
-  if ($version -cne '0.4.1') {
-    throw "Documentation/layout gate: VERSION must be 0.4.1, found '$version'."
+  if ($version -cne '0.4.2') {
+    throw "Documentation/layout gate: VERSION must be 0.4.2, found '$version'."
   }
 
   foreach ($relativeLink in @('INSTALL.md', 'SECURITY.md')) {
@@ -280,6 +293,24 @@ try {
 
   Import-Module (Join-Path $root 'scripts\AkashaBot.Common.psm1') -Force
   $python = Resolve-Python312
+  if ($env:GITHUB_ACTIONS -ceq 'true') {
+    $dependencyArguments = @($python.Prefix) + @(
+      '-m',
+      'pip',
+      'install',
+      '--disable-pip-version-check',
+      '-r',
+      (Join-Path $root 'bridge\requirements.lock')
+    )
+    & $python.FilePath @dependencyArguments
+    $dependencyExitCode = $LASTEXITCODE
+    if ($dependencyExitCode -ne 0) {
+      [Console]::Error.WriteLine(
+        "Python dependency installation failed with exit code $dependencyExitCode."
+      )
+      exit $dependencyExitCode
+    }
+  }
   $pythonArguments = @($python.Prefix) + @(
     '-B',
     '-m',

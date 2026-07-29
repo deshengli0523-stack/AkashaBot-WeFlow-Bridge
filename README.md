@@ -18,8 +18,9 @@
 1. 等待向导显示安装成功。未校准时，安装成功只表示文件和环境已经就绪，服务不会自动启动。
 2. 双击安装目录中的 `校准.bat`。
 3. 登录并最大化微信，校准期间保持窗口大小和显示缩放不变。
-4. 按向导依次点击搜索框、第一条搜索结果或会话、消息输入框、发送按钮；程序只保存相对于微信客户区的比例，不在文档或日志中输出点位。
-5. 校准成功后双击 `启动.bat`。
+4. 先按向导依次点击搜索框、第一条搜索结果或会话、消息输入框、发送按钮。随后关闭表情面板，再依次标定左下角笑脸、收藏心形标签、第 1 格中心和第 20 格中心。标定点击都会被程序吞掉；采集网格时不会发送任何表情。
+5. 收藏阶段只保存笑脸、收藏标签和完整暴露的前四行 4×5 网格首末格比例坐标，不截图，也不会选中或发送表情。
+6. 校准成功后双击 `启动.bat`。等待 AstrBot 插件首次加载并生成 `data\state\favorite-sticker-catalog.json`，编辑其中的语义说明，再在 AstrBot 中重载该插件。
 
 默认安装位置：`%LOCALAPPDATA%\AkashaBot-WeFlow-Bridge`。
 
@@ -64,6 +65,32 @@
 
 命令需要 AstrBot 管理员权限。`rebuild` 和 `forget` 必须从目标联系人的 Akasha 私聊会话执行；删除时会先删除云端 items 和 conversation，成功后再删除本地记忆。
 
+## 原生收藏表情
+
+安装器会部署 `Akasha 微信收藏表情` 插件。它给模型提供
+`send_wechat_favorite_sticker(sticker_id)` 工具，只发送微信收藏面板中的
+原生表情，不使用 OneBot `face`，也不把 GIF 或静态图退化为普通图片。
+如果收藏项本身是动画，动画能力由微信原生发送链路保留。
+
+笑脸入口、收藏心形标签和网格边界使用标定比例定位。当前按完整暴露的固定
+4×5 位置直接点击：Bridge 根据 `slot_01` 到 `slot_20` 计算对应格子的比例坐标，
+发送时不截图、不读取模板，也不进行置信度或唯一性检查。收藏顺序、数量或
+内容变化后，槽位可能对应另一张表情；必须先停止服务，复核语义目录并重新
+标定后再启动。笑脸到收藏标签、收藏标签到目标槽位的两段等待会独立随机
+采样，默认分别为 0.8–1.3 秒和 0.9–1.5 秒。
+
+首次启动并加载插件后，插件会在 `data\state\favorite-sticker-catalog.json` 创建
+20 项持久语义目录。为每项填写稳定 `id`、画面描述、`use_when` 和
+`avoid_when`；`sticker_key` 必须完整保留 `slot_01` 到 `slot_20`。
+
+每个消息事件最多尝试一次，同一会话默认冷却 60 秒。点击前会建立 WeFlow
+回执基线，点击后只把同一会话中新出现的己方原生表情记录视为确认；超时
+或提交状态未知时不会自动重试。当前收藏内容、窗口比例、DPI 或微信布局
+变化后请停止服务并重新校准；如果添加、删除、替换或调整收藏顺序，还要
+同步检查持久语义目录，避免描述与固定槽位不一致。直接点击模式不能检测
+目标缺失、顺序变化或点错内容；WeFlow 回执也只能确认同一会话出现了新的
+己方原生表情，不能证明内容正确。微信原生点击链路不会转码动画内容。
+
 ## 红包与转账接收
 
 安装器会同时部署 `Akasha 红包与转账接收` 插件。它使用 AstrBot 中选择的多模态 Provider 作为桌面 Agent，不启动第三个 Agent 服务，也不把模型 API Key 复制到桥接配置。请在 AstrBot 插件设置里选择独立的 `vision_provider_id`；留空时会使用当前可用 Provider，但明确排除联系人记忆 Provider。红包与收到的转账都直接进入 Agent 接收流程，不设置金额上限。
@@ -103,12 +130,15 @@ WeFlow 推送精确的 `[红包]` 或 `[转账]` 标记后，桥会先在普通�
 - `E_UIA_CALIBRATION_WINDOW`：未找到合适的微信窗口或窗口状态不符合要求。
 - `E_UIA_CALIBRATION_BUSY`：已有校准或生命周期操作正在进行，等待其结束后重试。
 - `E_UIA_RECALIBRATION_REQUIRED`：当前 DPI 或宽高比与校准参考不兼容，需要重新校准。
+- `E_UIA_STICKER_CALIBRATION_REQUIRED`：收藏表情槽位标定尚未生成，重新运行 `校准.bat`。
+- `E_UIA_STICKER_TEMPLATE_MISSING` / `E_UIA_STICKER_MATCH_LOW_CONFIDENCE` / `E_UIA_STICKER_MATCH_AMBIGUOUS`：保留给旧识图日志兼容；当前固定槽位直点路径不产生这些错误。
+- `E_UIA_STICKER_CONFIRMATION_UNKNOWN`：已经点击，但 WeFlow 未在期限内确认；不要自动重试。
 
 其他安装错误及处理方法见 [INSTALL.md](INSTALL.md)。
 
 ## 日志、安全与排障
 
-安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`，稳定身份映射、运行状态和联系人记忆迁移备份位于 `data\state`。如果 Bridge 在完整日志初始化前退出，`data\logs\bridge-startup.log` 会记录一行经过凭据和本机路径脱敏的固定诊断；`启动.bat` 也会直接提示检查这两个日志。联系人消息数据库与本机 DPAPI 密钥封装位于 AstrBot 的 `data\plugin_data\astrbot_plugin_akasha_contact_memory`。`bridge.log` 默认记录私聊联系人、群名与群成员，以及收到的完整正文和 Bot 尝试发送的完整正文；发送记录同时标注 `sent` 或 `failed`。令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
+安装日志位于 `data\logs\install.log`，桥接运行日志位于 `data\logs\bridge.log`，稳定身份映射、运行状态、收藏表情槽位标定与语义目录、联系人记忆迁移备份位于 `data\state`。旧版本生成的收藏表情私有模板会保留，但当前直点路径不读取，也不会在更新时主动删除。如果 Bridge 在完整日志初始化前退出，`data\logs\bridge-startup.log` 会记录一行经过凭据和本机路径脱敏的固定诊断；`启动.bat` 也会直接提示检查这两个日志。联系人消息数据库与本机 DPAPI 密钥封装位于 AstrBot 的 `data\plugin_data\astrbot_plugin_akasha_contact_memory`。`bridge.log` 默认记录私聊联系人、群名与群成员，以及收到的完整正文和 Bot 尝试发送的完整正文；发送记录同时标注 `sent` 或 `failed`。令牌、API Key 和本机路径仍会脱敏。未加引号且带空格的本机路径边界存在歧义时，脱敏会优先避免泄露，并可能连带遮住紧邻文本；消息中给路径加引号可保留准确边界。
 
 从 `0.3.2` 开始，启动器会在生命周期锁内核验 `data\state\bridge.pid`：已退出进程或 PID 已被复用时自动清理，确有存活 Bridge 时拒绝重复启动，身份无法核验时失败关闭。`停止.bat` 在 `processes.json` 丢失或为空时也会核验并停止属于本安装目录的孤儿 Bridge，不再需要手工删除 PID 文件。
 

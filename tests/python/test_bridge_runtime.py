@@ -15,6 +15,7 @@ import tempfile
 import threading
 import types
 import unittest
+import uuid
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -338,6 +339,163 @@ class BridgeRuntimeTests(unittest.TestCase):
         self.assertEqual("video-server-id", created[0][1][0]["rawid"])
         self.assertTrue(created[0][2])
         self.assertEqual({}, bridge.pending_buffers)
+
+    def test_official_contact_is_filtered_before_inbound_handlers(self):
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = ""
+        config_module.BUFFER_SECONDS = 5
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "test-token"
+        requests_module = types.ModuleType("requests")
+        requests_module.exceptions = types.SimpleNamespace(
+            ConnectionError=ConnectionError,
+        )
+        official = {
+            "content": "[图片]",
+            "sourceName": "official-account",
+            "sessionId": "official-session",
+            "sessionType": "private",
+            "rawid": "official-server-id",
+            "timestamp": 100,
+        }
+        request_calls = []
+
+        class SseResponse:
+            status_code = 200
+
+            @staticmethod
+            def iter_lines(decode_unicode=False):
+                self.assertTrue(decode_unicode)
+                return ["data:" + json.dumps(official, ensure_ascii=False)]
+
+        class ContactsResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "success": True,
+                    "count": 1,
+                    "contacts": [
+                        {
+                            "username": "official-session",
+                            "displayName": "official-account",
+                            "type": "official",
+                        }
+                    ],
+                }
+
+        def get(url, **kwargs):
+            request_calls.append((url, kwargs))
+            if url.endswith("/api/v1/contacts"):
+                return ContactsResponse()
+            return SseResponse()
+
+        requests_module.get = get
+        bridge_core = self._load_bridge_core(
+            "bridge_official_filter_test",
+            state_module=state_module,
+            config_module=config_module,
+            requests_module=requests_module,
+        )
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge.start_timestamp = 99
+        buffered = []
+        money_candidates = []
+        bridge.add_to_buffer = buffered.append
+        bridge.money_actions = types.SimpleNamespace(
+            handle_sse=lambda data: money_candidates.append(data) or False
+        )
+
+        with self.assertLogs("ob11-bridge", level="INFO") as captured:
+            bridge.listen_sse()
+
+        self.assertEqual([], buffered)
+        self.assertEqual([], money_candidates)
+        self.assertEqual({"official-server-id"}, bridge.processed_ids)
+        self.assertTrue(
+            any("已过滤 official 类型入站消息" in line for line in captured.output)
+        )
+        contacts_calls = [
+            call for call in request_calls if call[0].endswith("/api/v1/contacts")
+        ]
+        self.assertEqual(1, len(contacts_calls))
+        _, contacts_kwargs = contacts_calls[0]
+        self.assertEqual(
+            {"keyword": "official-session", "limit": 100},
+            contacts_kwargs["params"],
+        )
+        self.assertEqual(
+            "Bearer test-token",
+            contacts_kwargs["headers"]["Authorization"],
+        )
+        self.assertEqual(
+            "official",
+            bridge._contact_type_cache["official-session"],
+        )
+
+    def test_official_channel_is_filtered_without_contact_lookup(self):
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = ""
+        config_module.BUFFER_SECONDS = 5
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "test-token"
+        requests_module = types.ModuleType("requests")
+        requests_module.exceptions = types.SimpleNamespace(
+            ConnectionError=ConnectionError,
+        )
+        official = {
+            "content": "[表情]",
+            "sourceName": "official-account",
+            "sessionId": "official-session",
+            "sessionType": "CHANNEL",
+            "rawid": "official-channel-id",
+            "timestamp": 100,
+        }
+        request_calls = []
+
+        class SseResponse:
+            status_code = 200
+
+            @staticmethod
+            def iter_lines(decode_unicode=False):
+                self.assertTrue(decode_unicode)
+                return ["data:" + json.dumps(official, ensure_ascii=False)]
+
+        def get(url, **kwargs):
+            request_calls.append((url, kwargs))
+            return SseResponse()
+
+        requests_module.get = get
+        bridge_core = self._load_bridge_core(
+            "bridge_official_channel_filter_test",
+            state_module=state_module,
+            config_module=config_module,
+            requests_module=requests_module,
+        )
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge.start_timestamp = 99
+        buffered = []
+        money_candidates = []
+        bridge.add_to_buffer = buffered.append
+        bridge.money_actions = types.SimpleNamespace(
+            handle_sse=lambda data: money_candidates.append(data) or False
+        )
+
+        bridge.listen_sse()
+
+        self.assertEqual([], buffered)
+        self.assertEqual([], money_candidates)
+        self.assertEqual({"official-channel-id"}, bridge.processed_ids)
+        self.assertFalse(
+            any(url.endswith("/api/v1/contacts") for url, _ in request_calls)
+        )
 
     def test_inbound_sticker_uses_media_processing_thread(self):
         state_module = types.ModuleType("state")
@@ -4253,6 +4411,234 @@ class BridgeRuntimeTests(unittest.TestCase):
                     _unsafe_logging_calls(source),
                     f"scanner rejected metadata-only log: {source}",
                 )
+
+    def _favorite_protocol_fixture(self, *, sender):
+        class FakeWebSocket:
+            def __init__(self):
+                self.payloads = []
+
+            async def send(self, payload):
+                self.payloads.append(json.loads(payload))
+
+        state_module = types.ModuleType("state")
+        state_module.sender_instance = sender
+        state_module._ob_ws = FakeWebSocket()
+        state_module._self_id_int = 99
+        state_module.running = sender is not None
+        state_module.is_generation_running = lambda _generation: True
+        state_module.get_sender_for_generation = lambda _generation: sender
+        state_module.record_send_result = lambda *_args, **_kwargs: None
+        state_module.get_group_route_binding = lambda group_id: (
+            {"routing_name": "group-route", "session": "group-session"}
+            if group_id == 456
+            else None
+        )
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = ["Akasha"]
+        config_module.BOT_WXID = "bot-account"
+        config_module.ASTRBOT_ATTACHMENTS = ""
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "token"
+        requests_module = types.ModuleType("requests")
+        requests_module.get = lambda *_args, **_kwargs: None
+        protocol = self._load_ob_protocol(
+            f"favorite_protocol_{uuid.uuid4().hex}",
+            state_module,
+            config_module,
+            requests_module,
+        )
+        return protocol, state_module
+
+    def test_favorite_action_accepts_exact_private_and_group_contracts(self):
+        class Sender:
+            def __init__(self):
+                self.calls = []
+
+            def send_favorite_sticker(self, *args):
+                self.calls.append(args)
+                return types.SimpleNamespace(
+                    confirmed=True,
+                    error_code="",
+                    error_stage="complete",
+                    committed=True,
+                    in_progress=False,
+                    cached=False,
+                )
+
+        sender = Sender()
+        protocol, state_module = self._favorite_protocol_fixture(sender=sender)
+        protocol._resolve_private_contact = (
+            lambda target: (
+                "private-route",
+                "bot-account",
+                "private-session",
+            )
+            if target == 123
+            else None
+        )
+        requests = (
+            {
+                "action": "send_wechat_favorite_sticker",
+                "params": {
+                    "user_id": 123,
+                    "sticker_key": "slot_07",
+                    "request_id": str(uuid.uuid4()),
+                },
+                "echo": "private",
+            },
+            {
+                "action": "send_wechat_favorite_sticker",
+                "params": {
+                    "group_id": 456,
+                    "sticker_key": "slot_20",
+                    "request_id": str(uuid.uuid4()),
+                },
+                "echo": "group",
+            },
+        )
+        for request in requests:
+            asyncio.run(protocol._handle_ob_api(request))
+
+        self.assertEqual(len(sender.calls), 2)
+        self.assertEqual(
+            sender.calls[0][:4],
+            (
+                "private-route",
+                "private-session",
+                "slot_07",
+                requests[0]["params"]["request_id"],
+            ),
+        )
+        self.assertEqual(
+            sender.calls[1][:4],
+            (
+                "group-route",
+                "group-session",
+                "slot_20",
+                requests[1]["params"]["request_id"],
+            ),
+        )
+        self.assertTrue(all(call[4] > 0 for call in sender.calls))
+        self.assertEqual(
+            [payload["echo"] for payload in state_module._ob_ws.payloads],
+            ["private", "group"],
+        )
+
+    def test_favorite_action_rejects_bad_schema_route_and_missing_sender(self):
+        class Sender:
+            def __init__(self):
+                self.calls = []
+
+            def send_favorite_sticker(self, *args):
+                self.calls.append(args)
+                raise AssertionError("invalid action reached sender")
+
+        sender = Sender()
+        protocol, state_module = self._favorite_protocol_fixture(sender=sender)
+        invalid_params = (
+            {
+                "user_id": 123,
+                "group_id": 456,
+                "sticker_key": "slot_01",
+                "request_id": str(uuid.uuid4()),
+            },
+            {
+                "user_id": 123,
+                "sticker_key": "slot_21",
+                "request_id": str(uuid.uuid4()),
+            },
+            {
+                "user_id": 123,
+                "sticker_key": "slot_01",
+                "request_id": "not-a-uuid",
+            },
+            {
+                "user_id": 123,
+                "sticker_key": "slot_01",
+                "request_id": str(uuid.uuid4()),
+                "x": 1,
+            },
+        )
+        for index, params in enumerate(invalid_params):
+            asyncio.run(
+                protocol._handle_ob_api(
+                    {
+                        "action": "send_wechat_favorite_sticker",
+                        "params": params,
+                        "echo": f"bad-{index}",
+                    }
+                )
+            )
+        asyncio.run(
+            protocol._handle_ob_api(
+                {
+                    "action": "send_wechat_favorite_sticker",
+                    "params": {
+                        "group_id": 999,
+                        "sticker_key": "slot_01",
+                        "request_id": str(uuid.uuid4()),
+                    },
+                    "echo": "missing-route",
+                }
+            )
+        )
+
+        self.assertEqual(sender.calls, [])
+        self.assertTrue(
+            all(
+                payload["status"] == "failed"
+                for payload in state_module._ob_ws.payloads
+            )
+        )
+        self.assertEqual(
+            state_module._ob_ws.payloads[-1]["data"]["error_code"],
+            "E_OB_GROUP_ROUTE",
+        )
+
+        stopped_protocol, stopped_state = self._favorite_protocol_fixture(
+            sender=None
+        )
+        asyncio.run(
+            stopped_protocol._handle_ob_api(
+                {
+                    "action": "send_wechat_favorite_sticker",
+                    "params": {
+                        "user_id": 1,
+                        "sticker_key": "slot_01",
+                        "request_id": str(uuid.uuid4()),
+                    },
+                    "echo": "stopped",
+                }
+            )
+        )
+        self.assertEqual(
+            stopped_state._ob_ws.payloads[-1]["data"]["error_code"],
+            "E_UIA_SENDER_STOPPED",
+        )
+
+    def test_unknown_action_fails_with_echo_and_never_calls_sender(self):
+        sender = types.SimpleNamespace(calls=[])
+        protocol, state_module = self._favorite_protocol_fixture(sender=sender)
+
+        asyncio.run(
+            protocol._handle_ob_api(
+                {
+                    "action": "unknown_mutation",
+                    "params": {},
+                    "echo": 0,
+                }
+            )
+        )
+
+        response = state_module._ob_ws.payloads[-1]
+        self.assertEqual(response["status"], "failed")
+        self.assertNotEqual(response["retcode"], 0)
+        self.assertEqual(response["echo"], 0)
+        self.assertEqual(
+            response["data"]["error_code"],
+            "E_OB_UNSUPPORTED_ACTION",
+        )
+        self.assertEqual(sender.calls, [])
 
 
 if __name__ == "__main__":

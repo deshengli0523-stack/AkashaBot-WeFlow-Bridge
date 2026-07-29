@@ -360,6 +360,35 @@ class Win32WeChatDriver:
             return False
         return self._query_window_identity(root) == bound
 
+    def _point_targets_bound_process(
+        self, hwnd: int, point: tuple[int, int]
+    ) -> bool:
+        """Accept the main window or one visible same-process WeChat popup."""
+        bound = self._ensure_bound_window_identity(hwnd)
+        child = int(self.user32.WindowFromPoint(_POINT(*point)) or 0)
+        if not child:
+            return False
+        root = int(self.user32.GetAncestor(child, GA_ROOT) or 0)
+        if not root or not self.user32.IsWindowVisible(root):
+            return False
+        try:
+            target = self._query_window_identity(root)
+        except CalibrationError:
+            return False
+        return target.pid == bound.pid and target.image == bound.image
+
+    def _foreground_targets_bound_process(self, hwnd: int) -> bool:
+        bound = self._ensure_bound_window_identity(hwnd)
+        foreground = int(self.user32.GetForegroundWindow() or 0)
+        root = int(self.user32.GetAncestor(foreground, GA_ROOT) or 0)
+        if not root:
+            return False
+        try:
+            target = self._query_window_identity(root)
+        except CalibrationError:
+            return False
+        return target.pid == bound.pid and target.image == bound.image
+
     def find_wechat_window(self) -> int:
         """Return a visible WeChat main-window HWND or raise CALIBRATION_WINDOW."""
         class_candidates = []
@@ -573,8 +602,19 @@ class Win32WeChatDriver:
         self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
-    def _capture_point_is_valid(self, hwnd: int, point: tuple[int, int]) -> bool:
-        if not self._point_targets_bound_window(hwnd, point):
+    def _capture_point_is_valid(
+        self,
+        hwnd: int,
+        point: tuple[int, int],
+        *,
+        allow_same_process_popup: bool = False,
+    ) -> bool:
+        point_validator = (
+            self._point_targets_bound_process
+            if allow_same_process_popup
+            else self._point_targets_bound_window
+        )
+        if not point_validator(hwnd, point):
             return False
         metrics = self.get_client_metrics(hwnd)
         return (
@@ -582,7 +622,12 @@ class Win32WeChatDriver:
             and metrics.top <= point[1] < metrics.top + metrics.height
         )
 
-    def capture_swallowed_click(self, hwnd: int) -> tuple[int, int] | None:
+    def capture_swallowed_click(
+        self,
+        hwnd: int,
+        *,
+        allow_same_process_popup: bool = False,
+    ) -> tuple[int, int] | None:
         """Swallow one complete left-click; Esc cancels and returns None."""
         self._ensure_bound_window_identity(hwnd)
         state = {
@@ -627,7 +672,11 @@ class Win32WeChatDriver:
                     and state["pending"][0] == "cancel"
                 ):
                     try:
-                        valid = self._capture_point_is_valid(hwnd, point)
+                        valid = self._capture_point_is_valid(
+                            hwnd,
+                            point,
+                            allow_same_process_popup=allow_same_process_popup,
+                        )
                     except Exception:
                         queue_outcome("error")
                     else:
@@ -699,6 +748,94 @@ class Win32WeChatDriver:
             raise CalibrationError(CALIBRATION_WINDOW)
         self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    def click_bound_process_ratio(
+        self, hwnd: int, point: Mapping[str, object]
+    ) -> None:
+        """Click a ratio only inside the bound WeChat process and client bounds."""
+        try:
+            ratio_x = point["x"]
+            ratio_y = point["y"]
+        except (KeyError, TypeError):
+            raise CalibrationError(CALIBRATION_INVALID) from None
+        if (
+            not _is_finite_number(ratio_x)
+            or not _is_finite_number(ratio_y)
+            or not 0 < ratio_x < 1
+            or not 0 < ratio_y < 1
+        ):
+            raise CalibrationError(CALIBRATION_INVALID)
+        metrics = self.get_client_metrics(hwnd)
+        if (
+            not metrics.visible
+            or not metrics.maximized
+            or metrics.width < 800
+            or metrics.height < 600
+            or not self._foreground_targets_bound_process(hwnd)
+        ):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        screen_point = screen_point_from_ratio(point, metrics)
+        if not self._point_targets_bound_process(hwnd, screen_point):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        if not self.user32.SetCursorPos(*screen_point):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    def move_bound_process_ratio(
+        self, hwnd: int, point: Mapping[str, object]
+    ) -> None:
+        """Move without clicking, only to a bound-process client point."""
+        try:
+            ratio_x = point["x"]
+            ratio_y = point["y"]
+        except (KeyError, TypeError):
+            raise CalibrationError(CALIBRATION_INVALID) from None
+        if (
+            not _is_finite_number(ratio_x)
+            or not _is_finite_number(ratio_y)
+            or not 0 < ratio_x < 1
+            or not 0 < ratio_y < 1
+        ):
+            raise CalibrationError(CALIBRATION_INVALID)
+        metrics = self.get_client_metrics(hwnd)
+        if (
+            not metrics.visible
+            or not metrics.maximized
+            or not self._foreground_targets_bound_process(hwnd)
+        ):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        screen_point = screen_point_from_ratio(point, metrics)
+        if not self._point_targets_bound_process(hwnd, screen_point):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        if not self.user32.SetCursorPos(*screen_point):
+            raise CalibrationError(CALIBRATION_WINDOW)
+
+    def capture_bound_process_client(self, hwnd: int):
+        """Capture the main client rectangle while its same-process popup is active."""
+        from PIL import ImageGrab
+
+        metrics = self.get_client_metrics(hwnd)
+        if (
+            not metrics.visible
+            or not metrics.maximized
+            or metrics.width < 800
+            or metrics.height < 600
+            or not self._foreground_targets_bound_process(hwnd)
+        ):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        try:
+            return ImageGrab.grab(
+                bbox=(
+                    metrics.left,
+                    metrics.top,
+                    metrics.left + metrics.width,
+                    metrics.top + metrics.height,
+                ),
+                all_screens=True,
+            ).convert("RGB")
+        except Exception:
+            raise CalibrationError(CALIBRATION_WINDOW) from None
 
     def click_receive_ratio(
         self,
@@ -792,6 +929,21 @@ class Win32WeChatDriver:
         """Press and release one virtual key."""
         self.user32.keybd_event(virtual_key, 0, 0, 0)
         self.user32.keybd_event(virtual_key, 0, KEYEVENTF_KEYUP, 0)
+
+    def press_key_bound_process(
+        self,
+        hwnd: int,
+        virtual_key: int,
+    ) -> None:
+        """Press a key only while the bound WeChat process owns foreground."""
+        metrics = self.get_client_metrics(hwnd)
+        if (
+            not metrics.visible
+            or not metrics.maximized
+            or not self._foreground_targets_bound_process(hwnd)
+        ):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        self.press_key(virtual_key)
 
     def copy_image_to_clipboard(self, image_path: str) -> None:
         """Copy one image as DIB using Pillow without logging the path."""

@@ -24,6 +24,7 @@
   "uia_fixed_pre_paste_preview_delay": 1.0,
   "uia_fixed_pre_send_delay": 5.0,
   "uia_fixed_settle_jitter_max_seconds": 0.25,
+  "favorite_sticker_receipt_timeout_seconds": 8.0,
   "money_receive_enabled": true,
   "money_receive_timeout_seconds": 180,
   "money_receipt_poll_seconds": 1,
