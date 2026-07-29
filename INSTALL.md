@@ -54,7 +54,7 @@ py -3.12 -c "import platform,sys; print(sys.version); print(platform.architectur
 
 `%LOCALAPPDATA%\AkashaBot-WeFlow-Bridge\data\astrbot\FIRST_LOGIN.txt`
 
-打开 `http://127.0.0.1:6185`，使用文件中的初始信息登录，立即修改 AstrBot 密码，并配置模型提供商与 API Key。确认新密码可以登录后安全删除 `FIRST_LOGIN.txt`。桥接面板位于 `http://127.0.0.1:8766`，会显示最近的完整联系人名称、群聊成员、收发方向和聊天正文。
+打开 `http://127.0.0.1:6185`，使用文件中的初始信息登录，立即修改 AstrBot 密码，并配置模型提供商与 API Key。确认新密码可以登录后安全删除 `FIRST_LOGIN.txt`。桥接面板位于 `http://127.0.0.1:8766`，会显示最近的完整联系人名称、收发方向和聊天正文。公众号、频道与所有群聊入站消息会在进入红包/转账、媒体和普通消息处理前过滤；主动向群聊发送消息的能力不受影响。
 
 ### 配置联系人记忆
 

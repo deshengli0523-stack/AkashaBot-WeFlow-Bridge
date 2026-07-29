@@ -302,13 +302,71 @@ class WeFlowBridge:
         self._contact_type_cache[session_id] = contact_type
         return contact_type
 
-    def _is_official_contact(self, data: dict) -> bool:
-        if _text_value(data.get("sessionType")).casefold() in {
-            "channel",
-            "official",
-        }:
-            return True
-        return self._contact_type(data) == "official"
+    def _is_group_inbound(self, data: dict) -> bool:
+        session_type = _text_value(data.get("sessionType")).casefold()
+        direct_types = {
+            _text_value(data.get(key)).casefold()
+            for key in ("contactType", "sourceType", "talkerType")
+        }
+        group_identifiers = (
+            data.get("sessionId"),
+            data.get("talkerId"),
+            data.get("sourceName"),
+        )
+        return (
+            session_type in {"group", "chatroom"}
+            or bool(_text_value(data.get("groupName")))
+            or bool(direct_types & {"group", "chatroom"})
+            or any(
+                "@chatroom" in _text_value(value).casefold()
+                for value in group_identifiers
+            )
+        )
+
+    def _remember_filtered_group_route(self, data: dict) -> None:
+        source_name = _text_value(
+            data.get("sourceName") or data.get("talkerName")
+        )
+        session_id = _text_value(
+            data.get("sessionId") or data.get("talkerId")
+        )
+        group_raw = _text_value(data.get("groupName")) or source_name
+        routing_name = re.sub(r"\s*\(\d+\)\s*$", "", group_raw).strip()
+        if not routing_name:
+            return
+
+        account = _account_identity()
+        try:
+            group_id = state._wxid_to_int(
+                routing_name,
+                account=account,
+                identity_type="group",
+            )
+            state._ob_id_to_contact[group_id] = routing_name
+            if session_id:
+                state.remember_group_route(
+                    group_id,
+                    account=account,
+                    session=session_id,
+                    routing_name=routing_name,
+                )
+        except Exception:
+            log.warning("群聊 route 元数据保存失败，仍过滤本条入站消息")
+
+    def _inbound_filter_type(self, data: dict) -> str:
+        if self._is_group_inbound(data):
+            return "group"
+
+        session_type = _text_value(data.get("sessionType")).casefold()
+        if session_type in {"channel", "official"}:
+            return "official"
+
+        contact_type = self._contact_type(data)
+        if contact_type in {"group", "chatroom"}:
+            return "group"
+        if contact_type == "official":
+            return "official"
+        return ""
 
     def should_ignore(self, data):
         content = _text_value(data.get("content"))
@@ -732,8 +790,14 @@ class WeFlowBridge:
                             if raw_id in self.processed_ids:
                                 continue
                             self.processed_ids.add(raw_id)
-                        if self._is_official_contact(data):
-                            log.info("⏭️ 已过滤 official 类型入站消息")
+                        filtered_type = self._inbound_filter_type(data)
+                        if filtered_type:
+                            if filtered_type == "group":
+                                self._remember_filtered_group_route(data)
+                            log.info(
+                                "⏭️ 已过滤 %s 类型入站消息",
+                                filtered_type,
+                            )
                             continue
                         if (
                             self.money_actions is not None
