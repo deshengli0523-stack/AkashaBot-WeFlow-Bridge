@@ -497,6 +497,188 @@ class BridgeRuntimeTests(unittest.TestCase):
             any(url.endswith("/api/v1/contacts") for url, _ in request_calls)
         )
 
+    def test_group_sources_are_filtered_before_inbound_handlers(self):
+        state_module = types.ModuleType("state")
+        state_module.group_reply_mode = "all"
+        state_module._ob_id_to_contact = {}
+        group_ids = {}
+        remembered_routes = []
+
+        def group_id_for(routing_name, *, account, identity_type):
+            self.assertEqual("wechat_bot", account)
+            self.assertEqual("group", identity_type)
+            return group_ids.setdefault(routing_name, len(group_ids) + 100)
+
+        state_module._wxid_to_int = group_id_for
+        state_module.remember_group_route = (
+            lambda group_id, **kwargs: remembered_routes.append(
+                (group_id, kwargs)
+            )
+        )
+        config_module = types.ModuleType("config")
+        config_module.BOT_NICKNAMES = []
+        config_module.BOT_WXID = ""
+        config_module.BUFFER_SECONDS = 5
+        config_module.WE_FLOW_BASE_URL = "http://127.0.0.1:5031"
+        config_module.ACCESS_TOKEN = "test-token"
+        requests_module = types.ModuleType("requests")
+        requests_module.exceptions = types.SimpleNamespace(
+            ConnectionError=ConnectionError,
+        )
+        group_messages = [
+            {
+                "content": "group by session type",
+                "sourceName": "group-one",
+                "sessionId": "group-one",
+                "sessionType": "GROUP",
+                "rawid": "group-session-type-id",
+                "timestamp": 100,
+            },
+            {
+                "content": "group by session id",
+                "sourceName": "group-two",
+                "sessionId": "group-two@chatroom",
+                "rawid": "group-session-id",
+                "timestamp": 101,
+            },
+            {
+                "content": "group by contact type",
+                "sourceName": "group-three",
+                "sessionId": "group-three",
+                "sessionType": "private",
+                "contactType": "chatroom",
+                "rawid": "group-contact-type-id",
+                "timestamp": 102,
+            },
+            {
+                "content": "group by group name",
+                "sourceName": "group-member",
+                "groupName": "group-four(8)",
+                "sessionId": "group-four-session",
+                "rawid": "group-name-id",
+                "timestamp": 103,
+            },
+            {
+                "content": "group by talker id",
+                "sourceName": "group-five",
+                "talkerId": "group-five@chatroom",
+                "rawid": "group-talker-id",
+                "timestamp": 104,
+            },
+        ]
+        request_calls = []
+
+        class SseResponse:
+            status_code = 200
+
+            @staticmethod
+            def iter_lines(decode_unicode=False):
+                self.assertTrue(decode_unicode)
+                return [
+                    "data:" + json.dumps(message, ensure_ascii=False)
+                    for message in group_messages
+                ]
+
+        def get(url, **kwargs):
+            request_calls.append((url, kwargs))
+            return SseResponse()
+
+        requests_module.get = get
+        bridge_core = self._load_bridge_core(
+            "bridge_group_filter_test",
+            state_module=state_module,
+            config_module=config_module,
+            requests_module=requests_module,
+        )
+        bridge = bridge_core.WeFlowBridge(sender=None)
+        bridge.start_timestamp = 99
+        buffered = []
+        money_candidates = []
+        bridge.add_to_buffer = buffered.append
+        bridge.money_actions = types.SimpleNamespace(
+            handle_sse=lambda data: money_candidates.append(data) or False
+        )
+
+        with self.assertLogs("ob11-bridge", level="INFO") as captured:
+            bridge.listen_sse()
+
+        self.assertEqual([], buffered)
+        self.assertEqual([], money_candidates)
+        self.assertEqual(
+            {
+                "group-contact-type-id",
+                "group-name-id",
+                "group-session-id",
+                "group-session-type-id",
+                "group-talker-id",
+            },
+            bridge.processed_ids,
+        )
+        self.assertEqual(
+            5,
+            sum(
+                "已过滤 group 类型入站消息" in line
+                for line in captured.output
+            ),
+        )
+        for message in group_messages:
+            self.assertFalse(
+                any(
+                    message["content"] in line
+                    for line in captured.output
+                )
+            )
+        self.assertEqual(
+            {
+                group_ids["group-one"]: "group-one",
+                group_ids["group-two"]: "group-two",
+                group_ids["group-three"]: "group-three",
+                group_ids["group-four"]: "group-four",
+                group_ids["group-five"]: "group-five",
+            },
+            state_module._ob_id_to_contact,
+        )
+        self.assertEqual(
+            {
+                (
+                    group_ids["group-one"],
+                    "group-one",
+                    "group-one",
+                ),
+                (
+                    group_ids["group-two"],
+                    "group-two@chatroom",
+                    "group-two",
+                ),
+                (
+                    group_ids["group-three"],
+                    "group-three",
+                    "group-three",
+                ),
+                (
+                    group_ids["group-four"],
+                    "group-four-session",
+                    "group-four",
+                ),
+                (
+                    group_ids["group-five"],
+                    "group-five@chatroom",
+                    "group-five",
+                ),
+            },
+            {
+                (
+                    group_id,
+                    route["session"],
+                    route["routing_name"],
+                )
+                for group_id, route in remembered_routes
+            },
+        )
+        self.assertFalse(
+            any(url.endswith("/api/v1/contacts") for url, _ in request_calls)
+        )
+
     def test_inbound_sticker_uses_media_processing_thread(self):
         state_module = types.ModuleType("state")
         state_module.group_reply_mode = "all"

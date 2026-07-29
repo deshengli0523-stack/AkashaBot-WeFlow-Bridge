@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.3 - 2026-07-29
+
+- Filter every group-chat inbound event before money handling, media
+  processing, message buffering, or forwarding to AstrBot.
+- Recognize group sources from `sessionType=group/chatroom`, a session ID
+  or talker ID containing `@chatroom`, a non-empty `groupName`, or a direct
+  `contactType/sourceType/talkerType` value of `group/chatroom`.
+- Retain only the group name and stable session route needed for explicit
+  outbound group sends; group message bodies are not buffered or forwarded.
+- Keep private-contact inbound handling and explicit outbound group sends
+  unchanged.
+
+### Automated verification
+
+- All PowerShell release suites and 302 Python tests pass. Group-filter
+  regression tests cover each supported WeFlow group marker, prove that
+  neither ordinary buffering nor money handling receives the event, and
+  confirm that outbound group route metadata remains available.
+
 ## 0.4.2 - 2026-07-29
 
 - Add an AstrBot 4.26.6 model tool for sending one native WeChat favorite
