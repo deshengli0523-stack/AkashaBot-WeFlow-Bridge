@@ -26,6 +26,11 @@ from .akasha_memory.weflow_sync import WeFlowSync
 
 PLUGIN_NAME = "astrbot_plugin_akasha_contact_memory"
 ASTRBOT_LOADED_MARKER = "_akasha_contact_memory_astrbot_loaded"
+_on_decorating_result = getattr(
+    filter,
+    "on_decorating_result",
+    lambda *args, **kwargs: (lambda function: function),
+)
 
 
 def _value(config: dict, key: str, default: Any) -> Any:
@@ -235,6 +240,34 @@ class Main(Star):
         self.memory_provider = memory_provider
         self._effective_mode = effective_mode
         self.runtime = runtime
+        try:
+            setattr(
+                self.context,
+                "akasha_memory_pre_action_terminal",
+                self._record_merged_pre_action_terminal,
+            )
+            setattr(
+                self.context,
+                "akasha_memory_acceptance",
+                self._mark_merged_reply_acceptance,
+            )
+            setattr(
+                self.context,
+                "akasha_memory_recovery_records",
+                self._merged_reply_recovery_records,
+            )
+            setattr(
+                self.context,
+                "akasha_memory_recovery_acceptance",
+                self._recover_merged_reply_acceptance,
+            )
+            setattr(
+                self.context,
+                "akasha_memory_recovery_terminal",
+                self._recover_merged_reply_terminal,
+            )
+        except Exception:
+            logger.warning("Akasha 联系人记忆无法发布 pre-action 对账接口。")
         logger.info(
             "Akasha 联系人记忆插件已启动：mode=%s, qwen_ready=%s",
             self._effective_mode,
@@ -275,7 +308,7 @@ class Main(Star):
 
     @filter.event_message_type(
         filter.EventMessageType.PRIVATE_MESSAGE,
-        priority=20_000,
+        priority=41_000,
     )
     async def handle_bridge_send_result(self, event: AstrMessageEvent) -> None:
         message_obj = getattr(event, "message_obj", None)
@@ -285,7 +318,33 @@ class Main(Star):
             or raw.get("notice_type") != "akasha_send_result"
         ):
             return
-        # This bridge-only notice is control traffic, never a user message.
+        outcome = str(raw.get("outcome") or "")
+        if (
+            raw.get("akasha_send_result_schema") == 2
+            and outcome
+        ):
+            try:
+                if self.runtime is None:
+                    raise RuntimeError("memory runtime unavailable")
+                status = await self.runtime.apply_merged_send_result(event)
+                event.set_extra("akasha_memory_result_status", status)
+                if outcome == "sent":
+                    logger.info(
+                        "Akasha 联系人合并回复结果已按 request 精确应用。"
+                    )
+                elif outcome == "commit_unknown":
+                    logger.warning(
+                        "Akasha 联系人合并回复提交结果未知；保留待确认记录。"
+                    )
+            except Exception as exc:
+                event.set_extra("akasha_memory_result_status", "failed")
+                logger.error(
+                    "Akasha 联系人合并回复结果未应用，Bridge 将保留 outbox：%s",
+                    type(exc).__name__,
+                )
+            return
+        # Legacy v1 control events are consumed here.  Schema v2 continues to
+        # the merged-reply 40k handler, which owns stop_event() and ACK.
         event.stop_event()
         if self.runtime and raw.get("success") is True:
             if await self.runtime.record_send_success(event):
@@ -300,6 +359,97 @@ class Main(Star):
             logger.warning(
                 "Akasha 联系人回复未实际发出；"
                 "已将该联系人的云端会话标记为需要重建。"
+            )
+
+    async def _record_merged_pre_action_terminal(
+        self,
+        event: AstrMessageEvent,
+        outcome: str,
+        reason: str,
+    ) -> bool:
+        if self.runtime is None:
+            return False
+        return await self.runtime.record_merged_pre_action_terminal(
+            event,
+            outcome,
+            reason,
+        )
+
+    async def _mark_merged_reply_acceptance(
+        self,
+        event: AstrMessageEvent,
+        status: str,
+    ) -> bool:
+        if self.runtime is None:
+            return False
+        return await self.runtime.mark_merged_reply_acceptance(event, status)
+
+    async def _merged_reply_recovery_records(self) -> list[dict[str, Any]]:
+        if self.runtime is None:
+            return []
+        return await self.runtime.merged_reply_recovery_records()
+
+    async def _recover_merged_reply_acceptance(self, request_id: str) -> bool:
+        if self.runtime is None:
+            return False
+        return await self.runtime.recover_merged_reply_acceptance(request_id)
+
+    async def _recover_merged_reply_terminal(
+        self,
+        request_id: str,
+        outcome: str,
+        reason: str,
+    ) -> bool:
+        if self.runtime is None:
+            return False
+        return await self.runtime.recover_merged_reply_terminal(
+            request_id,
+            outcome=outcome,
+            reason=reason,
+        )
+
+    @_on_decorating_result(priority=-25_000)
+    async def bind_merged_reply_result(self, event: AstrMessageEvent) -> None:
+        if not event.get_extra("akasha_merged_claimed", False):
+            return
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        request_id = str(
+            event.get_extra("akasha_merged_request_id", "") or ""
+        )
+        text = str(
+            event.get_extra("akasha_merged_normalized_text", "") or ""
+        )
+        try:
+            if self.runtime is None or not isinstance(raw, dict):
+                raise RuntimeError("memory runtime unavailable")
+            target_id = int(raw.get("user_id"))
+            generation = int(raw.get("bridge_generation"))
+            reply_epoch = int(raw.get("reply_epoch"))
+            if (
+                not request_id
+                or not text
+                or target_id <= 0
+                or generation <= 0
+                or reply_epoch <= 0
+            ):
+                raise ValueError("invalid merged reply binding")
+            status = await self.runtime.bind_merged_reply(
+                event,
+                request_id=request_id,
+                target_id=target_id,
+                bridge_generation=generation,
+                reply_epoch=reply_epoch,
+                admission_token=str(raw.get("admission_token") or ""),
+                text=text,
+                applicable=self._effective_mode == "active",
+            )
+            event.set_extra("akasha_memory_bind_status", status)
+        except Exception as exc:
+            event.set_extra("akasha_memory_bind_status", "failed")
+            logger.error(
+                "Akasha 联系人记忆 request 绑定失败，已阻止发送：%s",
+                type(exc).__name__,
             )
 
     @filter.event_message_type(
@@ -474,6 +624,46 @@ class Main(Star):
             self.memory_provider = None
             self.source_provider = None
             self._effective_mode = "off"
+            try:
+                if getattr(
+                    self.context,
+                    "akasha_memory_pre_action_terminal",
+                    None,
+                ) == self._record_merged_pre_action_terminal:
+                    delattr(
+                        self.context,
+                        "akasha_memory_pre_action_terminal",
+                    )
+            except Exception:
+                pass
+            try:
+                if getattr(
+                    self.context,
+                    "akasha_memory_acceptance",
+                    None,
+                ) == self._mark_merged_reply_acceptance:
+                    delattr(self.context, "akasha_memory_acceptance")
+            except Exception:
+                pass
+            for attribute, callback in (
+                (
+                    "akasha_memory_recovery_records",
+                    self._merged_reply_recovery_records,
+                ),
+                (
+                    "akasha_memory_recovery_acceptance",
+                    self._recover_merged_reply_acceptance,
+                ),
+                (
+                    "akasha_memory_recovery_terminal",
+                    self._recover_merged_reply_terminal,
+                ),
+            ):
+                try:
+                    if getattr(self.context, attribute, None) == callback:
+                        delattr(self.context, attribute)
+                except Exception:
+                    pass
             try:
                 if memory_provider:
                     manager = self.context.provider_manager

@@ -9,12 +9,19 @@ Web 控制面板模块。
 import json
 import logging
 import math
+import os
+import sys
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
+
+_BRIDGE_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BRIDGE_MODULE_DIR not in sys.path:
+    sys.path.insert(0, _BRIDGE_MODULE_DIR)
 
 import state
 import config
 from money_service import MoneyRequestError
+from reply_store import default_store
 from uia_support import CalibrationError, validate_calibration
 
 log = logging.getLogger("ob11-bridge")
@@ -319,6 +326,16 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
       <div class="send-result-message" id="sendResultMessage"></div>
     </div>
 
+    <div class="send-result" id="draftQuarantinePanel" role="status" aria-live="polite">
+      <div class="send-result-title">草稿内容发生变化，已暂停该联系人自动回复</div>
+      <div class="send-result-message" id="draftQuarantines"></div>
+    </div>
+
+    <div class="send-result" id="commitUnknownPanel" role="status" aria-live="polite">
+      <div class="send-result-title">发送按钮已触发，但无法确认微信是否提交</div>
+      <div class="send-result-message" id="commitUnknownRows"></div>
+    </div>
+
     <div class="btn-row">
       <button class="btn btn-pink" id="btnStart" onclick="action('start')">启动</button>
       <button class="btn btn-red" id="btnStop" onclick="action('stop')" disabled>停止</button>
@@ -407,7 +424,7 @@ function refreshDashboard() {
     document.getElementById('obStatus').style.color = s.ob_connected ? '#4caf50' : '#bdbdbd';
     document.getElementById('weflowStatus').textContent = s.weflow_connected ? '已连接' : '未连接';
     document.getElementById('weflowStatus').style.color = s.weflow_connected ? '#4caf50' : '#bdbdbd';
-    document.getElementById('sendMethod').textContent = s.sender_mode + (s.calibrated ? '（已标定）' : '（待标定）');
+    document.getElementById('sendMethod').textContent = s.sender_mode + (s.calibrated ? '（已标定）' : '（待标定）') + (s.merged_reply_ready ? ' · 合并就绪' : ' · 合并未就绪');
 
     var preview = s.send_preview;
     var previewPanel = document.getElementById('sendPreview');
@@ -470,6 +487,74 @@ function refreshDashboard() {
 
     document.getElementById('modeStatus').textContent = modeMap[s.group_reply_mode] || s.group_reply_mode;
 
+  });
+}
+
+function refreshDraftQuarantines() {
+  fetch('/draft-quarantines').then(function(r){return r.json()}).then(function(data){
+    var rows = Array.isArray(data.quarantines) ? data.quarantines : [];
+    var panel = document.getElementById('draftQuarantinePanel');
+    var body = document.getElementById('draftQuarantines');
+    if (!rows.length) {
+      panel.className = 'send-result';
+      body.textContent = '';
+      return;
+    }
+    panel.className = 'send-result active failed';
+    while (body.firstChild) body.removeChild(body.firstChild);
+    rows.forEach(function(row){
+      var line = document.createElement('div');
+      line.textContent = '目标 ' + row.target_id + '：请先人工检查微信输入框。 ';
+      var button = document.createElement('button');
+      button.className = 'btn btn-outline';
+      button.textContent = '我已人工检查，恢复此联系人';
+      button.onclick = function(){
+        fetch('/resolve-draft-quarantine', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({target_id:row.target_id,request_id:row.request_id}),
+        }).then(function(r){return r.json()}).then(function(){refreshDraftQuarantines();});
+      };
+      line.appendChild(button);
+      body.appendChild(line);
+    });
+  });
+}
+
+function refreshCommitUnknown() {
+  fetch('/commit-unknown').then(function(r){return r.json()}).then(function(data){
+    var rows = Array.isArray(data.rows) ? data.rows : [];
+    var panel = document.getElementById('commitUnknownPanel');
+    var body = document.getElementById('commitUnknownRows');
+    if (!rows.length) {
+      panel.className = 'send-result';
+      body.replaceChildren();
+      return;
+    }
+    panel.className = 'send-result active failed';
+    body.replaceChildren();
+    rows.forEach(function(row){
+      var line = document.createElement('div');
+      line.textContent = '目标 ' + row.target_id + '：请查看微信聊天记录后确认。 ';
+      [['已发送','sent'],['未发送','not_sent']].forEach(function(choice){
+        var button = document.createElement('button');
+        button.className = 'btn btn-outline';
+        button.textContent = choice[0];
+        button.onclick = function(){
+          fetch('/resolve-commit-unknown', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+              request_id:row.request_id,
+              revision:row.result_revision,
+              resolution:choice[1]
+            }),
+          }).then(function(r){return r.json()}).then(function(){refreshCommitUnknown();});
+        };
+        line.appendChild(button);
+      });
+      body.appendChild(line);
+    });
   });
 }
 
@@ -559,7 +644,8 @@ function renderConfigForm(cfg) {
       {key:'astrbot_attachments', label:'附件目录（AstrBot 存放图片的路径）', type:'text', ph:'C:\\astrbot\\attachments'},
     ]},
     {title:'桥接设置', fields:[
-      {key:'buffer_seconds', label:'消息缓冲(秒)', type:'number', ph:'5'},
+      {key:'buffer_quiet_seconds', label:'消息静默合并窗口(秒)', type:'number', ph:'1.5'},
+      {key:'buffer_max_seconds', label:'单批最长等待(秒)', type:'number', ph:'5'},
       {key:'group_reply_mode', label:'群聊回复模式', type:'select', opts:[{v:'mention',l:'仅@回复'},{v:'all',l:'全部回复'},{v:'batch',l:'批处理'}]},
       {key:'web_port', label:'Web 面板端口', type:'number', ph:'8766'},
       {key:'uia_fixed_pre_paste_preview_delay', label:'粘贴前预览(秒)', type:'number', ph:'1'},
@@ -647,8 +733,12 @@ function saveConfig() {
 // ===== 初始化 =====
 refreshDashboard();
 refreshChatHistory();
+refreshDraftQuarantines();
+refreshCommitUnknown();
 setInterval(refreshDashboard, 500);
 setInterval(refreshChatHistory, 2000);
+setInterval(refreshDraftQuarantines, 2000);
+setInterval(refreshCommitUnknown, 2000);
 </script>
 </body>
 </html>"""
@@ -716,6 +806,14 @@ def _public_config(value: dict[str, object]) -> dict[str, object]:
         config.UIA_FIXED_SETTLE_JITTER_MAX_SECONDS,
     )
     public.setdefault(
+        "buffer_quiet_seconds",
+        getattr(config, "BUFFER_QUIET_SECONDS", 1.5),
+    )
+    public.setdefault(
+        "buffer_max_seconds",
+        getattr(config, "BUFFER_MAX_SECONDS", 5.0),
+    )
+    public.setdefault(
         "video_caption_prompt",
         getattr(
             config,
@@ -774,6 +872,23 @@ def _merge_public_config(
             ):
                 raise ValueError("invalid UIA review delay")
             field_value = float(field_value)
+        if key in {"buffer_quiet_seconds", "buffer_max_seconds"}:
+            if isinstance(field_value, bool) or not isinstance(
+                field_value,
+                (int, float),
+            ):
+                raise ValueError("invalid buffer timing")
+            minimum, maximum = (
+                (0.2, 10.0)
+                if key == "buffer_quiet_seconds"
+                else (0.2, 30.0)
+            )
+            if (
+                not math.isfinite(float(field_value))
+                or not minimum <= float(field_value) <= maximum
+            ):
+                raise ValueError("invalid buffer timing")
+            field_value = float(field_value)
         if key == "video_caption_max_mib":
             if (
                 isinstance(field_value, bool)
@@ -810,6 +925,21 @@ def _merge_public_config(
             if not isinstance(field_value, str) or not field_value.strip():
                 continue
         current[key] = field_value
+    resolver = getattr(config, "resolve_buffer_windows", None)
+    if callable(resolver):
+        quiet, maximum, rejected_pair = resolver(current)
+        if rejected_pair:
+            raise ValueError("buffer max must not be shorter than quiet window")
+    else:
+        quiet = float(current.get("buffer_quiet_seconds", 1.5))
+        maximum = float(
+            current.get("buffer_max_seconds", current.get("buffer_seconds", 5.0))
+        )
+        if maximum < quiet:
+            raise ValueError("buffer max must not be shorter than quiet window")
+    current["buffer_quiet_seconds"] = quiet
+    current["buffer_max_seconds"] = maximum
+    current["buffer_seconds"] = maximum
     return current
 
 
@@ -837,8 +967,17 @@ class WebHandler(BaseHTTPRequestHandler):
                     else {"active": False}
                 ),
             }
+            merged_health = getattr(state, "merged_reply_health", None)
+            if callable(merged_health):
+                status.update(merged_health())
             status.update(_sender_status())
             self.send_json(status)
+        elif request.path == "/draft-quarantines":
+            self.send_json(
+                {"quarantines": default_store().list_quarantines()}
+            )
+        elif request.path == "/commit-unknown":
+            self.send_json({"rows": default_store().list_commit_unknown()})
         elif request.path in {
             "/api/money-action/frame",
             "/api/money-action/status",
@@ -926,8 +1065,14 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True})
         elif request_path == "/stop":
             from main import _stop_bridge
-            _stop_bridge()
-            self.send_json({"ok": True})
+            try:
+                _stop_bridge()
+                self.send_json({"ok": True})
+            except RuntimeError as error:
+                code = str(error)
+                if not code.startswith("E_MERGED_REPLY_STOP_"):
+                    code = "E_BRIDGE_STOP"
+                self.send_json({"ok": False, "error": code}, 409)
         elif request_path == "/pause":
             state.paused.set()
             log.info("[Web] 已暂停")
@@ -951,6 +1096,54 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "cancelled": cancelled})
             except Exception:
                 self.send_json({"ok": False, "error": "E_CANCEL_REQUEST"}, 400)
+        elif request_path == "/resolve-draft-quarantine":
+            try:
+                payload = self.read_json_body(4096)
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != {"target_id", "request_id"}
+                    or isinstance(payload["target_id"], bool)
+                    or not isinstance(payload["target_id"], int)
+                    or payload["target_id"] <= 0
+                    or not isinstance(payload["request_id"], str)
+                    or not payload["request_id"].strip()
+                ):
+                    raise ValueError("invalid quarantine identity")
+                resolved = state.clear_reply_draft_quarantine(
+                    payload["target_id"],
+                    payload["request_id"],
+                )
+                self.send_json({"ok": True, "resolved": resolved})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.send_json(
+                    {"ok": False, "error": "E_DRAFT_QUARANTINE_REQUEST"},
+                    400,
+                )
+        elif request_path == "/resolve-commit-unknown":
+            try:
+                payload = self.read_json_body(4096)
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != {"request_id", "revision", "resolution"}
+                    or not isinstance(payload["request_id"], str)
+                    or not payload["request_id"].strip()
+                    or isinstance(payload["revision"], bool)
+                    or not isinstance(payload["revision"], int)
+                    or payload["revision"] <= 0
+                    or payload["resolution"] not in {"sent", "not_sent"}
+                ):
+                    raise ValueError("invalid commit resolution")
+                resolved = default_store().resolve_commit_unknown(
+                    payload["request_id"],
+                    payload["revision"],
+                    payload["resolution"],
+                )
+                self.send_json({"ok": True, "resolved": resolved})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.send_json(
+                    {"ok": False, "error": "E_COMMIT_UNKNOWN_REQUEST"},
+                    400,
+                )
         elif request_path == "/mode":
             mode_order = ["mention", "all", "batch"]
             idx = mode_order.index(state.group_reply_mode) if state.group_reply_mode in mode_order else -1
@@ -987,6 +1180,15 @@ class WebHandler(BaseHTTPRequestHandler):
                 # 运行时同步 group_reply_mode
                 if "group_reply_mode" in new_cfg:
                     state.group_reply_mode = new_cfg["group_reply_mode"]
+                if "buffer_quiet_seconds" in new_cfg:
+                    config.BUFFER_QUIET_SECONDS = float(
+                        new_cfg["buffer_quiet_seconds"]
+                    )
+                if "buffer_max_seconds" in new_cfg:
+                    config.BUFFER_MAX_SECONDS = float(
+                        new_cfg["buffer_max_seconds"]
+                    )
+                    config.BUFFER_SECONDS = config.BUFFER_MAX_SECONDS
                 if "uia_fixed_pre_paste_preview_delay" in new_cfg:
                     delay = float(new_cfg["uia_fixed_pre_paste_preview_delay"])
                     config.UIA_FIXED_PRE_PASTE_PREVIEW_DELAY = delay

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- Add contact-scoped merged replies: each private inbound batch advances a
+  durable reply epoch, and a newer epoch supersedes older model work and
+  queued UI sends until the exact WeChat commit boundary.
+- Persist raw ingress, admissions, send jobs, UI stages, result notices,
+  acknowledgements, draft quarantines, and restart recovery in SQLite WAL.
+- Collapse each claimed AstrBot result into one normalized Bridge action;
+  disable streaming without rewriting an existing segmented-reply object or
+  falling back to the default sender after claim.
+- Split inbound buffering into a quiet window and a hard maximum while
+  preserving legacy `buffer_seconds` and existing post-paste review delays.
+- Bind merged results to the exact pending contact-memory output and apply
+  revisioned receipts without allowing stale notices to regress newer state.
+- Keep readiness closed until paged restart reconciliation completes, and
+  drain accepted sends through the durable commit boundary before shutdown.
+
+### Automated verification
+
+- All seven PowerShell release suites and 314 Python tests pass through
+  `tests\Run-All.ps1`.
+
 ## 0.4.3 - 2026-07-29
 
 - Filter every group-chat inbound event before money handling, media

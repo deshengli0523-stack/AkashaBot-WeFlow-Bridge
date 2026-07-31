@@ -109,6 +109,7 @@ class UiaFixedSenderTests(unittest.TestCase):
         self.driver = FakeDriver()
         self.sleep_calls = []
         sender_module.state.running = True
+        sender_module.state.stopping = False
         sender_module.state.paused.clear()
         sender_module.state.sender_instance = None
         if hasattr(sender_module.state, "clear_last_send_result"):
@@ -119,6 +120,7 @@ class UiaFixedSenderTests(unittest.TestCase):
 
     def tearDown(self):
         sender_module.state.running = False
+        sender_module.state.stopping = False
         sender_module.state.paused.clear()
 
     def _sender(self, driver=None, **changes):
@@ -469,7 +471,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("click", "first_result", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
-                ("press_key", 0x08),
+                ("press_key_bound", 101, 0x08),
                 ("copy_text", "private-body"),
                 ("hotkey_ctrl", 0x56),
                 ("click", "send_button", 101),
@@ -521,7 +523,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                 ("click", "first_result", 101),
                 ("click", "message_input", 101),
                 ("hotkey_ctrl", 0x41),
-                ("press_key", 0x08),
+                ("press_key_bound", 101, 0x08),
                 ("copy_image", image_path),
                 ("hotkey_ctrl", 0x56),
                 ("click", "send_button", 101),
@@ -540,6 +542,7 @@ class UiaFixedSenderTests(unittest.TestCase):
                 if name == "send_button" and not self.submit_interrupted:
                     self.events.append(("click_blocked", name, hwnd))
                     self.submit_interrupted = True
+                    sender_module.state.stopping = True
                     self.metrics = valid_metrics(foreground=False)
                     raise CalibrationError(CALIBRATION_WINDOW)
                 super().click_ratio(hwnd, point)
@@ -557,7 +560,10 @@ class UiaFixedSenderTests(unittest.TestCase):
         sender = self._sender(driver)
 
         with self.assertLogs("weflow-bridge", logging.WARNING) as captured:
-            sent = self._send_text(sender)
+            try:
+                sent = self._send_text(sender)
+            finally:
+                sender_module.state.stopping = False
 
         self.assertIs(sent, True, driver.events)
         self.assertEqual(
@@ -1238,6 +1244,9 @@ class UiaFixedSenderTests(unittest.TestCase):
         )
         preview_id = sender_module.state.get_send_preview()["preview_id"]
 
+        sender_module.state.stopping = True
+        self.assertFalse(sender_module.state.try_commit_send(cancel_event))
+        sender_module.state.stopping = False
         self.assertTrue(sender_module.state.try_commit_send(cancel_event))
         self.assertFalse(
             sender_module.state.cancel_current_preview(preview_id)

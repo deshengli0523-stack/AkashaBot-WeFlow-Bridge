@@ -31,8 +31,10 @@ from favorite_sticker import (
 log = logging.getLogger("weflow-bridge")
 
 VK_A = 0x41
+VK_C = 0x43
 VK_V = 0x56
 VK_BACKSPACE = 0x08
+VK_ESCAPE = 0x1B
 
 _FAVORITE_ENTRY_TO_TAB_DELAY_RANGE = (0.8, 1.3)
 _FAVORITE_TAB_TO_SLOT_DELAY_RANGE = (0.9, 1.5)
@@ -353,8 +355,208 @@ class UiaFixedSender:
         self._click(hwnd, "message_input")
         self.driver.hotkey_ctrl(VK_A)
         self._pause(0.05)
-        self.driver.press_key(VK_BACKSPACE)
+        press_bound = getattr(self.driver, "press_key_bound_process", None)
+        if not callable(press_bound):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        press_bound(hwnd, VK_BACKSPACE)
         self._pause(0.05)
+
+    @staticmethod
+    def _canonical_draft_text(value: object) -> str:
+        normalized = str(value).replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.rstrip(" \t") for line in normalized.split("\n")]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        output = []
+        blank = 0
+        for line in lines:
+            if line == "":
+                blank += 1
+                if blank <= 1:
+                    output.append("")
+            else:
+                blank = 0
+                output.append(line)
+        return "\n".join(output)
+
+    @staticmethod
+    def _clipboard_sequence_number() -> int | None:
+        if os.name != "nt":
+            return None
+        try:
+            import ctypes
+
+            return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _snapshot_clipboard() -> dict[str, object] | None:
+        """Capture every HGLOBAL clipboard format or fail without mutation."""
+
+        try:
+            import pyperclip
+
+            if os.name != "nt":
+                return {
+                    "mode": "text",
+                    "text": str(pyperclip.paste()),
+                    "sequence": None,
+                }
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            user32.OpenClipboard.argtypes = [wintypes.HWND]
+            user32.OpenClipboard.restype = wintypes.BOOL
+            user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
+            user32.EnumClipboardFormats.restype = wintypes.UINT
+            user32.GetClipboardData.argtypes = [wintypes.UINT]
+            user32.GetClipboardData.restype = wintypes.HANDLE
+            kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalSize.restype = ctypes.c_size_t
+            kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalLock.restype = wintypes.LPVOID
+            kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalUnlock.restype = wintypes.BOOL
+            if not user32.OpenClipboard(None):
+                return None
+            try:
+                formats: list[tuple[int, bytes]] = []
+                clipboard_format = 0
+                while True:
+                    clipboard_format = int(
+                        user32.EnumClipboardFormats(clipboard_format)
+                    )
+                    if clipboard_format == 0:
+                        break
+                    handle = user32.GetClipboardData(clipboard_format)
+                    if not handle:
+                        return None
+                    size = int(kernel32.GlobalSize(handle))
+                    if size <= 0:
+                        # Bitmap/owner-display handles are not losslessly
+                        # restorable through HGLOBAL; fail closed.
+                        return None
+                    pointer = kernel32.GlobalLock(handle)
+                    if not pointer:
+                        return None
+                    try:
+                        formats.append(
+                            (clipboard_format, ctypes.string_at(pointer, size))
+                        )
+                    finally:
+                        kernel32.GlobalUnlock(handle)
+                return {
+                    "mode": "win32",
+                    "formats": formats,
+                    "sequence": int(user32.GetClipboardSequenceNumber()),
+                }
+            finally:
+                user32.CloseClipboard()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _restore_clipboard(
+        snapshot: dict[str, object],
+        *,
+        expected_sequence: int | None,
+        expected_text: str,
+    ) -> bool:
+        """Restore only if no program changed the probe clipboard."""
+
+        try:
+            import pyperclip
+
+            if str(pyperclip.paste()) != expected_text:
+                return False
+            current_sequence = UiaFixedSender._clipboard_sequence_number()
+            if (
+                expected_sequence is not None
+                and current_sequence != expected_sequence
+            ):
+                return False
+            if snapshot.get("mode") == "text":
+                pyperclip.copy(str(snapshot.get("text") or ""))
+                return True
+            if snapshot.get("mode") != "win32" or os.name != "nt":
+                return False
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            user32.OpenClipboard.argtypes = [wintypes.HWND]
+            user32.OpenClipboard.restype = wintypes.BOOL
+            user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+            user32.SetClipboardData.restype = wintypes.HANDLE
+            kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+            kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+            kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalLock.restype = wintypes.LPVOID
+            kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalUnlock.restype = wintypes.BOOL
+            if not user32.OpenClipboard(None):
+                return False
+            allocated: list[int] = []
+            try:
+                if not user32.EmptyClipboard():
+                    return False
+                for clipboard_format, data in snapshot.get("formats", []):
+                    handle = kernel32.GlobalAlloc(0x0002, len(data))
+                    if not handle:
+                        return False
+                    pointer = kernel32.GlobalLock(handle)
+                    if not pointer:
+                        return False
+                    try:
+                        ctypes.memmove(pointer, data, len(data))
+                    finally:
+                        kernel32.GlobalUnlock(handle)
+                    if not user32.SetClipboardData(int(clipboard_format), handle):
+                        return False
+                    allocated.append(int(handle))
+                return True
+            finally:
+                user32.CloseClipboard()
+        except Exception:
+            return False
+
+    def _managed_input_is_empty(self, hwnd: int) -> bool:
+        """Inspect the selected draft without ever deleting an unknown draft."""
+
+        snapshot = self._snapshot_clipboard()
+        if snapshot is None:
+            return False
+        try:
+            import pyperclip
+
+            self._click(hwnd, "message_input")
+            self.driver.hotkey_ctrl(VK_A)
+            self._pause(0.05)
+            sentinel = f"akasha-empty-probe-{time.monotonic_ns()}"
+            pyperclip.copy(sentinel)
+            self.driver.hotkey_ctrl(VK_C)
+            self._pause(0.10)
+            copied = str(pyperclip.paste())
+            sequence = self._clipboard_sequence_number()
+            metrics = self.driver.get_client_metrics(hwnd)
+            empty = copied == sentinel and bool(metrics.foreground)
+            restored = self._restore_clipboard(
+                snapshot,
+                expected_sequence=sequence,
+                expected_text=copied,
+            )
+            press_bound = getattr(self.driver, "press_key_bound_process", None)
+            if callable(press_bound):
+                press_bound(hwnd, VK_ESCAPE)
+            return bool(empty and restored)
+        except Exception:
+            return False
 
     def _send_button(self, hwnd: int) -> None:
         self._click(hwnd, "send_button")
@@ -364,9 +566,14 @@ class UiaFixedSender:
         self,
         hwnd: int,
         lifecycle_event: threading.Event,
+        *,
+        allow_stopping: bool = False,
     ) -> bool:
         """Keep the FIFO head until a transient foreground loss recovers."""
-        while self._send_active(lifecycle_event):
+        while self._send_active(
+            lifecycle_event,
+            allow_stopping=allow_stopping,
+        ):
             try:
                 self._send_button(hwnd)
                 return True
@@ -377,7 +584,10 @@ class UiaFixedSender:
                     "[UIA_FIXED] foreground lost before submit; "
                     "queue head retained"
                 )
-            while self._send_active(lifecycle_event):
+            while self._send_active(
+                lifecycle_event,
+                allow_stopping=allow_stopping,
+            ):
                 metrics = self.driver.get_client_metrics(hwnd)
                 if (
                     not metrics.visible
@@ -389,15 +599,27 @@ class UiaFixedSender:
                 if metrics.foreground:
                     break
                 self._pause(0.05)
-            if not self._send_active(lifecycle_event):
+            if not self._send_active(
+                lifecycle_event,
+                allow_stopping=allow_stopping,
+            ):
                 return False
         return False
 
-    def _send_active(self, cancel_event: threading.Event) -> bool:
+    def _send_active(
+        self,
+        cancel_event: threading.Event,
+        *,
+        allow_stopping: bool = False,
+    ) -> bool:
         return bool(
             state.running
             and not self._stopped.is_set()
             and not cancel_event.is_set()
+            and (
+                allow_stopping
+                or not bool(getattr(state, "stopping", False))
+            )
         )
 
     def _wait_for_review(
@@ -471,6 +693,94 @@ class UiaFixedSender:
         except Exception:
             log.warning("[UIA_FIXED] cancelled text could not be cleared")
 
+    def _discard_owned_pasted_text(
+        self,
+        hwnd: int,
+        contact: str,
+        expected_text: str,
+        *,
+        target_id: object,
+        generation: object,
+        reply_epoch: object,
+        request_id: str,
+    ) -> bool:
+        """Clear only when clipboard readback proves the draft is ours."""
+
+        snapshot = self._snapshot_clipboard()
+        if snapshot is None:
+            return False
+        try:
+            import pyperclip
+
+            self._select_contact(hwnd, contact)
+            self._click(hwnd, "message_input")
+            self.driver.hotkey_ctrl(VK_A)
+            self._pause(0.05)
+            sentinel = f"akasha-draft-probe-{time.monotonic_ns()}"
+            pyperclip.copy(sentinel)
+            self.driver.hotkey_ctrl(VK_C)
+            self._pause(0.10)
+            copied = pyperclip.paste()
+            canonical_copied = str(copied).replace("\r\n", "\n")
+            canonical_expected = self._canonical_draft_text(expected_text)
+            canonical_copied = self._canonical_draft_text(canonical_copied)
+            if canonical_copied != canonical_expected:
+                log.warning(
+                    "[UIA_FIXED] cancelled draft ownership mismatch; retained"
+                )
+                return False
+            copied_sequence = self._clipboard_sequence_number()
+            preview = state.get_send_preview()
+            metrics = self.driver.get_client_metrics(hwnd)
+            if (
+                not metrics.foreground
+                or not isinstance(preview, dict)
+                or str(preview.get("request_id") or "") != str(request_id)
+                or preview.get("target_id") != target_id
+                or preview.get("generation") != generation
+                or preview.get("reply_epoch") != reply_epoch
+                or not state.is_reply_current(
+                    target_id,
+                    generation,
+                    reply_epoch,
+                )
+                or str(pyperclip.paste()) != copied
+                or (
+                    copied_sequence is not None
+                    and self._clipboard_sequence_number() != copied_sequence
+                )
+            ):
+                log.warning(
+                    "[UIA_FIXED] cancelled draft ownership changed; retained"
+                )
+                return False
+            press_bound = getattr(self.driver, "press_key_bound_process", None)
+            if not callable(press_bound):
+                return False
+            press_bound(hwnd, VK_BACKSPACE)
+            self._pause(0.05)
+            return self._restore_clipboard(
+                snapshot,
+                expected_sequence=copied_sequence,
+                expected_text=str(copied),
+            )
+        except Exception:
+            log.warning(
+                "[UIA_FIXED] cancelled draft ownership unavailable; retained"
+            )
+            return False
+        finally:
+            try:
+                press_bound = getattr(
+                    self.driver,
+                    "press_key_bound_process",
+                    None,
+                )
+                if callable(press_bound):
+                    press_bound(hwnd, VK_ESCAPE)
+            except Exception:
+                pass
+
     def _record_failure(self, code: str, stage: str) -> bool:
         state.record_send_result(
             False,
@@ -484,11 +794,13 @@ class UiaFixedSender:
         cancel_event: threading.Event,
         stage: str,
     ) -> bool:
-        code = (
-            "E_UIA_SEND_CANCELLED"
-            if cancel_event.is_set()
-            else "E_UIA_SENDER_STOPPED"
-        )
+        cancel_reason = state.get_send_cancel_reason(cancel_event)
+        if cancel_reason == "superseded":
+            code = "E_UIA_REPLY_SUPERSEDED"
+        elif cancel_event.is_set():
+            code = "E_UIA_SEND_CANCELLED"
+        else:
+            code = "E_UIA_SENDER_STOPPED"
         return self._record_failure(code, stage)
 
     def _log_failure(self, caught: BaseException, stage: str) -> None:
@@ -804,16 +1116,47 @@ class UiaFixedSender:
             if result is None:
                 _FAVORITE_REQUEST_CACHE.abandon(request_id, identity)
 
-    def send_text(self, contact: str, text: str) -> bool:
+    def send_text(
+        self,
+        contact: str,
+        text: str,
+        *,
+        target_id: object = None,
+        generation: object = None,
+        reply_epoch: object = None,
+        request_id: str = "",
+    ) -> bool:
         """Preview, paste, and submit one cancellable FIFO text item."""
+        managed_reply = all(
+            value is not None
+            for value in (target_id, generation, reply_epoch)
+        )
         with self._lock:
-            if not state.running or self._stopped.is_set():
+            if (
+                not state.running
+                or bool(getattr(state, "stopping", False))
+                or self._stopped.is_set()
+            ):
                 log.info("[UIA_FIXED] text send skipped while stopped")
                 return self._record_failure("E_UIA_SENDER_STOPPED", "request")
-            cancel_event = state.begin_send_preview(contact, text)
+            if managed_reply and state.get_reply_draft_quarantine(target_id):
+                log.warning("[UIA_FIXED] managed reply blocked by draft quarantine")
+                return self._record_failure(
+                    "E_UIA_DRAFT_QUARANTINED",
+                    "preflight",
+                )
+            cancel_event = state.begin_send_preview(
+                contact,
+                text,
+                target_id=target_id,
+                generation=generation,
+                reply_epoch=reply_epoch,
+                request_id=request_id,
+            )
             hwnd = None
             pasted = False
             committed = False
+            commit_started = False
             stage = "review"
             try:
                 if not self._wait_for_review(
@@ -828,10 +1171,29 @@ class UiaFixedSender:
                 hwnd = self._preflight()
                 stage = "select_contact"
                 self._select_contact(hwnd, contact)
+                if request_id and not state.persist_merged_job_stage(
+                    request_id,
+                    "ui_selected",
+                ):
+                    return self._record_failure(
+                        "E_UIA_SENDER_STOPPED",
+                        stage,
+                    )
                 if not self._wait_until_resumed(cancel_event):
                     return self._record_inactive_failure(cancel_event, stage)
                 stage = "focus_input"
-                self._focus_and_clear_input(hwnd)
+                if managed_reply:
+                    if not self._managed_input_is_empty(hwnd):
+                        state.mark_reply_draft_quarantine(
+                            target_id,
+                            request_id=request_id,
+                        )
+                        return self._record_failure(
+                            "E_UIA_DRAFT_OWNERSHIP_LOST",
+                            stage,
+                        )
+                else:
+                    self._focus_and_clear_input(hwnd)
                 if not self._wait_until_resumed(cancel_event):
                     return self._record_inactive_failure(cancel_event, stage)
 
@@ -848,6 +1210,14 @@ class UiaFixedSender:
                     return True
 
                 stage = "paste"
+                if request_id and not state.persist_merged_job_stage(
+                    request_id,
+                    "pasted_owned",
+                ):
+                    return self._record_failure(
+                        "E_UIA_SENDER_STOPPED",
+                        stage,
+                    )
                 while True:
                     paste_block["reason"] = ""
                     if self._paste_text(
@@ -886,20 +1256,68 @@ class UiaFixedSender:
                 stage = "submit"
                 if not state.try_commit_send(cancel_event):
                     return self._record_inactive_failure(cancel_event, stage)
+                if request_id and not state.persist_merged_job_stage(
+                    request_id,
+                    "committing",
+                ):
+                    return self._record_failure(
+                        "E_UIA_SUBMIT_FAILED",
+                        stage,
+                    )
+                commit_started = True
                 if not self._send_button_when_foreground(
                     hwnd,
                     cancel_event,
+                    allow_stopping=True,
                 ):
-                    return self._record_inactive_failure(cancel_event, stage)
+                    return self._record_failure(
+                        "E_UIA_SUBMIT_FAILED",
+                        stage,
+                    )
                 committed = True
+                if request_id and not state.persist_merged_job_stage(
+                    request_id,
+                    "committed",
+                ):
+                    raise RuntimeError("durable commit state unavailable")
                 state.record_send_result(True, code="OK", stage="complete")
                 return True
             except Exception as caught:
-                self._log_failure(caught, stage)
+                if commit_started:
+                    log.error("[UIA_FIXED] submit result unknown")
+                    self._record_failure("E_UIA_COMMIT_UNKNOWN", "submit")
+                else:
+                    self._log_failure(caught, stage)
                 return False
             finally:
                 if pasted and not committed and hwnd is not None:
-                    self._discard_pasted_text(hwnd, contact)
+                    if managed_reply:
+                        owned_cleared = False
+                        if not commit_started:
+                            owned_cleared = self._discard_owned_pasted_text(
+                                hwnd,
+                                contact,
+                                text,
+                                target_id=target_id,
+                                generation=generation,
+                                reply_epoch=reply_epoch,
+                                request_id=request_id,
+                            )
+                        if not owned_cleared:
+                            state.mark_reply_draft_quarantine(
+                                target_id,
+                                request_id=request_id,
+                            )
+                            if (
+                                state.get_send_cancel_reason(cancel_event)
+                                == "superseded"
+                            ):
+                                self._record_failure(
+                                    "E_UIA_REPLY_SUPERSEDED_DRAFT_QUARANTINED",
+                                    "review",
+                                )
+                    else:
+                        self._discard_pasted_text(hwnd, contact)
                 state.end_send_preview(cancel_event)
 
     def send_image(self, contact: str, image_path: str) -> bool:

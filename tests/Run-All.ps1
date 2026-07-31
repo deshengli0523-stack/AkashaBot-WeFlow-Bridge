@@ -49,11 +49,14 @@ function Assert-AkashaTask8Layout {
     'bridge\calibrate_uia_fixed.py',
     'bridge\favorite_sticker.py',
     'bridge\uia_support.py',
+    'bridge\reply_store.py',
     'plugins\astrbot_plugin_akasha_contact_memory\main.py',
     'plugins\astrbot_plugin_akasha_favorite_stickers\main.py',
     'plugins\astrbot_plugin_akasha_favorite_stickers\catalog.json',
+    'plugins\astrbot_plugin_akasha_merged_reply\main.py',
     'tests\python\test_contact_memory.py',
     'tests\python\test_favorite_sticker_plugin.py',
+    'tests\python\test_merged_reply.py',
     'scripts\Calibrate-Uia.ps1',
     (((Join-AkashaCharacters @(0x6821, 0x51C6))) + '.bat')
   )
@@ -70,8 +73,8 @@ function Assert-AkashaTask8Layout {
   }
 
   $publishedFiles = @(Get-AkashaPublishedFiles)
-  if ($publishedFiles.Count -ne 83) {
-    throw "Documentation/layout gate: expected 83 publish files, found $($publishedFiles.Count)."
+  if ($publishedFiles.Count -ne 90) {
+    throw "Documentation/layout gate: expected 90 publish files, found $($publishedFiles.Count)."
   }
 
   $updateLauncher = (Join-AkashaCharacters @(0x66F4, 0x65B0)) + '.bat'

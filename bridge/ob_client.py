@@ -55,6 +55,7 @@ async def _ob_client_main(generation):
                     break
                 active_ws = ws
                 state._ob_ws = ws
+                state.clear_merged_reply_capability()
                 state._ob_ws_ready.set()
                 log.info(f"[OB11] ✅ 已连接到 AstrBot")
 
@@ -68,8 +69,9 @@ async def _ob_client_main(generation):
                             break
                 ka_task = asyncio.create_task(_keepalive())
                 try:
-                    # 按 WebSocket 到达顺序逐条处理。每个发送请求必须
-                    # 完成全部 UIA 段后，下一个请求才可触碰微信窗口。
+                    # 按 WebSocket 到达顺序处理协议帧。合并回复动作只
+                    # 做持久受理，UIA 由单独 FIFO worker 执行，因此
+                    # heartbeat / ACK 不会被长审核阻塞。
                     async for raw in ws:
                         if not state.is_generation_running(generation):
                             break
@@ -94,6 +96,7 @@ async def _ob_client_main(generation):
             log.error("[OB11] 连接异常，5 秒后重试")
 
         if active_ws is not None and state._ob_ws is active_ws:
+            state.clear_merged_reply_capability(active_ws)
             state._ob_ws = None
             state._ob_ws_ready.clear()
         if not state.is_generation_running(generation):
@@ -101,5 +104,6 @@ async def _ob_client_main(generation):
         await asyncio.sleep(5)
 
     if active_ws is not None and state._ob_ws is active_ws:
+        state.clear_merged_reply_capability(active_ws)
         state._ob_ws = None
         state._ob_ws_ready.clear()

@@ -13,7 +13,7 @@ from typing import Any, TypeVar
 from .models import ContactRecord, MemoryMessage, QwenSessionRecord
 
 _T = TypeVar("_T")
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 13
 SEND_FAILURE_REBUILD_MESSAGE_LIMIT = 20
 
 _SCHEMA_V10 = """
@@ -128,7 +128,77 @@ CREATE TABLE IF NOT EXISTS message_replacements (
 );
 CREATE INDEX IF NOT EXISTS idx_message_replacements_target
     ON message_replacements(target_message_id);
-PRAGMA user_version = 10;
+CREATE TABLE IF NOT EXISTS merged_reply_bindings (
+    request_id TEXT PRIMARY KEY,
+    contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
+    message_id INTEGER UNIQUE REFERENCES messages(id) ON DELETE SET NULL,
+    target_id INTEGER NOT NULL,
+    bridge_generation INTEGER NOT NULL,
+    reply_epoch INTEGER NOT NULL,
+    admission_token TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    outcome TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    notice_id TEXT NOT NULL DEFAULT '',
+    result_digest TEXT NOT NULL DEFAULT '',
+    result_revision INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merged_reply_receipts (
+    notice_id TEXT PRIMARY KEY,
+    result_digest TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    applied_at REAL NOT NULL
+);
+PRAGMA user_version = 13;
+COMMIT;
+"""
+
+_MIGRATE_V10_TO_V11 = """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS merged_reply_bindings (
+    request_id TEXT PRIMARY KEY,
+    contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
+    message_id INTEGER UNIQUE REFERENCES messages(id) ON DELETE SET NULL,
+    target_id INTEGER NOT NULL,
+    bridge_generation INTEGER NOT NULL,
+    reply_epoch INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    outcome TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    notice_id TEXT NOT NULL DEFAULT '',
+    result_digest TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merged_reply_receipts (
+    notice_id TEXT PRIMARY KEY,
+    result_digest TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    applied_at REAL NOT NULL
+);
+PRAGMA user_version = 11;
+COMMIT;
+"""
+
+_MIGRATE_V11_TO_V12 = """
+BEGIN IMMEDIATE;
+ALTER TABLE merged_reply_bindings
+    ADD COLUMN result_revision INTEGER NOT NULL DEFAULT 0;
+PRAGMA user_version = 12;
+COMMIT;
+"""
+
+_MIGRATE_V12_TO_V13 = """
+BEGIN IMMEDIATE;
+ALTER TABLE merged_reply_bindings
+    ADD COLUMN admission_token TEXT NOT NULL DEFAULT '';
+PRAGMA user_version = 13;
 COMMIT;
 """
 
@@ -310,6 +380,26 @@ def _representation_hash(message: MemoryMessage) -> str:
 
 def _equivalence_text(content: str) -> str:
     return "".join(content.split())
+
+
+def _merged_normalized_text(content: str) -> str:
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip(" \t") for line in normalized.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    output: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line == "":
+            blank_run += 1
+            if blank_run <= 1:
+                output.append("")
+        else:
+            blank_run = 0
+            output.append(line)
+    return "\n".join(output)
 
 
 def _contact_from_row(row: sqlite3.Row) -> ContactRecord:
@@ -568,6 +658,8 @@ class MemoryStore:
                 connection.executescript(_MIGRATE_V8_TO_V9)
             elif current == 9:
                 pass
+            elif current in {10, 11, 12}:
+                pass
             else:
                 raise sqlite3.DatabaseError(
                     f"no migration path from memory schema {current}"
@@ -610,6 +702,32 @@ class MemoryStore:
                 )
                 connection.execute("PRAGMA user_version = 10")
                 connection.commit()
+            if 1 <= current <= 10:
+                connection.executescript(_MIGRATE_V10_TO_V11)
+            if 1 <= current <= 11:
+                binding_columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA table_info(merged_reply_bindings)"
+                    ).fetchall()
+                }
+                if "result_revision" not in binding_columns:
+                    connection.executescript(_MIGRATE_V11_TO_V12)
+                else:
+                    connection.execute("PRAGMA user_version = 12")
+                    connection.commit()
+            if 1 <= current <= 12:
+                binding_columns = {
+                    str(row["name"])
+                    for row in connection.execute(
+                        "PRAGMA table_info(merged_reply_bindings)"
+                    ).fetchall()
+                }
+                if "admission_token" not in binding_columns:
+                    connection.executescript(_MIGRATE_V12_TO_V13)
+                else:
+                    connection.execute("PRAGMA user_version = 13")
+                    connection.commit()
             wal_cursor = connection.execute("PRAGMA journal_mode = WAL")
             wal_cursor.fetchone()
             wal_cursor.close()
@@ -1210,6 +1328,431 @@ class MemoryStore:
         )
         return snapshots[0] if snapshots else None
 
+    async def bind_merged_reply(
+        self,
+        *,
+        request_id: str,
+        contact_id: int | None,
+        target_id: int,
+        bridge_generation: int,
+        reply_epoch: int,
+        admission_token: str,
+        response_id: str,
+        text: str,
+        applicable: bool,
+    ) -> str:
+        """Bind one protocol request to one exact pending generated row."""
+
+        normalized_text = _merged_normalized_text(text)
+        text_hash = _content_hash(normalized_text)
+
+        def operation(connection: sqlite3.Connection) -> str:
+            existing = connection.execute(
+                "SELECT * FROM merged_reply_bindings WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                same = (
+                    (existing["contact_id"] is None and contact_id is None)
+                    or (
+                        existing["contact_id"] is not None
+                        and contact_id is not None
+                        and int(existing["contact_id"]) == contact_id
+                    )
+                ) and all(
+                    (
+                        int(existing["target_id"]) == target_id,
+                        int(existing["bridge_generation"]) == bridge_generation,
+                        int(existing["reply_epoch"]) == reply_epoch,
+                        str(existing["admission_token"]) == admission_token,
+                        str(existing["text_hash"]) == text_hash,
+                    )
+                )
+                if not same:
+                    raise ValueError("E_MEMORY_REQUEST_BIND_CONFLICT")
+                return str(existing["status"])
+
+            message_id: int | None = None
+            status = "not_applicable"
+            if applicable:
+                if contact_id is None:
+                    raise ValueError("E_MEMORY_CONTACT_REQUIRED")
+                if not response_id:
+                    raise ValueError("E_MEMORY_RESPONSE_ID_REQUIRED")
+                selected = connection.execute(
+                    """
+                    SELECT messages.id,messages.content
+                    FROM messages
+                    LEFT JOIN message_delivery
+                      ON message_delivery.message_id=messages.id
+                    LEFT JOIN merged_reply_bindings
+                      ON merged_reply_bindings.message_id=messages.id
+                    WHERE messages.contact_id=?
+                      AND messages.direction='out'
+                      AND messages.origin='generated'
+                      AND messages.pending=1
+                      AND COALESCE(message_delivery.confirmed,0)=0
+                      AND merged_reply_bindings.message_id IS NULL
+                      AND messages.source_uid=?
+                    """,
+                    (contact_id, f"generated:{response_id}"),
+                ).fetchone()
+                if (
+                    selected is None
+                    or _merged_normalized_text(str(selected["content"]))
+                    != normalized_text
+                ):
+                    raise ValueError("E_MEMORY_PENDING_OUTPUT_NOT_FOUND")
+                message_id = int(selected["id"])
+                status = "bound"
+            now = time.time()
+            connection.execute(
+                """
+                INSERT INTO merged_reply_bindings(
+                    request_id,contact_id,message_id,target_id,bridge_generation,
+                    reply_epoch,admission_token,text,text_hash,status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    request_id,
+                    contact_id,
+                    message_id,
+                    target_id,
+                    bridge_generation,
+                    reply_epoch,
+                    admission_token,
+                    normalized_text,
+                    text_hash,
+                    status,
+                    now,
+                    now,
+                ),
+            )
+            return status
+
+        return await self._write(operation)
+
+    async def apply_merged_reply_result(
+        self,
+        *,
+        request_id: str,
+        notice_id: str,
+        result_digest: str,
+        result_revision: int,
+        target_id: int,
+        bridge_generation: int,
+        reply_epoch: int,
+        outcome: str,
+        delivered_parts: Iterable[str] = (),
+        discarded_parts: Iterable[str] = (),
+        reason: str = "",
+    ) -> str:
+        """Apply one v2 notice by request id and receipt it atomically."""
+
+        delivered = _merged_normalized_text("".join(delivered_parts))
+        discarded = _merged_normalized_text("".join(discarded_parts))
+
+        def operation(connection: sqlite3.Connection) -> str:
+            receipt = connection.execute(
+                "SELECT * FROM merged_reply_receipts WHERE notice_id=?",
+                (notice_id,),
+            ).fetchone()
+            if receipt is not None:
+                if (
+                    str(receipt["result_digest"]) != result_digest
+                    or str(receipt["request_id"]) != request_id
+                ):
+                    raise ValueError("E_MEMORY_RESULT_DIGEST_CONFLICT")
+                binding = connection.execute(
+                    "SELECT status FROM merged_reply_bindings WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                return (
+                    "not_applicable"
+                    if binding is not None
+                    and str(binding["status"]) == "not_applicable"
+                    else "applied"
+                )
+
+            binding = connection.execute(
+                "SELECT * FROM merged_reply_bindings WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if binding is None:
+                raise ValueError("E_MEMORY_RESULT_BINDING_MISSING")
+            if (
+                int(binding["target_id"]) != target_id
+                or int(binding["bridge_generation"]) != bridge_generation
+                or int(binding["reply_epoch"]) != reply_epoch
+            ):
+                raise ValueError("E_MEMORY_RESULT_BINDING_MISMATCH")
+            current_revision = int(binding["result_revision"] or 0)
+            if result_revision <= 0:
+                raise ValueError("E_MEMORY_RESULT_REVISION")
+            if result_revision < current_revision:
+                connection.execute(
+                    """
+                    INSERT INTO merged_reply_receipts(
+                        notice_id,result_digest,request_id,applied_at
+                    ) VALUES(?,?,?,?)
+                    """,
+                    (notice_id, result_digest, request_id, time.time()),
+                )
+                return (
+                    "not_applicable"
+                    if str(binding["status"]) == "not_applicable"
+                    else "applied"
+                )
+            if result_revision == current_revision and current_revision > 0:
+                raise ValueError("E_MEMORY_RESULT_REVISION_CONFLICT")
+            binding_status = str(binding["status"])
+            if binding_status == "not_applicable":
+                now = time.time()
+                connection.execute(
+                    """
+                    INSERT INTO merged_reply_receipts(
+                        notice_id,result_digest,request_id,applied_at
+                    ) VALUES(?,?,?,?)
+                    """,
+                    (notice_id, result_digest, request_id, now),
+                )
+                connection.execute(
+                    """
+                    UPDATE merged_reply_bindings
+                    SET outcome=?,reason=?,notice_id=?,result_digest=?,
+                        result_revision=?,updated_at=?
+                    WHERE request_id=?
+                    """,
+                    (
+                        outcome,
+                        reason,
+                        notice_id,
+                        result_digest,
+                        result_revision,
+                        now,
+                        request_id,
+                    ),
+                )
+                return "not_applicable"
+            if binding_status not in {
+                "bound",
+                "accepted",
+                "acceptance_unknown",
+                "commit_unknown",
+                "result_applied",
+            }:
+                raise ValueError("E_MEMORY_RESULT_BINDING_TERMINAL")
+            message_id = binding["message_id"]
+            contact_id = binding["contact_id"]
+            if message_id is None or contact_id is None:
+                raise ValueError("E_MEMORY_RESULT_MESSAGE_MISSING")
+            expected_text = str(binding["text"])
+            row = connection.execute(
+                """
+                SELECT messages.id,messages.id_quality,messages.pending,
+                       COALESCE(message_delivery.confirmed,0) AS confirmed
+                FROM messages
+                LEFT JOIN message_delivery
+                  ON message_delivery.message_id=messages.id
+                WHERE messages.id=? AND messages.contact_id=?
+                """,
+                (int(message_id), int(contact_id)),
+            ).fetchone()
+            if row is None and outcome != "commit_unknown":
+                raise ValueError("E_MEMORY_RESULT_MESSAGE_MISSING")
+
+            now = time.time()
+            if outcome == "sent":
+                if delivered != expected_text or row is None:
+                    raise ValueError("E_MEMORY_RESULT_TEXT_MISMATCH")
+                connection.execute(
+                    """
+                    INSERT INTO message_delivery(message_id,progress,confirmed,updated_at)
+                    VALUES(?,?,1,?)
+                    ON CONFLICT(message_id) DO UPDATE SET
+                        progress=excluded.progress,confirmed=1,
+                        updated_at=excluded.updated_at
+                    """,
+                    (int(message_id), expected_text, now),
+                )
+                if str(row["id_quality"]) == "fallback_response":
+                    connection.execute(
+                        """
+                        UPDATE contacts SET memory_revision=memory_revision+1
+                        WHERE id=? AND tombstoned_at IS NULL
+                        """,
+                        (int(contact_id),),
+                    )
+            elif outcome in {"superseded", "manual_cancel", "failed"}:
+                if discarded != expected_text or row is None:
+                    raise ValueError("E_MEMORY_RESULT_TEXT_MISMATCH")
+                if bool(row["confirmed"]):
+                    raise ValueError("E_MEMORY_RESULT_ALREADY_CONFIRMED")
+                connection.execute(
+                    "DELETE FROM messages WHERE id=?", (int(message_id),)
+                )
+                connection.execute(
+                    "UPDATE qwen_sessions SET dirty=1 WHERE contact_id=?",
+                    (int(contact_id),),
+                )
+                connection.execute(
+                    """
+                    UPDATE contacts
+                    SET memory_revision=memory_revision+1,
+                        next_seed_recent_limit=?
+                    WHERE id=? AND tombstoned_at IS NULL
+                    """,
+                    (SEND_FAILURE_REBUILD_MESSAGE_LIMIT, int(contact_id)),
+                )
+            elif outcome == "commit_unknown":
+                pass
+            else:
+                raise ValueError("E_MEMORY_RESULT_OUTCOME")
+
+            connection.execute(
+                """
+                INSERT INTO merged_reply_receipts(
+                    notice_id,result_digest,request_id,applied_at
+                ) VALUES(?,?,?,?)
+                """,
+                (notice_id, result_digest, request_id, now),
+            )
+            next_status = (
+                "commit_unknown" if outcome == "commit_unknown" else "result_applied"
+            )
+            connection.execute(
+                """
+                UPDATE merged_reply_bindings
+                SET status=?,outcome=?,reason=?,notice_id=?,result_digest=?,
+                    result_revision=?,updated_at=?
+                WHERE request_id=?
+                """,
+                (
+                    next_status,
+                    outcome,
+                    reason,
+                    notice_id,
+                    result_digest,
+                    result_revision,
+                    now,
+                    request_id,
+                ),
+            )
+            return "applied"
+
+        return await self._write(operation)
+
+    async def record_merged_pre_action_terminal(
+        self,
+        request_id: str,
+        *,
+        outcome: str,
+        reason: str,
+    ) -> bool:
+        def operation(connection: sqlite3.Connection) -> bool:
+            binding = connection.execute(
+                "SELECT * FROM merged_reply_bindings WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if binding is None:
+                return False
+            status = str(binding["status"])
+            if status in {"pre_action_terminal", "result_applied"}:
+                return True
+            contact_id = binding["contact_id"]
+            message_id = binding["message_id"]
+            if contact_id is not None and message_id is not None:
+                connection.execute(
+                    """
+                    DELETE FROM messages
+                    WHERE id=? AND contact_id=? AND pending=1
+                    """,
+                    (int(message_id), int(contact_id)),
+                )
+                connection.execute(
+                    "UPDATE qwen_sessions SET dirty=1 WHERE contact_id=?",
+                    (int(contact_id),),
+                )
+                connection.execute(
+                    """
+                    UPDATE contacts
+                    SET memory_revision=memory_revision+1,
+                        next_seed_recent_limit=?
+                    WHERE id=? AND tombstoned_at IS NULL
+                    """,
+                    (SEND_FAILURE_REBUILD_MESSAGE_LIMIT, int(contact_id)),
+                )
+            connection.execute(
+                """
+                UPDATE merged_reply_bindings
+                SET status='pre_action_terminal',outcome=?,reason=?,updated_at=?
+                WHERE request_id=?
+                """,
+                (outcome, reason, time.time(), request_id),
+            )
+            return True
+
+        return await self._write(operation)
+
+    async def mark_merged_reply_acceptance(
+        self,
+        request_id: str,
+        status: str,
+    ) -> bool:
+        if status not in {"accepted", "acceptance_unknown"}:
+            raise ValueError("E_MEMORY_ACCEPTANCE_STATUS")
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            binding = connection.execute(
+                "SELECT status FROM merged_reply_bindings WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if binding is None:
+                return False
+            current = str(binding["status"])
+            if current == "not_applicable":
+                return True
+            if current in {"pre_action_terminal", "result_applied", "commit_unknown"}:
+                return True
+            if current not in {"bound", "acceptance_unknown", "accepted"}:
+                return False
+            connection.execute(
+                """
+                UPDATE merged_reply_bindings SET status=?,updated_at=?
+                WHERE request_id=?
+                """,
+                (status, time.time(), request_id),
+            )
+            return True
+
+        return await self._write(operation)
+
+    async def list_recoverable_merged_bindings(
+        self,
+        *,
+        limit: int = 128,
+    ) -> list[dict[str, Any]]:
+        """Return only pre-action bindings that need Bridge reconciliation."""
+
+        safe_limit = max(1, min(512, int(limit)))
+
+        def operation(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = connection.execute(
+                """
+                SELECT request_id,admission_token,target_id,bridge_generation,
+                       reply_epoch,status
+                FROM merged_reply_bindings
+                WHERE status IN ('bound','acceptance_unknown')
+                  AND admission_token<>''
+                ORDER BY created_at,request_id
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await self._read(operation)
+
     async def confirm_generated_delivery(
         self,
         contact_id: int,
@@ -1285,6 +1828,71 @@ class MemoryStore:
                     )
                 return confirmed
             return False
+
+        return await self._write(operation)
+
+    async def discard_generated_delivery(
+        self,
+        contact_id: int,
+        discarded_parts: Iterable[str],
+    ) -> bool:
+        """Discard one exact unconfirmed generated turn, never the contact queue."""
+
+        target = "".join(
+            _equivalence_text(str(part))
+            for part in discarded_parts
+            if _equivalence_text(str(part))
+        )
+        if not target:
+            return False
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            rows = connection.execute(
+                """
+                SELECT
+                    messages.id,
+                    messages.content,
+                    COALESCE(message_delivery.confirmed, 0) AS confirmed
+                FROM messages
+                LEFT JOIN message_delivery
+                  ON message_delivery.message_id = messages.id
+                WHERE messages.contact_id = ?
+                  AND messages.direction = 'out'
+                  AND messages.origin = 'generated'
+                  AND messages.pending = 1
+                ORDER BY messages.source_time, messages.id
+                """,
+                (contact_id,),
+            ).fetchall()
+            selected_id = next(
+                (
+                    int(row["id"])
+                    for row in rows
+                    if not bool(row["confirmed"])
+                    and _equivalence_text(str(row["content"])) == target
+                ),
+                None,
+            )
+            if selected_id is None:
+                return False
+            connection.execute(
+                "DELETE FROM messages WHERE id = ?",
+                (selected_id,),
+            )
+            connection.execute(
+                "UPDATE qwen_sessions SET dirty = 1 WHERE contact_id = ?",
+                (contact_id,),
+            )
+            connection.execute(
+                """
+                UPDATE contacts
+                SET memory_revision = memory_revision + 1,
+                    next_seed_recent_limit = ?
+                WHERE id = ? AND tombstoned_at IS NULL
+                """,
+                (SEND_FAILURE_REBUILD_MESSAGE_LIMIT, contact_id),
+            )
+            return True
 
         return await self._write(operation)
 

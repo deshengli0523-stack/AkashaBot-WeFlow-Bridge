@@ -547,16 +547,20 @@ class QwenSessionManager:
         self,
         contact_id: int,
         content: str,
-    ) -> None:
+        *,
+        response_id: str = "",
+    ) -> str:
         if not content:
-            return
+            return ""
+        archived_response_id = response_id.strip() or f"fallback-{uuid.uuid4().hex}"
         async with self._lock_for(contact_id):
             await self.store.archive_generated(
                 contact_id,
-                response_id=f"fallback-{uuid.uuid4().hex}",
+                response_id=archived_response_id,
                 content=content,
                 id_quality="fallback_response",
             )
+        return archived_response_id
 
     async def mark_dirty(self, contact_id: int) -> None:
         await self.store.mark_contact_sessions_dirty(contact_id)

@@ -35,6 +35,16 @@ def _source_time(value: Any) -> float:
     return max(0.0, result)
 
 
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _bridge_source_uid(source: Mapping[str, Any]) -> tuple[str, str]:
     raw_id = str(source.get("rawid") or "").strip()
     if raw_id:
@@ -74,6 +84,10 @@ class ContactMemoryRuntime:
         # Provider request session IDs use opaque, request-scoped keys. Never
         # key memory by AstrBot UMO alone: separate accounts can reuse a UMO.
         self._prepared: dict[str, PreparedContact] = {}
+        # Provider responses are keyed by the exact request-scoped session id.
+        # This prevents concurrent equal-text replies from binding each other's
+        # pending generated row.
+        self._generated_response_ids: dict[str, str] = {}
 
     @staticmethod
     def binding_from_event(event: Any) -> ContactBinding | None:
@@ -87,7 +101,7 @@ class ContactMemoryRuntime:
         if not isinstance(raw, Mapping):
             return None
         # aiocqhttp.Event.type is post_type; always read the mapping key.
-        if raw.get("akasha_schema") != 1 or str(raw.get("type") or "") != "private":
+        if raw.get("akasha_schema") not in {1, 2} or str(raw.get("type") or "") != "private":
             return None
         account = str(raw.get("account") or "").strip()
         session = str(raw.get("session") or "").strip()
@@ -162,6 +176,7 @@ class ContactMemoryRuntime:
         for request_key, prepared in tuple(self._prepared.items()):
             if prepared.contact.id == contact_id:
                 self._prepared.pop(request_key, None)
+                self._generated_response_ids.pop(request_key, None)
 
     @staticmethod
     def source_uids(binding: ContactBinding) -> set[str]:
@@ -328,7 +343,7 @@ class ContactMemoryRuntime:
         prepared = self.prepared_for(contact_key)
         if not prepared or not self.qwen_sessions:
             raise RuntimeError("contact memory Qwen session is unavailable")
-        return await self.qwen_sessions.respond(
+        result = await self.qwen_sessions.respond(
             prepared.contact,
             prompt=prompt,
             system_prompt=system_prompt,
@@ -341,11 +356,182 @@ class ContactMemoryRuntime:
             tool_choice=tool_choice,
             request_max_retries=request_max_retries,
         )
+        if result.text and not result.tool_calls:
+            self._generated_response_ids[contact_key] = result.response_id
+        return result
 
     async def mark_dirty(self, contact_key: str) -> None:
         prepared = self.prepared_for(contact_key)
         if prepared and self.qwen_sessions:
             await self.qwen_sessions.mark_dirty(prepared.contact.id)
+
+    async def bind_merged_reply(
+        self,
+        event: Any,
+        *,
+        request_id: str,
+        target_id: int,
+        bridge_generation: int,
+        reply_epoch: int,
+        admission_token: str,
+        text: str,
+        applicable: bool,
+    ) -> str:
+        prepared = await self.bind_event(event, allow_off=True)
+        if applicable and (
+            prepared is None or prepared.contact.tombstoned_at is not None
+        ):
+            raise ValueError("E_MEMORY_CONTACT_REQUIRED")
+        contact_id = prepared.contact.id if prepared is not None else None
+        contact_key = str(
+            event.get_extra("akasha_memory_contact_key", "") or ""
+        )
+        response_id = self._generated_response_ids.get(contact_key, "")
+        status = await self.store.bind_merged_reply(
+            request_id=request_id,
+            contact_id=contact_id,
+            target_id=target_id,
+            bridge_generation=bridge_generation,
+            reply_epoch=reply_epoch,
+            admission_token=admission_token,
+            response_id=response_id,
+            text=text,
+            applicable=applicable,
+        )
+        if applicable:
+            self._generated_response_ids.pop(contact_key, None)
+        return status
+
+    async def record_merged_pre_action_terminal(
+        self,
+        event: Any,
+        outcome: str,
+        reason: str,
+    ) -> bool:
+        request_id = str(
+            event.get_extra("akasha_merged_request_id", "") or ""
+        )
+        if not request_id:
+            return False
+        changed = await self.store.record_merged_pre_action_terminal(
+            request_id,
+            outcome=outcome,
+            reason=reason,
+        )
+        if changed:
+            prepared = await self.bind_event(event, allow_off=True)
+            if prepared is not None:
+                self._drop_contact_cache(prepared.contact.id)
+        return changed
+
+    async def mark_merged_reply_acceptance(
+        self,
+        event: Any,
+        status: str,
+    ) -> bool:
+        request_id = str(
+            event.get_extra("akasha_merged_request_id", "") or ""
+        )
+        if not request_id:
+            return False
+        return await self.store.mark_merged_reply_acceptance(
+            request_id,
+            status,
+        )
+
+    async def merged_reply_recovery_records(self) -> list[dict[str, Any]]:
+        return await self.store.list_recoverable_merged_bindings()
+
+    async def recover_merged_reply_acceptance(
+        self,
+        request_id: str,
+    ) -> bool:
+        return await self.store.mark_merged_reply_acceptance(
+            request_id,
+            "accepted",
+        )
+
+    async def recover_merged_reply_terminal(
+        self,
+        request_id: str,
+        *,
+        outcome: str,
+        reason: str,
+    ) -> bool:
+        changed = await self.store.record_merged_pre_action_terminal(
+            request_id,
+            outcome=outcome,
+            reason=reason,
+        )
+        if changed:
+            self._prepared.clear()
+            self._generated_response_ids.clear()
+        return changed
+
+    async def apply_merged_send_result(self, event: Any) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        if not isinstance(raw, Mapping):
+            raise ValueError("E_MEMORY_RESULT_SCHEMA")
+        request_id = str(raw.get("request_id") or "")
+        notice_id = str(raw.get("notice_id") or "")
+        result_digest = str(raw.get("result_digest") or "")
+        result_revision = _positive_int(raw.get("result_revision"))
+        target_id = _positive_int(raw.get("user_id"))
+        bridge_generation = _positive_int(raw.get("bridge_generation"))
+        reply_epoch = _positive_int(raw.get("reply_epoch"))
+        outcome = str(raw.get("outcome") or "")
+        if (
+            not request_id
+            or not notice_id
+            or len(result_digest) != 64
+            or result_revision is None
+            or target_id is None
+            or bridge_generation is None
+            or reply_epoch is None
+            or outcome
+            not in {
+                "sent",
+                "superseded",
+                "manual_cancel",
+                "failed",
+                "commit_unknown",
+            }
+        ):
+            raise ValueError("E_MEMORY_RESULT_SCHEMA")
+        delivered_raw = raw.get("delivered_parts", [])
+        discarded_raw = raw.get("discarded_parts", [])
+        delivered = (
+            tuple(value for value in delivered_raw if isinstance(value, str))
+            if isinstance(delivered_raw, list)
+            else ()
+        )
+        discarded = (
+            tuple(value for value in discarded_raw if isinstance(value, str))
+            if isinstance(discarded_raw, list)
+            else ()
+        )
+        status = await self.store.apply_merged_reply_result(
+            request_id=request_id,
+            notice_id=notice_id,
+            result_digest=result_digest,
+            result_revision=result_revision,
+            target_id=target_id,
+            bridge_generation=bridge_generation,
+            reply_epoch=reply_epoch,
+            outcome=outcome,
+            delivered_parts=delivered,
+            discarded_parts=discarded,
+            reason=str(raw.get("error_code") or ""),
+        )
+        prepared = await self.bind_event(event, allow_off=True)
+        if prepared is not None and outcome in {
+            "superseded",
+            "manual_cancel",
+            "failed",
+        }:
+            self._drop_contact_cache(prepared.contact.id)
+        return status
 
     async def record_send_failure(self, event: Any) -> bool:
         prepared = await self.bind_event(event, allow_off=True)
@@ -355,6 +541,35 @@ class ContactMemoryRuntime:
             await self.store.invalidate_unconfirmed_outputs(prepared.contact.id)
         self._drop_contact_cache(prepared.contact.id)
         return True
+
+    async def record_send_discard(self, event: Any) -> bool:
+        """Remove only the generated turn named by a v2 send result."""
+
+        prepared = await self.bind_event(event, allow_off=True)
+        if not prepared or prepared.contact.tombstoned_at is not None:
+            return False
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        if not isinstance(raw, Mapping):
+            return False
+        discarded = raw.get("discarded_parts")
+        if not isinstance(discarded, list):
+            return False
+        parts = tuple(
+            value
+            for value in discarded
+            if isinstance(value, str) and value
+        )
+        if not parts:
+            return False
+        async with self.synchronizer.exclusive_contact(prepared.contact.id):
+            changed = await self.store.discard_generated_delivery(
+                prepared.contact.id,
+                parts,
+            )
+        if changed:
+            self._drop_contact_cache(prepared.contact.id)
+        return changed
 
     async def record_send_success(self, event: Any) -> bool:
         prepared = await self.bind_event(event, allow_off=True)
@@ -383,13 +598,18 @@ class ContactMemoryRuntime:
         self,
         contact_key: str,
         content: str,
+        *,
+        response_id: str = "",
     ) -> None:
         prepared = self.prepared_for(contact_key)
         if prepared and self.qwen_sessions:
-            await self.qwen_sessions.archive_fallback_output(
+            archived_response_id = await self.qwen_sessions.archive_fallback_output(
                 prepared.contact.id,
                 content,
+                response_id=response_id,
             )
+            if archived_response_id:
+                self._generated_response_ids[contact_key] = archived_response_id
 
     async def finish_request(self, contact_key: str) -> bool:
         prepared = self.prepared_for(contact_key)
@@ -453,3 +673,4 @@ class ContactMemoryRuntime:
         if self.qwen_sessions:
             await self.qwen_sessions.client.close()
         self._prepared.clear()
+        self._generated_response_ids.clear()

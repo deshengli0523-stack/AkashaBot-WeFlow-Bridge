@@ -69,9 +69,11 @@ function Invoke-AkashaHealthCheck {
   param(
     [Parameter(Mandatory)][string]$InstallRoot,
     [scriptblock]$HttpProbe,
-    [scriptblock]$TcpProbe
+    [scriptblock]$TcpProbe,
+    [scriptblock]$BridgeStatusProbe
   )
 
+  $customHttpProbe = $PSBoundParameters.ContainsKey('HttpProbe')
   Get-AkashaBotPaths -Root $InstallRoot | Out-Null
   if ($null -eq $HttpProbe) { $HttpProbe = { param($Uri) Invoke-AkashaDefaultHttpProbe -Uri $Uri } }
   if ($null -eq $TcpProbe) { $TcpProbe = { param($HostName, $Port) Invoke-AkashaDefaultTcpProbe -HostName $HostName -Port $Port } }
@@ -91,6 +93,25 @@ function Invoke-AkashaHealthCheck {
       $failed++
       Write-Host "[FAIL] $($check.Name) $($check.Uri)$(Get-AkashaHealthOwnerText -Port $check.Port)"
     }
+  }
+
+  $bridgeStatus = $null
+  try {
+    if ($null -ne $BridgeStatusProbe) {
+      $bridgeStatus = & $BridgeStatusProbe
+    } elseif (-not $customHttpProbe) {
+      $bridgeStatus = Invoke-RestMethod -UseBasicParsing -Uri 'http://127.0.0.1:8766/status' -TimeoutSec 5 -ErrorAction Stop
+    }
+  } catch {
+    $bridgeStatus = $null
+  }
+  if ($null -ne $bridgeStatus -and
+      $bridgeStatus.merged_reply_ready -eq $true -and
+      $bridgeStatus.ordinary_ingress_open -eq $true) {
+    Write-Host '[OK] Bridge merged reply readiness'
+  } elseif (-not $customHttpProbe -or $null -ne $BridgeStatusProbe) {
+    $failed++
+    Write-Host '[FAIL] Bridge merged reply readiness'
   }
 
   $oneBotSucceeded = $false

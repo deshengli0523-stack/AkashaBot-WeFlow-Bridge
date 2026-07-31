@@ -242,7 +242,7 @@ function Assert-NoTransactionResidue {
 function New-TestSourceFixture {
   param([string]$Path)
   New-Item -ItemType Directory -Force -Path $Path | Out-Null
-  foreach ($entry in @(@(Get-AkashaInstallPayload) + @(Get-AkashaContactMemoryPluginPayload) + @(Get-AkashaMoneyReceiverPluginPayload) + @(Get-AkashaFavoriteStickerPluginPayload))) {
+  foreach ($entry in @(@(Get-AkashaInstallPayload) + @(Get-AkashaContactMemoryPluginPayload) + @(Get-AkashaMoneyReceiverPluginPayload) + @(Get-AkashaFavoriteStickerPluginPayload) + @(Get-AkashaMergedReplyPluginPayload))) {
     $source = Join-Path $root ([string]$entry.Source)
     $destination = Join-Path $Path ([string]$entry.Source)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
@@ -330,14 +330,14 @@ Assert-Equal $stalledClockResult.Attempts 3 'Readiness polling did not apply its
 Assert-SequenceEqual @($stalledClockHealth.State.Calls) @('health', 'health-delay:11', 'health', 'health-delay:11', 'health') 'Stalled-clock readiness polling did not stop at its defensive attempt bound.'
 
 $payload = @(Get-AkashaInstallPayload)
-Assert-Equal $payload.Count 33 'Installed payload count changed.'
-Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 17 'Bridge payload count changed.'
+Assert-Equal $payload.Count 34 'Installed payload count changed.'
+Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 18 'Bridge payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -like 'scripts\*' }).Count 9 'Script payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -notlike 'bridge\*' -and $_.Source -notlike 'scripts\*' }).Count 7 'Root payload count changed.'
 Assert-True (@($payload | Where-Object { $_.Source -ceq $launchers.Install }).Count -eq 0) 'Install launcher must not be installed.'
 $expectedPayloadSources = @(
   'bridge\bridge_core.py', 'bridge\config.py', 'bridge\favorite_sticker.py', 'bridge\main.py', 'bridge\money_action.py', 'bridge\money_service.py', 'bridge\ob_client.py',
-  'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\state.py',
+  'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\reply_store.py', 'bridge\state.py',
   'bridge\uia_fixed_sender.py', 'bridge\uia_support.py',
   'bridge\calibrate_uia_fixed.py', 'bridge\web_panel.py',
   'bridge\config.example.json', 'bridge\requirements.txt', 'bridge\requirements.lock',
@@ -388,6 +388,16 @@ $expectedFavoriteStickerPluginSources = @(
   'plugins\astrbot_plugin_akasha_favorite_stickers\README.md'
 )
 Assert-SequenceEqual @($favoriteStickerPluginPayload.Source | Sort-Object) @($expectedFavoriteStickerPluginSources | Sort-Object) 'Favorite-sticker plugin payload is not the frozen exact allowlist.'
+$mergedReplyPluginPayload = @(Get-AkashaMergedReplyPluginPayload)
+Assert-Equal $mergedReplyPluginPayload.Count 5 'Merged-reply plugin payload count changed.'
+$expectedMergedReplyPluginSources = @(
+  'plugins\astrbot_plugin_akasha_merged_reply\__init__.py',
+  'plugins\astrbot_plugin_akasha_merged_reply\main.py',
+  'plugins\astrbot_plugin_akasha_merged_reply\metadata.yaml',
+  'plugins\astrbot_plugin_akasha_merged_reply\_conf_schema.json',
+  'plugins\astrbot_plugin_akasha_merged_reply\README.md'
+)
+Assert-SequenceEqual @($mergedReplyPluginPayload.Source | Sort-Object) @($expectedMergedReplyPluginSources | Sort-Object) 'Merged-reply plugin payload is not the frozen exact allowlist.'
 
 try {
   New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
@@ -402,6 +412,10 @@ try {
     Install-AkashaContactMemoryPlugin -SourceRoot $root -Paths $preInitPaths -Payload $favoriteStickerPluginPayload -PluginName 'astrbot_plugin_akasha_favorite_stickers' -PluginLabel 'favorite-sticker'
   } 'E_PLUGIN_INSTALL:*' 'Favorite-sticker plugin deployment ran before AstrBot init.' | Out-Null
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $preInitPaths.AstrBotData 'data\plugins\astrbot_plugin_akasha_favorite_stickers'))) 'Pre-init favorite-sticker deployment created the AstrBot plugin target.'
+  Assert-ThrowsLike {
+    Install-AkashaContactMemoryPlugin -SourceRoot $root -Paths $preInitPaths -Payload $mergedReplyPluginPayload -PluginName 'astrbot_plugin_akasha_merged_reply' -PluginLabel 'merged-reply'
+  } 'E_PLUGIN_INSTALL:*' 'Merged-reply plugin deployment ran before AstrBot init.' | Out-Null
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $preInitPaths.AstrBotData 'data\plugins\astrbot_plugin_akasha_merged_reply'))) 'Pre-init merged-reply deployment created the AstrBot plugin target.'
 
   $launcherProbeRoot = Join-Path $fixtureRoot 'launcher transport with spaces'
   $launcherProbeScripts = Join-Path $launcherProbeRoot 'scripts'
@@ -484,6 +498,9 @@ exit 0
   $installedFavoriteStickerPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\astrbot_plugin_akasha_favorite_stickers'
   $actualFavoriteStickerPluginFiles = @(Get-RelativeFiles -Base $installedFavoriteStickerPluginRoot)
   Assert-SequenceEqual $actualFavoriteStickerPluginFiles @($favoriteStickerPluginPayload.Relative | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object) 'Installed favorite-sticker plugin payload is not exact.'
+  $installedMergedReplyPluginRoot = Join-Path $successRoot 'data\astrbot\data\plugins\astrbot_plugin_akasha_merged_reply'
+  $actualMergedReplyPluginFiles = @(Get-RelativeFiles -Base $installedMergedReplyPluginRoot)
+  Assert-SequenceEqual $actualMergedReplyPluginFiles @($mergedReplyPluginPayload.Relative | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object) 'Installed merged-reply plugin payload is not exact.'
   foreach ($name in @($launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health, 'VERSION', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $successRoot $name) -PathType Leaf) "Installed root payload is missing $name."
   }

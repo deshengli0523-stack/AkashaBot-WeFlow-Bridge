@@ -1,0 +1,7 @@
+{
+  "enabled": {
+    "description": "启用 Akasha 私聊合并回复",
+    "type": "bool",
+    "default": true
+  }
+}

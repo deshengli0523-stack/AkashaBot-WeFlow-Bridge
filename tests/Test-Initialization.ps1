@@ -365,6 +365,8 @@ function New-AstrBotInitializerState {
 function New-AstrBotInitializer {
   param([Parameter(Mandatory)]$State)
 
+  $fixtureFactory = ${function:New-AstrBotFixtureValue}
+  $jsonWriter = ${function:Write-JsonAtomic}
   return {
     param($pythonExe, $astrBotRoot)
 
@@ -384,9 +386,9 @@ function New-AstrBotInitializer {
       $value = if ($State.InvalidSchema) {
         [ordered]@{ config_version = 2; dashboard = $null; platform = 'invalid' }
       } else {
-        New-AstrBotFixtureValue
+        & $fixtureFactory
       }
-      Write-JsonAtomic -Path (Join-Path $astrBotRoot 'data\cmd_config.json') -Value $value
+      & $jsonWriter -Path (Join-Path $astrBotRoot 'data\cmd_config.json') -Value $value
     }
     if ($State.MakeFirstLoginDirectory) {
       New-Item -ItemType Directory -Force -Path (Join-Path $astrBotRoot 'FIRST_LOGIN.txt') | Out-Null
@@ -606,6 +608,23 @@ try {
   Assert-Equal $partialState.Calls 0 'Partial AstrBot data invoked the initializer.'
   Assert-True (Test-Path -LiteralPath $partialSentinel -PathType Leaf) 'Partial pre-existing AstrBot data was deleted.'
   Assert-True (-not (Test-Path -LiteralPath $partialAstrBot.Paths.State)) 'Partial AstrBot data created state before side-effect-free preflight completed.'
+
+  $sharedAstrBot = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'shared-astrbot'
+  Write-ExistingAstrBotFixture $sharedAstrBot.Paths
+  $sharedAstrPath = Join-Path $sharedAstrBot.Paths.AstrBotData 'data\cmd_config.json'
+  $sharedAstrValue = Get-Content -LiteralPath $sharedAstrPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $sharedAstrValue.platform[0].enable = $true
+  Write-JsonAtomic -Path $sharedAstrPath -Value $sharedAstrValue
+  $sharedAstrFingerprint = Get-FileFingerprint $sharedAstrPath
+  $sharedWeFlowFingerprint = Get-FileFingerprint $sharedAstrBot.WeFlowConfigPath
+  $sharedState = New-AstrBotInitializerState
+  Assert-ThrowsExact {
+    Initialize-AkashaConfiguration -Paths $sharedAstrBot.Paths -WeFlowConfigPath $sharedAstrBot.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer $sharedState)
+  } 'E_ASTRBOT_SHARED_INSTANCE: AkashaBot requires a dedicated AstrBot data directory.' 'Enabled foreign AstrBot platform did not fail closed.'
+  Assert-Equal $sharedState.Calls 0 'Shared AstrBot rejection invoked the initializer.'
+  Assert-Equal (Get-FileFingerprint $sharedAstrPath) $sharedAstrFingerprint 'Shared AstrBot rejection changed AstrBot configuration.'
+  Assert-Equal (Get-FileFingerprint $sharedAstrBot.WeFlowConfigPath) $sharedWeFlowFingerprint 'Shared AstrBot rejection changed WeFlow configuration.'
+  Assert-True (-not (Test-Path -LiteralPath $sharedAstrBot.Paths.BridgeConfig)) 'Shared AstrBot rejection created a bridge configuration.'
 
   $astrPreflightJunction = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'astr-child-junction-preflight'
   New-Item -ItemType Directory -Force -Path $astrPreflightJunction.Paths.AstrBotData | Out-Null
@@ -968,47 +987,15 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal ([string]$freshAstr.dashboard.host) '127.0.0.1' 'AstrBot dashboard host is wrong.'
   Assert-Equal ([int]$freshAstr.dashboard.port) 6185 'AstrBot dashboard port is wrong.'
   Assert-Equal ([int]$freshAstr.platform_settings.forward_threshold) 5000 'AstrBot forward threshold is wrong.'
-  Assert-True ([bool]$freshAstr.platform_settings.segmented_reply.enable) 'AstrBot segmented reply was not enabled.'
-  Assert-True ([bool]$freshAstr.platform_settings.segmented_reply.only_llm_result) 'AstrBot segmented reply is not limited to LLM results.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval_method) 'random' 'AstrBot segmented interval method is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.interval) '0.8,1.8' 'AstrBot segmented interval is wrong.'
-  Assert-Equal ([int]$freshAstr.platform_settings.segmented_reply.words_count_threshold) 2147483647 'AstrBot segmented threshold is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.split_mode) 'regex' 'AstrBot segmented split mode is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.regex) '.{0,24}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,25}' 'AstrBot segmented regex is wrong.'
-  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule) '\s+' 'AstrBot content cleanup rule is wrong.'
+  Assert-True (-not [bool]$freshAstr.provider_settings.streaming_response) 'AstrBot streaming response was not disabled.'
+  Assert-Equal (@($freshAstr.plugin_set) -join ',') '*' 'Fresh AstrBot plugin_set was not initialized to the wildcard policy.'
+  Assert-True (-not [bool]$freshAstr.platform_settings.segmented_reply.enable) 'AstrBot segmented reply setting was not preserved.'
+  Assert-Equal ([string]$freshAstr.platform_settings.segmented_reply.preserve_fixture) 'segment-keep' 'AstrBot segmented reply extension field was lost.'
+  Assert-True ($null -eq $freshAstr.platform_settings.segmented_reply.PSObject.Properties['regex']) 'Initializer still injected the legacy segmented-reply regex.'
   Assert-True ([bool]$freshBridge.money_receive_enabled) 'Fresh bridge did not enable incoming money handling.'
   Assert-Equal ([int]$freshBridge.money_receive_timeout_seconds) 180 'Fresh bridge money timeout is wrong.'
   Assert-Equal ([int]$freshBridge.money_receipt_poll_seconds) 1 'Fresh bridge receipt poll interval is wrong.'
-  $segmentPattern = [string]$freshAstr.platform_settings.segmented_reply.regex
-  $segmentCleanupPattern = [string]$freshAstr.platform_settings.segmented_reply.content_cleanup_rule
-  $segmentOptions = [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::Multiline
-  $fullWidthSpace = [string][char]0x3000
-  $chineseQuestion = [string][char]0xff1f
-  $chineseExclamation = [string][char]0xff01
-  $punctuationRun = $chineseQuestion + $chineseExclamation
-  $segmentCases = @(
-    [pscustomobject]@{ Name = 'ordinary spaces'; Input = 'alpha beta'; Expected = @('alpha', 'beta') },
-    [pscustomobject]@{ Name = 'full-width spaces'; Input = ('alpha' + $fullWidthSpace + 'beta'); Expected = @('alpha', 'beta') },
-    [pscustomobject]@{ Name = 'tabs'; Input = "alpha`tbeta"; Expected = @('alpha', 'beta') },
-    [pscustomobject]@{ Name = 'blank lines'; Input = "alpha`r`n`r`nbeta"; Expected = @('alpha', 'beta') },
-    [pscustomobject]@{ Name = 'punctuation runs'; Input = ('hello' + $punctuationRun + ' next'); Expected = @(('hello' + $punctuationRun), 'next') },
-    [pscustomobject]@{ Name = 'decimal points'; Input = 'version3.14stable'; Expected = @('version3.14stable') },
-    [pscustomobject]@{ Name = 'strict twenty-five character cap'; Input = 'abcdefghijklmnopqrstuvwxyz'; Expected = @('abcdefghijklmnopqrstuvwxy', 'z') }
-  )
-  foreach ($segmentCase in $segmentCases) {
-    $actualSegments = @(
-      [regex]::Matches($segmentCase.Input, $segmentPattern, $segmentOptions) | ForEach-Object {
-        $segment = [regex]::Replace($_.Value, $segmentCleanupPattern, '').Trim()
-        if ($segment.Length -gt 0) {
-          $segment
-        }
-      }
-    )
-    Assert-Equal ($actualSegments -join '|') ($segmentCase.Expected -join '|') "AstrBot segmented reply failed the $($segmentCase.Name) case."
-    foreach ($actualSegment in $actualSegments) {
-      Assert-True ($actualSegment.Length -le 25) "AstrBot segmented reply exceeded 25 characters in the $($segmentCase.Name) case."
-    }
-  }
+  Assert-Equal ([int]$freshBridge.merged_reply_protocol_version) 1 'Fresh bridge merged-reply protocol version is wrong.'
   Assert-Equal @($freshAstr.platform).Count 1 'AstrBot platform count is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].id) 'akasha_ob11' 'AstrBot platform id is wrong.'
   Assert-Equal ([string]$freshAstr.platform[0].type) 'aiocqhttp' 'AstrBot platform type is wrong.'
@@ -1082,6 +1069,9 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
 
   $existing = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'existing-success'
   Write-ExistingAstrBotFixture $existing.Paths
+  $existingAstrBefore = Get-Content -LiteralPath (Join-Path $existing.Paths.AstrBotData 'data\cmd_config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  Set-JsonProperty -Object $existingAstrBefore -Name 'plugin_set' -Value @('fixture_plugin')
+  Write-JsonAtomic -Path (Join-Path $existing.Paths.AstrBotData 'data\cmd_config.json') -Value $existingAstrBefore
   $existingToken = 'b' * 64
   Write-ExistingBridgeFixture -Paths $existing.Paths -Token $existingToken
   $existingBridgeBefore = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1097,10 +1087,11 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal $existingState.Calls 0 'Existing AstrBot invoked the initializer.'
   $existingBridgeAfter = Get-Content -LiteralPath $existing.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-True ([string]$existingBridgeAfter.access_token -ceq $existingToken) 'Existing valid bridge token changed.'
-  Assert-Equal ([double]$existingBridgeAfter.uia_fixed_pre_send_delay) 5.0 'Existing bridge post-paste delay maximum was not migrated to five seconds.'
+  Assert-Equal ([double]$existingBridgeAfter.uia_fixed_pre_send_delay) 10.0 'Existing bridge post-paste preview delay was not preserved.'
   Assert-True ([bool]$existingBridgeAfter.money_receive_enabled) 'Existing bridge did not receive the money feature default.'
   Assert-Equal ([int]$existingBridgeAfter.money_receive_timeout_seconds) 180 'Existing bridge money timeout default is wrong.'
   Assert-Equal ([int]$existingBridgeAfter.money_receipt_poll_seconds) 1 'Existing bridge receipt poll default is wrong.'
+  Assert-Equal ([int]$existingBridgeAfter.merged_reply_protocol_version) 1 'Existing bridge merged-reply protocol version is wrong.'
   Assert-Equal ([string]$existingBridgeAfter.unknown_nonlegacy_field) 'preserve-me' 'Existing unknown non-legacy bridge field was lost.'
   Assert-Equal ($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress) $existingCalibrationJson 'Existing schema 1 calibration was not preserved exactly.'
   $existingCalibrationBytesAfter = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($existingBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress)))
@@ -1116,6 +1107,7 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Assert-Equal ([string]$existingAstr.dashboard.preserve_fixture) 'dashboard-keep' 'Existing AstrBot dashboard field was lost.'
   Assert-Equal ([string]$existingAstr.platform_settings.preserve_fixture) 'settings-keep' 'Existing AstrBot platform settings field was lost.'
   Assert-Equal ([string]$existingAstr.platform_settings.segmented_reply.preserve_fixture) 'segment-keep' 'Existing AstrBot segmented reply field was lost.'
+  Assert-Equal (@($existingAstr.plugin_set) -join ',') 'fixture_plugin,astrbot_plugin_akasha_contact_memory,astrbot_plugin_akasha_merged_reply' 'Existing explicit plugin_set was not extended exactly once.'
   Assert-Equal @($existingAstr.platform).Count 2 'Akasha platform upsert removed or duplicated an existing platform.'
   $preservedPlatform = @($existingAstr.platform | Where-Object { $_.id -ceq 'fixture-platform' })
   $akashaPlatform = @($existingAstr.platform | Where-Object { $_.id -ceq 'akasha_ob11' })
@@ -1127,12 +1119,14 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Initialize-AkashaConfiguration -Paths $existing.Paths -WeFlowConfigPath $existing.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer $existingState)
   $existingAstrRepeat = Get-Content -LiteralPath (Join-Path $existing.Paths.AstrBotData 'data\cmd_config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-Equal @($existingAstrRepeat.platform | Where-Object { $_.id -ceq 'akasha_ob11' }).Count 1 'Repeated platform upsert duplicated akasha_ob11.'
+  Assert-Equal (@($existingAstrRepeat.plugin_set) -join ',') 'fixture_plugin,astrbot_plugin_akasha_contact_memory,astrbot_plugin_akasha_merged_reply' 'Repeated initialization duplicated or reordered plugin_set.'
 
   $legacy = New-ConfigurationFixture -BaseRoot $configurationRoot -Name 'legacy-bridge-success'
   Write-ExistingAstrBotFixture $legacy.Paths
   $legacyToken = 'c' * 64
   $legacyBridge = [pscustomobject][ordered]@{
     access_token = $legacyToken
+    buffer_seconds = 7.0
     unknown_nonlegacy_field = 'keep-legacy-unknown'
     send_method = 'weflow_api'
     weflow_send_api = 'http://127.0.0.1:5031/api/v1/message'
@@ -1154,6 +1148,9 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
   Initialize-AkashaConfiguration -Paths $legacy.Paths -WeFlowConfigPath $legacy.WeFlowConfigPath -AstrBotInitializer (New-AstrBotInitializer (New-AstrBotInitializerState))
   $legacyBridgeAfter = Get-Content -LiteralPath $legacy.Paths.BridgeConfig -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-Equal ([string]$legacyBridgeAfter.access_token) $legacyToken 'Legacy cleanup changed the valid bridge token.'
+  Assert-Equal ([double]$legacyBridgeAfter.buffer_quiet_seconds) 1.5 'Legacy buffer did not receive the quiet-window default.'
+  Assert-Equal ([double]$legacyBridgeAfter.buffer_max_seconds) 7.0 'Legacy buffer was not migrated to the hard maximum.'
+  Assert-Equal ([double]$legacyBridgeAfter.buffer_seconds) 7.0 'Legacy compatibility buffer value changed during migration.'
   Assert-Equal ([string]$legacyBridgeAfter.unknown_nonlegacy_field) 'keep-legacy-unknown' 'Legacy cleanup removed an unknown non-legacy field.'
   Assert-Equal ($legacyBridgeAfter.uia_fixed_calibration | ConvertTo-Json -Depth 10 -Compress) ($expectedUncompletedCalibration | ConvertTo-Json -Depth 10 -Compress) 'Legacy flat coordinates were migrated instead of adding the uncompleted schema.'
   foreach ($legacyKey in $legacyBridgeKeys) {
@@ -1201,7 +1198,9 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
     $bridgeCleanupWriterState.Calls++
     AkashaBot.Common\Write-JsonAtomic -Path $Path -Value $Value
     if ([System.IO.Path]::GetFullPath($Path).Equals([System.IO.Path]::GetFullPath($bridgeCleanupFailure.Paths.BridgeConfig), [System.StringComparison]::OrdinalIgnoreCase)) {
-      $bridgeCleanupWriterState.TargetWasReplaced = (Get-FileFingerprint $Path) -cne $bridgeCleanupOriginalFingerprint
+      $bridgeCleanupWriterState.TargetWasReplaced = [Convert]::ToBase64String(
+        [System.IO.File]::ReadAllBytes($Path)
+      ) -cne $bridgeCleanupOriginalFingerprint
       throw 'E_JSON_ATOMIC_CLEANUP: Unable to remove temporary JSON artifacts.'
     }
   }.GetNewClosure()
@@ -1228,7 +1227,9 @@ New-Item -ItemType Junction -Path `$firstLogin -Target `$externalTarget | Out-Nu
     param([string]$Path, $Value)
     AkashaBot.Common\Write-JsonAtomic -Path $Path -Value $Value
     if ([System.IO.Path]::GetFullPath($Path).Equals([System.IO.Path]::GetFullPath($weFlowCleanupFailure.WeFlowConfigPath), [System.StringComparison]::OrdinalIgnoreCase)) {
-      $weFlowCleanupWriterState.TargetWasReplaced = (Get-FileFingerprint $Path) -cne $weFlowCleanupOriginalFingerprint
+      $weFlowCleanupWriterState.TargetWasReplaced = [Convert]::ToBase64String(
+        [System.IO.File]::ReadAllBytes($Path)
+      ) -cne $weFlowCleanupOriginalFingerprint
       throw 'E_JSON_ATOMIC_CLEANUP: Unable to remove temporary JSON artifacts.'
     }
   }.GetNewClosure()

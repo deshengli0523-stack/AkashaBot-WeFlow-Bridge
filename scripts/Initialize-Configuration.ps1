@@ -10,7 +10,7 @@ function Set-JsonProperty {
     $Value
   )
 
-  if ($Object.PSObject.Properties.Name -ccontains $Name) {
+  if ($null -ne $Object.PSObject.Properties[$Name]) {
     $Object.$Name = $Value
   } else {
     $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
@@ -39,6 +39,32 @@ function New-HexToken {
 
 function New-DashboardPassword {
   return 'Ak!' + (New-HexToken).Substring(0, 21)
+}
+
+function Get-AkashaFiniteNumber {
+  param(
+    $Value,
+    [Parameter(Mandatory)][double]$Minimum,
+    [Parameter(Mandatory)][double]$Maximum
+  )
+
+  if ($null -eq $Value -or $Value -is [bool]) {
+    return $null
+  }
+  $parsed = 0.0
+  if (-not [double]::TryParse(
+      [string]$Value,
+      [System.Globalization.NumberStyles]::Float,
+      [System.Globalization.CultureInfo]::InvariantCulture,
+      [ref]$parsed
+    )) {
+    return $null
+  }
+  if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed) -or
+      $parsed -lt $Minimum -or $parsed -gt $Maximum) {
+    return $null
+  }
+  return [double]$parsed
 }
 
 function Test-AkashaConfigurationPath {
@@ -539,6 +565,27 @@ function Initialize-AkashaConfiguration {
           $platformProperty.Value -isnot [System.Collections.IList]) {
         throw 'E_ASTRBOT_SCHEMA: AstrBot configuration is missing dashboard or platform data.'
       }
+      $foreignEnabledPlatforms = @(
+        foreach ($candidatePlatform in @($astr.platform)) {
+          if ($null -eq $candidatePlatform -or
+              $candidatePlatform.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+            throw 'E_ASTRBOT_SCHEMA: AstrBot configuration is missing dashboard or platform data.'
+          }
+          $candidateId = if ($null -ne $candidatePlatform.PSObject.Properties['id']) {
+            [string]$candidatePlatform.PSObject.Properties['id'].Value
+          } else { '' }
+          $candidateEnabled = (
+            $null -ne $candidatePlatform.PSObject.Properties['enable'] -and
+            $candidatePlatform.PSObject.Properties['enable'].Value -eq $true
+          )
+          if ($candidateId -cne 'akasha_ob11' -and $candidateEnabled) {
+            $candidateId
+          }
+        }
+      )
+      if ($foreignEnabledPlatforms.Count -gt 0) {
+        throw 'E_ASTRBOT_SHARED_INSTANCE: AkashaBot requires a dedicated AstrBot data directory.'
+      }
       Set-JsonProperty -Object $astr.dashboard -Name 'enable' -Value $true
       Set-JsonProperty -Object $astr.dashboard -Name 'host' -Value '127.0.0.1'
       Set-JsonProperty -Object $astr.dashboard -Name 'port' -Value 6185
@@ -555,32 +602,48 @@ function Initialize-AkashaConfiguration {
       }
       Set-JsonProperty -Object $platformSettings -Name 'forward_threshold' -Value 5000
 
-      $segmentedReplyProperty = $platformSettings.PSObject.Properties['segmented_reply']
-      if ($null -eq $segmentedReplyProperty) {
-        $segmentedReply = [pscustomobject][ordered]@{}
-        Set-JsonProperty -Object $platformSettings -Name 'segmented_reply' -Value $segmentedReply
-      } elseif ($null -eq $segmentedReplyProperty.Value -or
-          $segmentedReplyProperty.Value.GetType() -ne [System.Management.Automation.PSCustomObject]) {
-        throw 'E_ASTRBOT_SCHEMA: AstrBot segmented reply settings must be a JSON object.'
+      $providerSettingsProperty = $astr.PSObject.Properties['provider_settings']
+      if ($null -eq $providerSettingsProperty) {
+        $providerSettings = [pscustomobject][ordered]@{}
+        Set-JsonProperty -Object $astr -Name 'provider_settings' -Value $providerSettings
+      } elseif ($null -eq $providerSettingsProperty.Value -or
+          $providerSettingsProperty.Value.GetType() -ne [System.Management.Automation.PSCustomObject]) {
+        throw 'E_ASTRBOT_SCHEMA: AstrBot provider settings must be a JSON object.'
       } else {
-        $segmentedReply = $segmentedReplyProperty.Value
+        $providerSettings = $providerSettingsProperty.Value
       }
-      Set-JsonProperty -Object $segmentedReply -Name 'enable' -Value $true
-      Set-JsonProperty -Object $segmentedReply -Name 'only_llm_result' -Value $true
-      Set-JsonProperty -Object $segmentedReply -Name 'interval_method' -Value 'random'
-      Set-JsonProperty -Object $segmentedReply -Name 'interval' -Value '0.8,1.8'
-      Set-JsonProperty -Object $segmentedReply -Name 'log_base' -Value 2.6
-      Set-JsonProperty -Object $segmentedReply -Name 'words_count_threshold' -Value 2147483647
-      Set-JsonProperty -Object $segmentedReply -Name 'split_mode' -Value 'regex'
-      Set-JsonProperty -Object $segmentedReply -Name 'regex' -Value '.{0,24}?(?:[\u3002\uff1f\uff01~\u2026\uff1b!?;](?![\u3002\uff1f\uff01~\u2026\uff1b!?;])|(?<!\d)\.(?![\d.])|\s(?!\s))|.{1,25}'
-      Set-JsonProperty -Object $segmentedReply -Name 'split_words' -Value @(
-        [string]([char]0x3002),
-        [string]([char]0xff1f),
-        [string]([char]0xff01),
-        '~',
-        [string]([char]0x2026)
-      )
-      Set-JsonProperty -Object $segmentedReply -Name 'content_cleanup_rule' -Value '\s+'
+      Set-JsonProperty -Object $providerSettings -Name 'streaming_response' -Value $false
+
+      $pluginSetProperty = $astr.PSObject.Properties['plugin_set']
+      if ($null -eq $pluginSetProperty) {
+        $pluginSetValues = @('*')
+      } elseif ($null -eq $pluginSetProperty.Value -or
+          $pluginSetProperty.Value -isnot [System.Collections.IList] -or
+          $pluginSetProperty.Value -is [string]) {
+        throw 'E_ASTRBOT_SCHEMA: AstrBot plugin_set must be a JSON array.'
+      } else {
+        $pluginSetValues = @($pluginSetProperty.Value)
+      }
+      $pluginSet = New-Object System.Collections.ArrayList
+      foreach ($pluginName in $pluginSetValues) {
+        if ($pluginName -isnot [string] -or [string]::IsNullOrWhiteSpace($pluginName)) {
+          throw 'E_ASTRBOT_SCHEMA: AstrBot plugin_set must contain plugin names.'
+        }
+        if (-not (@($pluginSet) -ccontains [string]$pluginName)) {
+          [void]$pluginSet.Add([string]$pluginName)
+        }
+      }
+      if (-not (@($pluginSet) -ccontains '*')) {
+        foreach ($requiredPlugin in @(
+            'astrbot_plugin_akasha_contact_memory',
+            'astrbot_plugin_akasha_merged_reply'
+          )) {
+          if (-not (@($pluginSet) -ccontains $requiredPlugin)) {
+            [void]$pluginSet.Add($requiredPlugin)
+          }
+        }
+      }
+      Set-JsonProperty -Object $astr -Name 'plugin_set' -Value @($pluginSet)
 
       $akashaPlatform = [pscustomobject][ordered]@{
         id = 'akasha_ob11'
@@ -656,20 +719,50 @@ function Initialize-AkashaConfiguration {
           throw 'E_BRIDGE_TOKEN: Existing bridge token is missing or invalid.'
         }
         $preSendDelayProperty = $bridge.PSObject.Properties['uia_fixed_pre_send_delay']
-        $preSendDelayIsLegacyDefault = (
-          $null -ne $preSendDelayProperty -and
-          $null -ne $preSendDelayProperty.Value -and
-          $preSendDelayProperty.Value -is [System.ValueType] -and
-          $preSendDelayProperty.Value -isnot [bool] -and
-          [double]$preSendDelayProperty.Value -eq 10.0
-        )
-        if ($null -eq $preSendDelayProperty -or $preSendDelayIsLegacyDefault) {
+        if ($null -eq $preSendDelayProperty) {
           Set-JsonProperty -Object $bridge -Name 'uia_fixed_pre_send_delay' -Value 5.0
         }
+
+        $quietProperty = $bridge.PSObject.Properties['buffer_quiet_seconds']
+        $maximumProperty = $bridge.PSObject.Properties['buffer_max_seconds']
+        $legacyBufferProperty = $bridge.PSObject.Properties['buffer_seconds']
+        $quietValue = Get-AkashaFiniteNumber -Value $(
+          if ($null -eq $quietProperty) { $null } else { $quietProperty.Value }
+        ) -Minimum 0.2 -Maximum 10.0
+        $maximumValue = Get-AkashaFiniteNumber -Value $(
+          if ($null -eq $maximumProperty) { $null } else { $maximumProperty.Value }
+        ) -Minimum 0.2 -Maximum 30.0
+        $legacyValue = Get-AkashaFiniteNumber -Value $(
+          if ($null -eq $legacyBufferProperty) { $null } else { $legacyBufferProperty.Value }
+        ) -Minimum 0.2 -Maximum 30.0
+
+        if ($null -ne $quietValue -and $null -ne $maximumValue -and
+            $maximumValue -lt $quietValue) {
+          $quietValue = 1.5
+          $maximumValue = 5.0
+        } elseif ($null -ne $quietValue -and $null -ne $maximumValue) {
+          # Preserve the valid new pair exactly.
+        } elseif ($null -ne $quietValue) {
+          if ($null -ne $legacyValue -and $legacyValue -ge $quietValue) {
+            $maximumValue = $legacyValue
+          } else {
+            $maximumValue = [Math]::Max(5.0, $quietValue)
+          }
+        } elseif ($null -ne $maximumValue) {
+          $quietValue = [Math]::Min(1.5, $maximumValue)
+        } else {
+          $maximumValue = if ($null -ne $legacyValue) { $legacyValue } else { 5.0 }
+          $quietValue = [Math]::Min(1.5, $maximumValue)
+        }
+        Set-JsonProperty -Object $bridge -Name 'buffer_quiet_seconds' -Value ([double]$quietValue)
+        Set-JsonProperty -Object $bridge -Name 'buffer_max_seconds' -Value ([double]$maximumValue)
+        Set-JsonProperty -Object $bridge -Name 'buffer_seconds' -Value ([double]$maximumValue)
+
         if ($null -eq $bridge.PSObject.Properties['uia_fixed_calibration']) {
           Set-JsonProperty -Object $bridge -Name 'uia_fixed_calibration' -Value $calibrationTemplateProperty.Value
         }
       }
+      Set-JsonProperty -Object $bridge -Name 'merged_reply_protocol_version' -Value 1
 
       $legacyBridgeKeys = @(
         'send_method',
