@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.4 - 2026-08-06
 
 - Add contact-scoped merged replies: each private inbound batch advances a
   durable reply epoch, and a newer epoch supersedes older model work and
