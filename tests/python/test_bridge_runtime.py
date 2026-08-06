@@ -241,10 +241,27 @@ def _unsafe_logging_calls(source, filename="<source>"):
 
 class BridgeRuntimeTests(unittest.TestCase):
     @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._previous_state_dir = os.environ.get("AKASHABOT_STATE_DIR")
+        cls._isolated_state_dir = tempfile.TemporaryDirectory(
+            prefix="akasha-bridge-runtime-state-"
+        )
+        os.environ["AKASHABOT_STATE_DIR"] = cls._isolated_state_dir.name
+
+    @classmethod
     def tearDownClass(cls):
-        cache_dir = pathlib.Path(__file__).parent / "__pycache__"
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir)
+        try:
+            cache_dir = pathlib.Path(__file__).parent / "__pycache__"
+            if cache_dir.is_dir():
+                shutil.rmtree(cache_dir)
+        finally:
+            if cls._previous_state_dir is None:
+                os.environ.pop("AKASHABOT_STATE_DIR", None)
+            else:
+                os.environ["AKASHABOT_STATE_DIR"] = cls._previous_state_dir
+            cls._isolated_state_dir.cleanup()
+            super().tearDownClass()
 
     @staticmethod
     def _load_ob_protocol(module_name, state_module, config_module, requests_module):
@@ -1052,7 +1069,8 @@ class BridgeRuntimeTests(unittest.TestCase):
             self.assertLogs("ob11-bridge", level="INFO") as captured,
         ):
             bridge.add_to_buffer(sticker)
-            bridge.process_sender("wxid-contact", 1)
+            media_buffer = next(iter(bridge.pending_buffers))
+            bridge.process_sender(media_buffer, 1)
 
         self.assertEqual(1, len(pushed))
         serialized_event = json.dumps(pushed[0], ensure_ascii=False)
@@ -1644,6 +1662,7 @@ class BridgeRuntimeTests(unittest.TestCase):
     def _load_main_runtime(self, request_get):
         state_module = types.ModuleType("state")
         state_module.running = False
+        state_module.stopping = False
         state_module.lifecycle_generation = 0
         state_module.run_lock = threading.Lock()
         state_module.paused = threading.Event()
@@ -1822,6 +1841,53 @@ class BridgeRuntimeTests(unittest.TestCase):
             [(1,), (2,)],
         )
         self.assertFalse(hasattr(state_module, "ob_client_started"))
+
+    def test_bridge_stop_drains_before_sender_stop_and_timeout_stays_recoverable(self):
+        main_module, state_module, _, _, _ = self._load_main_runtime(
+            lambda *_args, **_kwargs: types.SimpleNamespace(status_code=200)
+        )
+
+        class Sender:
+            def __init__(self):
+                self.stopped = False
+
+            def stop_pending(self):
+                self.stopped = True
+
+        sender = Sender()
+        state_module.running = True
+        state_module.lifecycle_generation = 7
+        state_module.sender_instance = sender
+        state_module.clear_merged_reply_capability = lambda: None
+        state_module.stop_merged_reply_workers = lambda _generation: None
+        observations = []
+
+        def drain(generation, _timeout):
+            observations.append(
+                (generation, state_module.stopping, sender.stopped)
+            )
+            with self.assertRaisesRegex(RuntimeError, "E_MERGED_REPLY_STOPPING"):
+                main_module._start_bridge()
+            return True
+
+        state_module.drain_merged_reply_workers = drain
+        self.assertTrue(main_module._stop_bridge())
+        self.assertEqual([(7, True, False)], observations)
+        self.assertTrue(sender.stopped)
+        self.assertFalse(state_module.running)
+        self.assertFalse(state_module.stopping)
+
+        timeout_sender = Sender()
+        state_module.running = True
+        state_module.stopping = False
+        state_module.lifecycle_generation = 8
+        state_module.sender_instance = timeout_sender
+        state_module.drain_merged_reply_workers = lambda *_args: False
+        with self.assertRaisesRegex(RuntimeError, "E_MERGED_REPLY_STOP_TIMEOUT"):
+            main_module._stop_bridge()
+        self.assertTrue(state_module.running)
+        self.assertFalse(state_module.stopping)
+        self.assertFalse(timeout_sender.stopped)
 
     def test_bridge_invalid_weflow_token_remains_terminal(self):
         main_module, state_module, _, _, fake_bridge = self._load_main_runtime(

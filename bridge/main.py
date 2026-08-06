@@ -227,6 +227,8 @@ def _release_pid_file_if_owned(path: str, record: str) -> None:
 
 def _start_bridge():
     with state.run_lock:
+        if bool(getattr(state, "stopping", False)):
+            raise RuntimeError("E_MERGED_REPLY_STOPPING")
         if state.running:
             return
         sender = UiaFixedSender(
@@ -250,11 +252,22 @@ def _start_bridge():
                 ),
             ),
         )
-        state.lifecycle_generation += 1
-        generation = state.lifecycle_generation
+        allocator = getattr(state, "allocate_lifecycle_generation", None)
+        if callable(allocator):
+            generation = allocator()
+        else:
+            generation = int(getattr(state, "lifecycle_generation", 0)) + 1
+            state.lifecycle_generation = generation
         state.running = True
+        state.stopping = False
         state.sender_instance = sender
     state.paused.clear()
+    clear_capability = getattr(state, "clear_merged_reply_capability", None)
+    if callable(clear_capability):
+        clear_capability()
+    start_workers = getattr(state, "start_merged_reply_workers", None)
+    if callable(start_workers):
+        start_workers(generation)
 
     t = threading.Thread(
         target=_run_ob_client,
@@ -276,11 +289,46 @@ def _start_bridge():
 
 def _stop_bridge():
     with state.run_lock:
-        state.running = False
-        state.lifecycle_generation += 1
+        if bool(getattr(state, "stopping", False)):
+            raise RuntimeError("E_MERGED_REPLY_STOPPING")
+        if not state.running:
+            return True
+        generation = state.lifecycle_generation
+        state.stopping = True
+        clear_capability = getattr(state, "clear_merged_reply_capability", None)
+        if callable(clear_capability):
+            clear_capability()
         sender = state.sender_instance
+
+    drain_workers = getattr(state, "drain_merged_reply_workers", None)
+    try:
+        drained = (
+            not callable(drain_workers)
+            or drain_workers(generation, 20.0)
+        )
+    except BaseException:
+        with state.run_lock:
+            if state.lifecycle_generation == generation and state.running:
+                state.stopping = False
+        raise
+    if not drained:
+        with state.run_lock:
+            if state.lifecycle_generation == generation and state.running:
+                state.stopping = False
+        log.error("[Web] 合并回复仍处于提交边界，拒绝强制停止")
+        raise RuntimeError("E_MERGED_REPLY_STOP_TIMEOUT")
+
+    with state.run_lock:
+        if state.lifecycle_generation != generation:
+            state.stopping = False
+            raise RuntimeError("E_MERGED_REPLY_STOP_GENERATION")
+        state.running = False
+        state.stopping = False
         if sender is not None:
             sender.stop_pending()
+        stop_workers = getattr(state, "stop_merged_reply_workers", None)
+        if callable(stop_workers):
+            stop_workers(generation)
 
     # 切断 SSE 长连接，让 _bridge_loop 的 listen_sse() 从阻塞中退出
     with state.bridge_lock:
@@ -315,6 +363,7 @@ def _stop_bridge():
     state._ob_ws_loop = None
 
     log.info("[Web] 已停止")
+    return True
 
 
 def _bridge_loop(generation: int):

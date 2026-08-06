@@ -200,6 +200,29 @@ function Get-AkashaStopWeFlowDiscovery {
   return $candidate
 }
 
+function Request-AkashaBridgeGracefulStop {
+  param([Parameter(Mandatory)]$Paths)
+
+  if (-not (Test-Path -LiteralPath $Paths.BridgeConfig -PathType Leaf)) {
+    return $true
+  }
+  try {
+    Assert-AkashaLifecyclePathBoundary -Paths $Paths -Candidates @($Paths.BridgeConfig)
+    $configuration = Get-Content -LiteralPath $Paths.BridgeConfig -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $protocolProperty = $configuration.PSObject.Properties['merged_reply_protocol_version']
+    if ($null -eq $protocolProperty) { return $true }
+    if ([int]$protocolProperty.Value -ne 1) { return $false }
+    $portProperty = $configuration.PSObject.Properties['web_port']
+    $port = if ($null -eq $portProperty) { 8766 } else { [int]$portProperty.Value }
+    if ($port -lt 1024 -or $port -gt 65535) { return $false }
+    $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri ("http://127.0.0.1:{0}/stop" -f $port) -TimeoutSec 25 -ErrorAction Stop
+    $payload = $response.Content | ConvertFrom-Json -ErrorAction Stop
+    return $payload.ok -eq $true
+  } catch {
+    return $false
+  }
+}
+
 function Stop-AkashaServices {
   param([Parameter(Mandatory)][string]$InstallRoot)
 
@@ -287,6 +310,12 @@ function Stop-AkashaServices {
           $events.Add("refused name=$($record.Name)")
           continue
         }
+        if ([string]$record.Name -ceq 'bridge' -and
+            -not (Request-AkashaBridgeGracefulStop -Paths $paths)) {
+          $identityRefused = $true
+          $events.Add('refused-graceful name=bridge')
+          continue
+        }
         try {
           Get-AkashaStopPreflight -Paths $paths
           if (-not $identity.Lease.TerminateAndWait(5000)) { throw 'timeout' }
@@ -326,17 +355,22 @@ function Stop-AkashaServices {
           $identityRefused = $true
           $events.Add('refused name=bridge-pid')
         } else {
-          try {
-            Get-AkashaStopPreflight -Paths $paths
-            if (-not $bridgeIdentity.Lease.TerminateAndWait(5000)) { throw 'timeout' }
-            $remaining = @($remaining | Where-Object { [int]$_.Pid -ne [int]$bridgePidState.Record.Pid })
-            Write-AkashaProcessState -Path $paths.ProcessState -Paths $paths -Records $remaining
-            $afterStop = Resolve-AkashaBridgePidState -Paths $paths
-            if ([string]$afterStop.Status -notin @('missing', 'stale')) { throw 'pid cleanup failed' }
-            $events.Add('stop name=bridge-pid')
-          } catch {
+          if (-not (Request-AkashaBridgeGracefulStop -Paths $paths)) {
             $identityRefused = $true
-            $events.Add('refused name=bridge-pid')
+            $events.Add('refused-graceful name=bridge-pid')
+          } else {
+            try {
+              Get-AkashaStopPreflight -Paths $paths
+              if (-not $bridgeIdentity.Lease.TerminateAndWait(5000)) { throw 'timeout' }
+              $remaining = @($remaining | Where-Object { [int]$_.Pid -ne [int]$bridgePidState.Record.Pid })
+              Write-AkashaProcessState -Path $paths.ProcessState -Paths $paths -Records $remaining
+              $afterStop = Resolve-AkashaBridgePidState -Paths $paths
+              if ([string]$afterStop.Status -notin @('missing', 'stale')) { throw 'pid cleanup failed' }
+              $events.Add('stop name=bridge-pid')
+            } catch {
+              $identityRefused = $true
+              $events.Add('refused name=bridge-pid')
+            }
           }
         }
       } finally {

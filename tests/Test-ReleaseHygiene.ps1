@@ -34,6 +34,7 @@ $expectedPublishFiles = @(
   'bridge/ob_client.py',
   'bridge/ob_protocol.py',
   'bridge/privacy.py',
+  'bridge/reply_store.py',
   'bridge/requirements.lock',
   'bridge/requirements.txt',
   'bridge/state.py',
@@ -65,6 +66,11 @@ $expectedPublishFiles = @(
   'plugins/astrbot_plugin_akasha_money_receiver/_conf_schema.json',
   'plugins/astrbot_plugin_akasha_money_receiver/main.py',
   'plugins/astrbot_plugin_akasha_money_receiver/metadata.yaml',
+  'plugins/astrbot_plugin_akasha_merged_reply/README.md',
+  'plugins/astrbot_plugin_akasha_merged_reply/__init__.py',
+  'plugins/astrbot_plugin_akasha_merged_reply/_conf_schema.json',
+  'plugins/astrbot_plugin_akasha_merged_reply/main.py',
+  'plugins/astrbot_plugin_akasha_merged_reply/metadata.yaml',
   'scripts/AkashaBot.Common.psm1',
   'scripts/Calibrate-Uia.ps1',
   'scripts/Initialize-Configuration.ps1',
@@ -88,6 +94,7 @@ $expectedPublishFiles = @(
   'tests/python/test_money_action.py',
   'tests/python/test_money_plugin.py',
   'tests/python/test_money_service.py',
+  'tests/python/test_merged_reply.py',
   'tests/python/test_uia_calibration.py',
   'tests/python/test_uia_fixed_sender.py',
   'tests/python/test_uia_support.py',
@@ -97,12 +104,12 @@ $expectedPublishFiles = @(
   ((-join @([char]0x5065, [char]0x5EB7, [char]0x68C0, [char]0x67E5)) + '.bat'),
   ((-join @([char]0x6821, [char]0x51C6)) + '.bat')
 )
-if ($expectedPublishFiles.Count -ne 83) {
-  throw "Release allowlist invariant is not 83 files: $($expectedPublishFiles.Count)"
+if ($expectedPublishFiles.Count -ne 90) {
+  throw "Release allowlist invariant is not 90 files: $($expectedPublishFiles.Count)"
 }
 $uniqueExpectedPublishFiles = @($expectedPublishFiles | Sort-Object -Unique)
-if ($uniqueExpectedPublishFiles.Count -ne 83) {
-  throw "Release allowlist must contain 83 unique entries; duplicate entries were found."
+if ($uniqueExpectedPublishFiles.Count -ne 90) {
+  throw "Release allowlist must contain 90 unique entries; duplicate entries were found."
 }
 $publishFiles = @(
   foreach ($entry in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop |
@@ -130,8 +137,8 @@ foreach ($relativePath in $actualPublishFiles) {
   }
 }
 $uniqueActualPublishFiles = @($actualPublishFiles | Sort-Object -Unique)
-if ($actualPublishFiles.Count -ne 83 -or $uniqueActualPublishFiles.Count -ne 83) {
-  throw "Published files must contain exactly 83 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
+if ($actualPublishFiles.Count -ne 90 -or $uniqueActualPublishFiles.Count -ne 90) {
+  throw "Published files must contain exactly 90 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
 }
 
 $bridgeRoot = Join-Path $root 'bridge'
@@ -257,6 +264,7 @@ $expectedLegacyContextLines = @(
   '          Set-JsonProperty -Object $bridge -Name ''uia_fixed_calibration'' -Value $calibrationTemplateProperty.Value',
   '        }',
   '      }',
+  '      Set-JsonProperty -Object $bridge -Name ''merged_reply_protocol_version'' -Value 1',
   ''
 ) + $expectedLegacyLines + @(
   '',

@@ -17,18 +17,33 @@ import hmac
 import os
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from typing import Optional
 
+_BRIDGE_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BRIDGE_MODULE_DIR not in sys.path:
+    sys.path.insert(0, _BRIDGE_MODULE_DIR)
+from reply_store import ReplyStoreError, default_store
+
 # ============ 状态控制 ============
 
 running = False
+stopping = False
 paused = threading.Event()
 paused.clear()
 run_lock = threading.Lock()
 bridge_thread = None
 lifecycle_generation = 0
+
+
+def allocate_lifecycle_generation() -> int:
+    """Allocate a restart-safe generation before accepting any work."""
+
+    global lifecycle_generation
+    lifecycle_generation = default_store().allocate_generation()
+    return lifecycle_generation
 
 
 def is_generation_running(generation: int) -> bool:
@@ -44,12 +59,14 @@ def get_sender_for_generation(generation: int):
 
 def deactivate_generation(generation: int) -> bool:
     """Atomically stop only the generation that observed the failure."""
-    global running, lifecycle_generation
+    global running, stopping, lifecycle_generation
     with run_lock:
         if not is_generation_running(generation):
             return False
         running = False
-        lifecycle_generation += 1
+        stopping = False
+        clear_merged_reply_capability()
+        stop_merged_reply_workers(generation)
         sender = sender_instance
         if sender is not None:
             sender.stop_pending()
@@ -68,6 +85,14 @@ _SEND_RESULT_MESSAGES = {
     "E_UIA_INPUT_FOCUS_FAILED": "未能定位或清空微信消息输入框",
     "E_UIA_SENDER_STOPPED": "桥接已停止，未执行发送",
     "E_UIA_SEND_CANCELLED": "此条发送已取消",
+    "E_UIA_REPLY_SUPERSEDED": "同一联系人发来新消息，旧回复已淘汰",
+    "E_UIA_REPLY_SUPERSEDED_DRAFT_QUARANTINED": (
+        "旧回复已淘汰，但输入框内容所有权无法确认；已暂停该联系人的自动回复"
+    ),
+    "E_UIA_DRAFT_QUARANTINED": (
+        "联系人输入框存在无法确认所有权的草稿，自动回复已暂停"
+    ),
+    "E_UIA_COMMIT_UNKNOWN": "发送按钮操作结果未知，禁止自动重试",
     "E_UIA_PASTE_FAILED": "剪贴板内容未能粘贴到微信",
     "E_UIA_IMAGE_MISSING": "待发送图片不存在或不可读取",
     "E_UIA_IMAGE_CLIPBOARD_FAILED": "图片未能写入微信粘贴所需的剪贴板",
@@ -94,6 +119,19 @@ _SEND_RESULT_MESSAGES = {
     "E_OB_SEND_EXCEPTION": "发送组件执行异常",
     "E_OB_NO_SENDABLE_SEGMENTS": "消息中没有可发送的内容",
     "E_OB_UNSUPPORTED_ACTION": "不支持的 OneBot 操作",
+    "E_OB_IDEMPOTENCY_CONFLICT": "相同请求标识携带了不同正文或目标",
+    "E_OB_STATE_CAPACITY": "合并回复持久状态已达到安全容量",
+    "E_EPOCH_CAPACITY": "合并回复目标回合表已达到安全容量",
+    "E_INGRESS_SPOOL_CAPACITY": "普通入站持久缓冲已达到安全容量",
+    "E_MERGED_REPLY_NOT_READY": "合并回复插件能力租约尚未就绪",
+    "E_MERGED_REPLY_LEASE_INVALID": "合并回复插件能力租约无效或已过期",
+    "E_MERGED_REPLY_ADMISSION_REQUIRED": "普通私聊回复缺少合并回复 admission",
+    "E_ADMISSION_INVALID": "合并回复 admission 无效或已结束",
+    "E_ADMISSION_CAPACITY": "合并回复 admission 已达到安全容量",
+    "E_OUTBOX_CAPACITY": "合并回复结果通知已达到安全容量",
+    "E_UIA_DRAFT_OWNERSHIP_LOST": "无法证明输入框草稿仍由本次回复所有",
+    "E_UIA_DRAFT_RECOVERY_REQUIRED": "重启后发现未确认草稿，需要人工检查",
+    "E_UIA_STOPPED": "桥接停止前未完成发送",
 }
 _SEND_RESULT_STAGES = {
     "request",
@@ -160,6 +198,164 @@ send_preview_lock = threading.Lock()
 current_send_cancel_event: Optional[threading.Event] = None
 current_send_preview: Optional[dict[str, object]] = None
 send_preview_sequence = 0
+_reply_epochs: dict[int, tuple[int, int]] = {}
+_reply_draft_quarantine: dict[int, dict[str, object]] = {}
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def advance_reply_epoch(
+    target_id: object,
+    generation: object,
+    raw_id: object = "",
+    raw_payload: object = None,
+) -> int | None:
+    """Advance one private contact and cancel only its uncommitted old reply."""
+
+    normalized_target = _positive_int(target_id)
+    normalized_generation = _positive_int(generation)
+    if normalized_target is None or normalized_generation is None:
+        raise ValueError("invalid reply epoch identity")
+
+    normalized_raw_id = str(raw_id or "").strip()
+    next_epoch = (
+        default_store().accept_raw_and_advance_epoch(
+            normalized_target,
+            normalized_generation,
+            normalized_raw_id,
+            dict(raw_payload) if isinstance(raw_payload, dict) else None,
+        )
+        if normalized_raw_id
+        else default_store().advance_epoch(
+            normalized_target,
+            normalized_generation,
+        )
+    )
+    if next_epoch is None:
+        return None
+    with send_preview_lock:
+        previous = _reply_epochs.get(normalized_target)
+        if previous is not None and previous[0] > normalized_generation:
+            raise ReplyStoreError("E_STALE_BRIDGE_GENERATION")
+        _reply_epochs[normalized_target] = (normalized_generation, next_epoch)
+
+        preview = current_send_preview
+        cancel_event = current_send_cancel_event
+        if (
+            preview is not None
+            and cancel_event is not None
+            and preview.get("target_id") == normalized_target
+            and preview.get("generation") == normalized_generation
+            and _positive_int(preview.get("reply_epoch")) is not None
+            and int(preview["reply_epoch"]) < next_epoch
+            and preview.get("stage") != "submitting"
+            and not cancel_event.is_set()
+        ):
+            if not str(preview.get("cancel_reason") or ""):
+                preview["cancel_reason"] = "superseded"
+                cancel_event.set()
+        return next_epoch
+
+
+def current_reply_epoch(target_id: object, generation: object) -> int | None:
+    normalized_target = _positive_int(target_id)
+    normalized_generation = _positive_int(generation)
+    if normalized_target is None or normalized_generation is None:
+        return None
+    current = default_store().current_epoch(
+        normalized_target,
+        normalized_generation,
+    )
+    if current is not None:
+        with send_preview_lock:
+            _reply_epochs[normalized_target] = (
+                normalized_generation,
+                current,
+            )
+    return current
+
+
+def is_reply_current(
+    target_id: object,
+    generation: object,
+    reply_epoch: object,
+) -> bool:
+    normalized_epoch = _positive_int(reply_epoch)
+    return bool(
+        normalized_epoch is not None
+        and current_reply_epoch(target_id, generation) == normalized_epoch
+    )
+
+
+def mark_reply_draft_quarantine(
+    target_id: object,
+    *,
+    request_id: str = "",
+) -> None:
+    normalized_target = _positive_int(target_id)
+    if normalized_target is None:
+        return
+    value = {
+        "target_id": normalized_target,
+        "request_id": str(request_id),
+        "reason": "E_UIA_DRAFT_OWNERSHIP_LOST",
+        "time": time.time(),
+    }
+    default_store().set_quarantine(
+        normalized_target,
+        str(request_id),
+        str(value["reason"]),
+    )
+    with send_preview_lock:
+        _reply_draft_quarantine[normalized_target] = value
+
+
+def get_reply_draft_quarantine(target_id: object) -> Optional[dict[str, object]]:
+    normalized_target = _positive_int(target_id)
+    if normalized_target is None:
+        return None
+    value = default_store().get_quarantine(normalized_target)
+    if value is None:
+        with send_preview_lock:
+            _reply_draft_quarantine.pop(normalized_target, None)
+        return None
+    result = {
+        "target_id": normalized_target,
+        "request_id": str(value.get("request_id") or ""),
+        "reason": str(value.get("reason") or ""),
+        "time": float(value.get("created_at") or 0.0),
+    }
+    with send_preview_lock:
+        _reply_draft_quarantine[normalized_target] = result
+    return dict(result)
+
+
+def clear_reply_draft_quarantine(
+    target_id: object,
+    request_id: object = "",
+) -> bool:
+    normalized_target = _positive_int(target_id)
+    if normalized_target is None:
+        return False
+    normalized_request = str(request_id or "").strip()
+    if not normalized_request:
+        return False
+    removed = default_store().resolve_quarantine(
+        normalized_target,
+        normalized_request,
+    )
+    if removed:
+        with send_preview_lock:
+            _reply_draft_quarantine.pop(normalized_target, None)
+    return removed
 
 
 def begin_send_preview(
@@ -167,11 +363,18 @@ def begin_send_preview(
     content: str,
     *,
     message_type: str = "text",
+    target_id: object = None,
+    generation: object = None,
+    reply_epoch: object = None,
+    request_id: str = "",
 ) -> threading.Event:
     """Publish one text item before any WeChat input is touched."""
     global current_send_cancel_event, current_send_preview, send_preview_sequence
     clear_last_send_result()
     cancel_event = threading.Event()
+    normalized_target = _positive_int(target_id)
+    normalized_generation = _positive_int(generation)
+    normalized_epoch = _positive_int(reply_epoch)
     with send_preview_lock:
         send_preview_sequence += 1
         current_send_cancel_event = cancel_event
@@ -182,7 +385,24 @@ def begin_send_preview(
             "message_type": str(message_type),
             "stage": "before_paste",
             "remaining_seconds": None,
+            "target_id": normalized_target,
+            "generation": normalized_generation,
+            "reply_epoch": normalized_epoch,
+            "request_id": str(request_id),
+            "cancel_reason": "",
         }
+        if (
+            normalized_target is not None
+            and normalized_generation is not None
+            and normalized_epoch is not None
+            and default_store().current_epoch(
+                normalized_target,
+                normalized_generation,
+            )
+            != normalized_epoch
+        ):
+            current_send_preview["cancel_reason"] = "superseded"
+            cancel_event.set()
     return cancel_event
 
 
@@ -221,17 +441,42 @@ def get_send_preview() -> Optional[dict[str, object]]:
 def try_commit_send(cancel_event: threading.Event) -> bool:
     """Atomically close cancellation before the OS-level submit action."""
     with send_preview_lock:
+        preview = current_send_preview
         if (
             current_send_cancel_event is not cancel_event
-            or current_send_preview is None
+            or preview is None
             or cancel_event.is_set()
             or not running
+            or stopping
             or paused.is_set()
         ):
             return False
-        current_send_preview["stage"] = "submitting"
-        current_send_preview["remaining_seconds"] = 0.0
+        target_id = _positive_int(preview.get("target_id"))
+        generation = _positive_int(preview.get("generation"))
+        reply_epoch = _positive_int(preview.get("reply_epoch"))
+        if (
+            target_id is not None
+            and generation is not None
+            and reply_epoch is not None
+            and default_store().current_epoch(target_id, generation)
+            != reply_epoch
+        ):
+            preview["cancel_reason"] = "superseded"
+            cancel_event.set()
+            return False
+        preview["stage"] = "submitting"
+        preview["remaining_seconds"] = 0.0
         return True
+
+
+def get_send_cancel_reason(cancel_event: threading.Event) -> str:
+    with send_preview_lock:
+        if (
+            current_send_cancel_event is not cancel_event
+            or current_send_preview is None
+        ):
+            return ""
+        return str(current_send_preview.get("cancel_reason") or "")
 
 
 def cancel_current_preview(expected_preview_id: int) -> bool:
@@ -247,7 +492,11 @@ def cancel_current_preview(expected_preview_id: int) -> bool:
             or cancel_event.is_set()
         ):
             return False
-        cancel_event.set()
+        if not str(preview.get("cancel_reason") or ""):
+            preview["cancel_reason"] = "manual_cancel"
+            cancel_event.set()
+        else:
+            return False
         return True
 
 
@@ -257,6 +506,530 @@ def end_send_preview(cancel_event: threading.Event) -> None:
         if current_send_cancel_event is cancel_event:
             current_send_cancel_event = None
             current_send_preview = None
+
+
+# ============ Merged reply capability and durable workers ============
+
+_MERGED_PROTOCOL_VERSION = 1
+_MERGED_ACTION_VERSION = 1
+_MERGED_RESULT_SCHEMA = 2
+_MERGED_MEMORY_SCHEMA = 1
+_MERGED_LEASE_SECONDS = 15.0
+_merged_capability_lock = threading.RLock()
+_merged_capability: Optional[dict[str, object]] = None
+_merged_worker_lock = threading.Lock()
+_merged_worker_generation = 0
+_merged_worker_stop: Optional[threading.Event] = None
+_merged_worker_wake = threading.Event()
+_merged_outbox_wake = threading.Event()
+_merged_worker_thread = None
+_merged_outbox_thread = None
+
+
+def _valid_uuid(value: object) -> str | None:
+    try:
+        import uuid
+
+        parsed = uuid.UUID(str(value))
+    except (ValueError, AttributeError):
+        return None
+    normalized = str(parsed)
+    return normalized if normalized == str(value).lower() else None
+
+
+def clear_merged_reply_capability(connection: object = None) -> None:
+    """Fail readiness closed when the reverse WS identity changes."""
+
+    global _merged_capability
+    with _merged_capability_lock:
+        if connection is not None and _merged_capability is not None:
+            if _merged_capability.get("connection_id") != id(connection):
+                return
+        _merged_capability = None
+
+
+def register_merged_reply_capability(
+    *,
+    plugin_instance_id: str,
+    generation: int,
+    protocol_version: int,
+    action_version: int,
+    result_schema: int,
+    memory_schema: int,
+    streaming_response: bool,
+    lifecycle_tracker_ready: bool,
+    connection: object,
+) -> dict[str, object]:
+    """Issue a connection-bound 15 second capability lease."""
+
+    global _merged_capability
+    normalized_instance = _valid_uuid(plugin_instance_id)
+    if (
+        normalized_instance is None
+        or not is_generation_running(generation)
+        or stopping
+        or connection is None
+        or connection is not _ob_ws
+        or protocol_version != _MERGED_PROTOCOL_VERSION
+        or action_version != _MERGED_ACTION_VERSION
+        or result_schema != _MERGED_RESULT_SCHEMA
+        or memory_schema != _MERGED_MEMORY_SCHEMA
+        or streaming_response is not False
+        or lifecycle_tracker_ready is not True
+    ):
+        raise ReplyStoreError("E_MERGED_REPLY_NOT_READY")
+    lease_id = secrets.token_urlsafe(32)
+    expires_monotonic = time.monotonic() + _MERGED_LEASE_SECONDS
+    default_store().release_foreign_admissions(
+        int(generation),
+        normalized_instance,
+    )
+    with _merged_capability_lock:
+        _merged_capability = {
+            "plugin_instance_id": normalized_instance,
+            "lease_id": lease_id,
+            "generation": int(generation),
+            "connection_id": id(connection),
+            "expires_monotonic": expires_monotonic,
+            "protocol_version": protocol_version,
+            "action_version": action_version,
+            "result_schema": result_schema,
+            "memory_schema": memory_schema,
+            "streaming_response": False,
+            "lifecycle_tracker_ready": True,
+            "recovery_ready": False,
+        }
+    _merged_outbox_wake.set()
+    return {
+        "lease_id": lease_id,
+        "bridge_generation": int(generation),
+        "expires_in_seconds": _MERGED_LEASE_SECONDS,
+        "protocol_version": protocol_version,
+        "action_version": action_version,
+        "result_schema": result_schema,
+    }
+
+
+def renew_merged_reply_capability(
+    *,
+    plugin_instance_id: str,
+    lease_id: str,
+    generation: int,
+    connection: object,
+) -> dict[str, object]:
+    global _merged_capability
+    now = time.monotonic()
+    with _merged_capability_lock:
+        capability = _merged_capability
+        if (
+            capability is None
+            or capability.get("plugin_instance_id") != plugin_instance_id
+            or capability.get("lease_id") != lease_id
+            or capability.get("generation") != generation
+            or capability.get("connection_id") != id(connection)
+            or connection is not _ob_ws
+            or float(capability.get("expires_monotonic") or 0.0) <= now
+            or not is_generation_running(generation)
+            or stopping
+        ):
+            _merged_capability = None
+            raise ReplyStoreError("E_MERGED_REPLY_LEASE_INVALID")
+        capability["expires_monotonic"] = now + _MERGED_LEASE_SECONDS
+    _merged_outbox_wake.set()
+    return {
+        "lease_id": lease_id,
+        "bridge_generation": generation,
+        "expires_in_seconds": _MERGED_LEASE_SECONDS,
+    }
+
+
+def activate_merged_reply_capability(
+    *,
+    plugin_instance_id: str,
+    lease_id: str,
+    generation: int,
+    connection: object,
+) -> dict[str, object]:
+    """Open ordinary ingress only after memory recovery has completed."""
+
+    global _merged_capability
+    if not validate_merged_reply_lease(
+        plugin_instance_id=plugin_instance_id,
+        lease_id=lease_id,
+        generation=generation,
+        require_ready=False,
+    ):
+        raise ReplyStoreError("E_MERGED_REPLY_LEASE_INVALID")
+    with _merged_capability_lock:
+        capability = _merged_capability
+        if (
+            capability is None
+            or capability.get("connection_id") != id(connection)
+            or connection is not _ob_ws
+            or stopping
+        ):
+            raise ReplyStoreError("E_MERGED_REPLY_LEASE_INVALID")
+        capability["recovery_ready"] = True
+    _merged_outbox_wake.set()
+    return {
+        "lease_id": lease_id,
+        "bridge_generation": generation,
+        "ready": True,
+    }
+
+
+def merged_reply_ready() -> bool:
+    global _merged_capability
+    now = time.monotonic()
+    with _merged_capability_lock:
+        capability = _merged_capability
+        valid = bool(
+            capability is not None
+            and _ob_ws is not None
+            and capability.get("connection_id") == id(_ob_ws)
+            and capability.get("generation") == lifecycle_generation
+            and float(capability.get("expires_monotonic") or 0.0) > now
+            and is_generation_running(lifecycle_generation)
+            and not stopping
+        )
+        if capability is not None and not valid:
+            _merged_capability = None
+        return bool(valid and capability.get("recovery_ready") is True)
+
+
+def merged_reply_capability_identity() -> Optional[dict[str, object]]:
+    if not merged_reply_ready():
+        return None
+    with _merged_capability_lock:
+        assert _merged_capability is not None
+        return {
+            "plugin_instance_id": str(
+                _merged_capability.get("plugin_instance_id") or ""
+            ),
+            "generation": int(_merged_capability.get("generation") or 0),
+        }
+
+
+def validate_merged_reply_lease(
+    *,
+    plugin_instance_id: str,
+    lease_id: str,
+    generation: int,
+    require_ready: bool = True,
+) -> bool:
+    global _merged_capability
+    now = time.monotonic()
+    with _merged_capability_lock:
+        capability = _merged_capability
+        valid = bool(
+            capability is not None
+            and capability.get("plugin_instance_id") == plugin_instance_id
+            and capability.get("lease_id") == lease_id
+            and capability.get("generation") == generation
+            and capability.get("connection_id") == id(_ob_ws)
+            and _ob_ws is not None
+            and float(capability.get("expires_monotonic") or 0.0) > now
+            and is_generation_running(generation)
+            and not stopping
+        )
+        if capability is not None and not valid:
+            _merged_capability = None
+        return bool(
+            valid
+            and (
+                not require_ready
+                or capability.get("recovery_ready") is True
+            )
+        )
+
+
+def ordinary_ingress_open() -> bool:
+    try:
+        return bool(default_store().health()["ordinary_ingress_open"])
+    except Exception:
+        return False
+
+
+def create_reply_admission(
+    target_id: int,
+    generation: int,
+    reply_epoch: int,
+) -> tuple[str, str]:
+    identity = merged_reply_capability_identity()
+    if identity is None:
+        raise ReplyStoreError("E_MERGED_REPLY_NOT_READY")
+    if not ordinary_ingress_open():
+        raise ReplyStoreError("E_OB_STATE_CAPACITY")
+    plugin_instance_id = str(identity["plugin_instance_id"])
+    token = default_store().create_admission(
+        target_id=target_id,
+        generation=generation,
+        epoch=reply_epoch,
+        plugin_instance_id=plugin_instance_id,
+    )
+    return token, plugin_instance_id
+
+
+def finish_reply_admission(
+    token: str,
+    *,
+    plugin_instance_id: str,
+    generation: int,
+    outcome: str,
+    reason: str,
+    request_id: str = "",
+) -> dict[str, object]:
+    return default_store().finish_admission(
+        token,
+        plugin_instance_id=plugin_instance_id,
+        generation=generation,
+        outcome=outcome,
+        reason=reason,
+        request_id=request_id,
+    )
+
+
+def merged_reply_admission_active(target_id: int) -> bool:
+    try:
+        return default_store().has_active_admission(target_id)
+    except Exception:
+        return True
+
+
+def accept_merged_reply_job(*, lease_id: str, **kwargs) -> dict[str, object]:
+    generation = int(kwargs.get("generation") or 0)
+    plugin_instance_id = str(kwargs.get("plugin_instance_id") or "")
+    # Keep the final lifecycle/lease check and durable admission in the same
+    # critical section as Stop's transition to ``stopping``.  Otherwise the
+    # private-route lookup can finish after Stop has already observed an empty
+    # queue, leaving a newly accepted old-generation job without a worker.
+    with run_lock:
+        if not validate_merged_reply_lease(
+            plugin_instance_id=plugin_instance_id,
+            lease_id=lease_id,
+            generation=generation,
+        ):
+            raise ReplyStoreError("E_MERGED_REPLY_LEASE_INVALID")
+        result = default_store().accept_job(**kwargs)
+    if result.get("accepted") is True and result.get("outcome") == "accepted":
+        _merged_worker_wake.set()
+    return result
+
+
+def persist_merged_job_stage(request_id: str, stage: str) -> bool:
+    if not request_id:
+        return False
+    return default_store().set_job_stage(request_id, stage)
+
+
+def _merged_worker_loop(generation: int, stop_event: threading.Event) -> None:
+    import logging
+
+    worker_log = logging.getLogger("ob11-bridge")
+    while not stop_event.is_set() and is_generation_running(generation):
+        try:
+            job = default_store().claim_next_job(generation)
+        except Exception:
+            worker_log.exception("[MERGED] 无法取得持久发送作业")
+            stop_event.wait(1.0)
+            continue
+        if job is None:
+            _merged_worker_wake.wait(0.5)
+            _merged_worker_wake.clear()
+            continue
+
+        request_id = str(job["request_id"])
+        target_id = int(job["target_id"])
+        reply_generation = int(job["generation"])
+        reply_epoch = int(job["epoch"])
+        outcome = "failed"
+        error_code = "E_UIA_SEND_FAILED"
+        error_stage = "complete"
+        committed = False
+        draft_quarantined = False
+        try:
+            sender = get_sender_for_generation(generation)
+            if sender is None:
+                error_code, error_stage = "E_UIA_STOPPED", "preflight"
+            elif not is_reply_current(target_id, reply_generation, reply_epoch):
+                outcome = "superseded"
+                error_code, error_stage = (
+                    "E_UIA_REPLY_SUPERSEDED",
+                    "preflight",
+                )
+            else:
+                sent = sender.send_text(
+                    str(job["routing_name"]),
+                    str(job["text"]),
+                    target_id=target_id,
+                    generation=reply_generation,
+                    reply_epoch=reply_epoch,
+                    request_id=request_id,
+                )
+                if sent is True:
+                    outcome = "sent"
+                    error_code, error_stage, committed = "", "complete", True
+                else:
+                    failure = get_last_send_result() or {}
+                    error_code = str(failure.get("code") or "E_UIA_SEND_FAILED")
+                    error_stage = str(failure.get("stage") or "complete")
+                    if error_code.startswith("E_UIA_REPLY_SUPERSEDED"):
+                        outcome = "superseded"
+                    elif error_code == "E_UIA_SEND_CANCELLED":
+                        outcome = "manual_cancel"
+                    elif error_code == "E_UIA_COMMIT_UNKNOWN":
+                        outcome, committed = "commit_unknown", True
+                    else:
+                        outcome = "failed"
+                draft_quarantined = bool(
+                    get_reply_draft_quarantine(target_id)
+                )
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            worker_log.warning(
+                "[MERGED] UIA 作业异常: request=%s type=%s",
+                request_id,
+                type(error).__name__,
+            )
+            error_code, error_stage = "E_OB_SEND_EXCEPTION", "complete"
+        try:
+            default_store().finish_job(
+                request_id,
+                outcome=outcome,
+                error_code=error_code,
+                error_stage=error_stage,
+                committed=committed,
+                draft_quarantined=draft_quarantined,
+            )
+            _merged_outbox_wake.set()
+        except Exception:
+            worker_log.exception(
+                "[MERGED] 无法原子落盘发送终态: request=%s",
+                request_id,
+            )
+
+
+def _merged_outbox_loop(generation: int, stop_event: threading.Event) -> None:
+    import logging
+
+    publisher_log = logging.getLogger("ob11-bridge")
+    while not stop_event.is_set() and is_generation_running(generation):
+        if not merged_reply_ready():
+            _merged_outbox_wake.wait(1.0)
+            _merged_outbox_wake.clear()
+            continue
+        try:
+            notices = default_store().pending_notices(16)
+        except Exception:
+            publisher_log.exception("[MERGED] 结果 outbox 不可读")
+            stop_event.wait(1.0)
+            continue
+        if not notices:
+            _merged_outbox_wake.wait(1.0)
+            _merged_outbox_wake.clear()
+            continue
+        for notice in notices:
+            if stop_event.is_set() or not merged_reply_ready():
+                break
+            try:
+                from ob_protocol import push_event
+
+                payload = dict(notice["payload"])
+                payload["self_id"] = int(_self_id_int or 0)
+                default_store().mark_notice_attempt(str(notice["notice_id"]))
+                push_event(payload)
+            except Exception:
+                publisher_log.warning("[MERGED] 结果通知发布失败，将由 outbox 重放")
+                break
+        stop_event.wait(1.0)
+
+
+def start_merged_reply_workers(generation: int) -> None:
+    global _merged_worker_generation, _merged_worker_stop
+    global _merged_worker_thread, _merged_outbox_thread
+    with _merged_worker_lock:
+        if (
+            _merged_worker_stop is not None
+            and not _merged_worker_stop.is_set()
+            and _merged_worker_generation == generation
+        ):
+            return
+        if _merged_worker_stop is not None:
+            _merged_worker_stop.set()
+        stop_event = threading.Event()
+        _merged_worker_generation = generation
+        _merged_worker_stop = stop_event
+        _merged_worker_thread = threading.Thread(
+            target=_merged_worker_loop,
+            args=(generation, stop_event),
+            daemon=True,
+            name=f"akasha-merged-worker-{generation}",
+        )
+        _merged_outbox_thread = threading.Thread(
+            target=_merged_outbox_loop,
+            args=(generation, stop_event),
+            daemon=True,
+            name=f"akasha-merged-outbox-{generation}",
+        )
+        _merged_worker_thread.start()
+        _merged_outbox_thread.start()
+
+
+def stop_merged_reply_workers(generation: int) -> None:
+    with _merged_worker_lock:
+        if (
+            _merged_worker_stop is not None
+            and _merged_worker_generation == generation
+        ):
+            _merged_worker_stop.set()
+            _merged_worker_wake.set()
+            _merged_outbox_wake.set()
+
+
+def drain_merged_reply_workers(
+    generation: int,
+    timeout_seconds: float = 20.0,
+) -> bool:
+    """Let accepted jobs reach a durable terminal state before shutdown."""
+
+    deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+    _merged_worker_wake.set()
+    while time.monotonic() < deadline:
+        try:
+            if default_store().open_job_count(generation) == 0:
+                break
+        except Exception:
+            return False
+        time.sleep(0.05)
+    else:
+        return False
+
+    stop_merged_reply_workers(generation)
+    with _merged_worker_lock:
+        worker = _merged_worker_thread
+        outbox = _merged_outbox_thread
+    current = threading.current_thread()
+    for thread in (worker, outbox):
+        if thread is not None and thread is not current:
+            thread.join(timeout=5.0)
+    return not bool(worker is not None and worker.is_alive())
+
+
+def merged_reply_health() -> dict[str, object]:
+    try:
+        health = default_store().health()
+    except Exception:
+        health = {
+            "ordinary_ingress_open": False,
+            "jobs": 0,
+            "active_admissions": 0,
+            "outbox_pending": 0,
+            "spool_pending": 0,
+            "draft_quarantines": 0,
+        }
+    health["merged_reply_ready"] = merged_reply_ready()
+    return health
 
 # ============ OneBot WebSocket 客户端管理 ============
 

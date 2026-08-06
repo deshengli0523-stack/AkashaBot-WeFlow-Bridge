@@ -14,6 +14,7 @@ import logging
 import os
 import queue
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -23,9 +24,14 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 
+_BRIDGE_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BRIDGE_MODULE_DIR not in sys.path:
+    sys.path.insert(0, _BRIDGE_MODULE_DIR)
+
 import state
 import config
 from ob_protocol import push_event, make_message_event
+from reply_store import ReplyStoreError, default_store
 from privacy import chat_record
 from money_service import MoneyActionService, WeFlowMoneySource
 
@@ -48,6 +54,16 @@ _CONTACT_TYPE_TIMEOUT_SECONDS = 3
 
 def _text_value(value) -> str:
     return "" if value is None else str(value).strip()
+
+
+def _positive_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _exact_text_value(value) -> str:
@@ -145,6 +161,21 @@ def _account_identity() -> str:
     return _text_value(getattr(config, "BOT_WXID", "")) or "wechat_bot"
 
 
+def _merged_runtime_available() -> bool:
+    """Require the complete merged-reply state surface, not a partial test stub."""
+
+    return all(
+        callable(getattr(state, name, None))
+        for name in (
+            "merged_reply_ready",
+            "ordinary_ingress_open",
+            "merged_reply_capability_identity",
+            "create_reply_admission",
+            "is_reply_current",
+        )
+    )
+
+
 def _is_red_packet_receipt_text(content: object) -> bool:
     text = _text_value(content)
     normalized = re.sub(r"\s+", "", text)
@@ -181,6 +212,15 @@ class WeFlowBridge:
         self._sse_event_keys = {}
         self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
         self._contact_type_cache = {}
+        self._spool_stop = threading.Event()
+        self._spool_thread = None
+        if _merged_runtime_available():
+            self._spool_thread = threading.Thread(
+                target=self._drain_private_spool_loop,
+                daemon=True,
+                name=f"akasha-ingress-spool-{int(generation or 0)}",
+            )
+            self._spool_thread.start()
         self.money_actions = None
         if sender is not None and bool(
             getattr(config, "MONEY_RECEIVE_ENABLED", False)
@@ -202,6 +242,12 @@ class WeFlowBridge:
                 ),
                 account_id=str(getattr(config, "BOT_WXID", "") or ""),
             )
+        self._raw_recovery_thread = threading.Thread(
+            target=self._recover_pending_raw_envelopes,
+            daemon=True,
+            name=f"akasha-raw-recovery-{int(generation or 0)}",
+        )
+        self._raw_recovery_thread.start()
 
     def _notify_money_action(self, payload: dict[str, object]) -> bool:
         return push_event(
@@ -217,7 +263,37 @@ class WeFlowBridge:
             }
         )
 
+    def _recover_pending_raw_envelopes(self) -> None:
+        try:
+            envelopes = default_store().pending_raw_envelopes()
+        except Exception:
+            log.exception("普通入站 raw WAL 恢复失败")
+            return
+        for envelope in envelopes:
+            if not self._active():
+                return
+            payload = envelope.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if self.generation is not None:
+                rebased = default_store().rebase_raw_envelope(
+                    str(envelope.get("raw_id_hash") or ""),
+                    int(self.generation),
+                )
+                if rebased is None:
+                    continue
+                envelope = {**envelope, **rebased}
+            recovered = dict(payload)
+            recovered["_akasha_recovery"] = {
+                "target_id": envelope.get("target_id"),
+                "generation": envelope.get("generation"),
+                "reply_epoch": envelope.get("epoch"),
+                "accepted_at": envelope.get("accepted_at"),
+            }
+            self.add_to_buffer(recovered)
+
     def stop_money_actions(self) -> None:
+        self._spool_stop.set()
         if self.money_actions is not None:
             self.money_actions.stop()
 
@@ -371,6 +447,13 @@ class WeFlowBridge:
     def should_ignore(self, data):
         content = _text_value(data.get("content"))
         msg_types = _message_type_values(data)
+        is_send = data.get("isSend")
+        if (
+            is_send is True
+            or (not isinstance(is_send, bool) and is_send == 1)
+            or _text_value(is_send).casefold() in {"1", "true", "yes"}
+        ):
+            return True
         if data.get("sourceName", "") in config.BOT_NICKNAMES:
             return True
         if config.BOT_WXID and data.get("talkerId", "") == config.BOT_WXID:
@@ -435,7 +518,7 @@ class WeFlowBridge:
     def add_to_buffer(self, data):
         """将消息加入缓冲区，等待合并后统一推送给 AstrBot。"""
         if not self._active():
-            return
+            return False
         is_sticker = _is_sticker_message(data)
         raw_content = data.get("content", "")
         content = "[表情]" if is_sticker else _money_receipt_display(raw_content)
@@ -452,7 +535,7 @@ class WeFlowBridge:
         )
         if not is_group and not raw_session_id:
             log.warning("跳过缺少稳定 sessionId 的私聊消息")
-            return
+            return False
         session_id_data = raw_session_id or source_name
 
         now = time.time()
@@ -463,7 +546,7 @@ class WeFlowBridge:
             and now - self._sent_recently[content] < 120
         ):
             log.info("⏭️ 自回复去重跳过: content_length=%d", len(content))
-            return
+            return True
 
         sender_in_group = _text_value(
             data.get("senderName", "")
@@ -500,7 +583,68 @@ class WeFlowBridge:
             )
 
         if _is_red_packet_receipt_text(raw_content):
-            return
+            return True
+
+        reply_target_id = None
+        reply_epoch = None
+        reply_generation = int(
+            self.generation
+            or getattr(state, "lifecycle_generation", 0)
+            or 0
+        )
+        if not is_group and reply_generation > 0:
+            advance_epoch = getattr(state, "advance_reply_epoch", None)
+            if callable(advance_epoch):
+                private_account = _text_value(
+                    getattr(config, "BOT_WXID", "")
+                )
+                if not private_account:
+                    log.warning("跳过缺少 BOT_WXID 的私聊消息")
+                    return False
+                try:
+                    reply_target_id = state.remember_private_route(
+                        session_id_data,
+                        account=private_account,
+                        routing_name=contact,
+                    )
+                    recovery = data.get("_akasha_recovery")
+                    if isinstance(recovery, dict):
+                        recovered_target = _positive_int(
+                            recovery.get("target_id")
+                        )
+                        recovered_generation = _positive_int(
+                            recovery.get("generation")
+                        )
+                        recovered_epoch = _positive_int(
+                            recovery.get("reply_epoch")
+                        )
+                        if (
+                            recovered_target != reply_target_id
+                            or recovered_generation != reply_generation
+                            or recovered_epoch is None
+                        ):
+                            raise ValueError("raw WAL identity mismatch")
+                        reply_epoch = recovered_epoch
+                    else:
+                        reply_epoch = advance_epoch(
+                            reply_target_id,
+                            reply_generation,
+                            _text_value(data.get("rawid")),
+                            data,
+                        )
+                        if reply_epoch is None:
+                            log.info("⏭️ 持久 rawid 去重跳过")
+                            return True
+                    state._ob_id_to_contact[reply_target_id] = contact
+                except Exception:
+                    log.warning("私聊 reply epoch 建立失败，本轮不推送")
+                    return False
+
+        if reply_epoch is not None:
+            data = dict(data)
+            data["_akasha_reply_target_id"] = reply_target_id
+            data["_akasha_reply_epoch"] = reply_epoch
+            data["_akasha_bridge_generation"] = reply_generation
 
         if is_sticker:
             threading.Thread(
@@ -508,7 +652,7 @@ class WeFlowBridge:
                 args=(data,),
                 daemon=True,
             ).start()
-            return
+            return True
         if content == "[图片]":
             # 图片消息：下载 → ollama 描述 → 注入缓冲区
             threading.Thread(
@@ -516,21 +660,21 @@ class WeFlowBridge:
                 args=(data,),
                 daemon=True,
             ).start()
-            return
+            return True
         if content == "[视频]":
             threading.Thread(
                 target=self.process_video_message,
                 args=(data,),
                 daemon=True,
             ).start()
-            return
+            return True
 
         if (
             is_group
             and state.group_reply_mode == "mention"
             and not any(f"@{n}" in content for n in config.BOT_NICKNAMES)
         ):
-            return
+            return True
 
         if is_group and state.group_reply_mode == "batch":
             buffer_key = f"__batch__{base_name}"
@@ -553,27 +697,146 @@ class WeFlowBridge:
                     "sender_in_group": sender_in_group if is_group else "",
                     "session_id_data": session_id_data,
                     "source_messages": [],
+                    "batch_started_monotonic": None,
+                    "last_accepted_monotonic": None,
+                    "reply_target_id": None,
+                    "reply_epoch": None,
+                    "bridge_generation": None,
                 }
             entry = self.pending_buffers[buffer_key]
+            batch_was_empty = not entry["messages"]
             if is_group and state.group_reply_mode == "batch" and sender_in_group:
                 entry["messages"].append(f'成员"{sender_in_group}"在群"{base_name}"中对你说：{content}')
             else:
                 entry["messages"].append(content)
             _insert_source_message_ref(entry, data)
 
+            accepted_at = time.monotonic()
+            if batch_was_empty or entry.get("batch_started_monotonic") is None:
+                entry["batch_started_monotonic"] = accepted_at
+            entry["last_accepted_monotonic"] = accepted_at
+            if reply_epoch is not None:
+                entry["reply_target_id"] = reply_target_id
+                entry["reply_epoch"] = reply_epoch
+                entry["bridge_generation"] = reply_generation
+
             if not entry["processing"]:
-                if entry["timer"]:
-                    entry["timer"].cancel()
-                entry["timer_version"] += 1
-                version = entry["timer_version"]
                 log.info(
-                    "📩 消息已进入缓冲: content_length=%d group=%s wait_seconds=%s",
-                    len(content), is_group, config.BUFFER_SECONDS,
+                    "📩 消息已进入缓冲: content_length=%d group=%s quiet=%s max=%s",
+                    len(content),
+                    is_group,
+                    getattr(
+                        config,
+                        "BUFFER_QUIET_SECONDS",
+                        config.BUFFER_SECONDS,
+                    ),
+                    getattr(
+                        config,
+                        "BUFFER_MAX_SECONDS",
+                        config.BUFFER_SECONDS,
+                    ),
                 )
-                timer = threading.Timer(config.BUFFER_SECONDS, lambda v=version, sid=buffer_key: self.process_sender(sid, v))
-                timer.daemon = True
-                timer.start()
-                entry["timer"] = timer
+                self._schedule_buffer_locked(buffer_key)
+
+        if not is_group:
+            try:
+                default_store().mark_raw_envelope_buffered(
+                    _text_value(data.get("rawid"))
+                )
+            except Exception:
+                log.exception("普通入站 raw WAL 状态更新失败")
+        return True
+
+    def _drain_private_spool_loop(self) -> None:
+        while not self._spool_stop.is_set() and self._active():
+            try:
+                self._drain_private_spool()
+            except Exception:
+                log.exception("私聊 pending spool 排空失败")
+            self._spool_stop.wait(0.5)
+
+    def _drain_private_spool(self) -> None:
+        if (
+            not self._active()
+            or not state.merged_reply_ready()
+            or not state.ordinary_ingress_open()
+        ):
+            return
+        store = default_store()
+        capability = state.merged_reply_capability_identity()
+        if capability is None:
+            return
+        for batch in store.pending_batches(32):
+            target_id = _positive_int(batch.get("target_id"))
+            generation = _positive_int(batch.get("generation"))
+            reply_epoch = _positive_int(batch.get("epoch"))
+            batch_id = str(batch.get("batch_id") or "")
+            if (
+                target_id is None
+                or generation is None
+                or reply_epoch is None
+                or not batch_id
+            ):
+                store.mark_batch_sent(batch_id)
+                continue
+            if not state.is_reply_current(target_id, generation, reply_epoch):
+                store.mark_batch_sent(batch_id)
+                log.info(
+                    "丢弃 spool 中已淘汰批次: target=%s generation=%s epoch=%s",
+                    target_id,
+                    generation,
+                    reply_epoch,
+                )
+                continue
+
+            admission_token = str(batch.get("admission_token") or "")
+            plugin_instance_id = ""
+            if admission_token:
+                admission = store.admission_status(admission_token)
+                if (
+                    admission is not None
+                    and admission.get("state") == "active"
+                    and admission.get("plugin_instance_id")
+                    == capability.get("plugin_instance_id")
+                ):
+                    plugin_instance_id = str(admission["plugin_instance_id"])
+                else:
+                    store.clear_batch_admission(batch_id, admission_token)
+                    admission_token = ""
+            if not admission_token:
+                try:
+                    admission_token, plugin_instance_id = (
+                        state.create_reply_admission(
+                            target_id,
+                            generation,
+                            reply_epoch,
+                        )
+                    )
+                except ReplyStoreError as error:
+                    if error.code in {
+                        "E_ADMISSION_CAPACITY",
+                        "E_OB_STATE_CAPACITY",
+                        "E_MERGED_REPLY_NOT_READY",
+                    }:
+                        return
+                    if error.code == "E_REPLY_SUPERSEDED":
+                        store.mark_batch_sent(batch_id)
+                        continue
+                    raise
+                store.bind_batch_admission(batch_id, admission_token)
+
+            event = dict(batch["payload"])
+            event["plugin_instance_id"] = plugin_instance_id
+            event["admission_token"] = admission_token
+            event["akasha_batch_id"] = batch_id
+            if not push_event(event):
+                return
+            store.mark_batch_sent(batch_id, admission_token)
+            log.info(
+                "✅ 已从持久 spool 推送私聊批次: target=%s epoch=%s",
+                target_id,
+                reply_epoch,
+            )
 
     def process_sender(self, sender_id, version=None):
         """缓冲到期：通过 OneBot 事件推送给 AstrBot。"""
@@ -585,6 +848,8 @@ class WeFlowBridge:
             entry = self.pending_buffers[sender_id]
             if version is not None and entry.get("timer_version", 0) != version:
                 return
+            if entry.get("processing"):
+                return
             if not entry["messages"]:
                 return
             msgs = entry["messages"].copy()
@@ -595,6 +860,14 @@ class WeFlowBridge:
             entry["messages"] = []
             entry["source_messages"] = []
             entry["processing"] = True
+            reply_target_id = entry.get("reply_target_id")
+            reply_epoch = entry.get("reply_epoch")
+            reply_generation = entry.get("bridge_generation")
+            entry["batch_started_monotonic"] = None
+            entry["last_accepted_monotonic"] = None
+            entry["reply_target_id"] = None
+            entry["reply_epoch"] = None
+            entry["bridge_generation"] = None
             if entry["timer"]:
                 entry["timer"].cancel()
                 entry["timer"] = None
@@ -653,6 +926,16 @@ class WeFlowBridge:
                         )
                         current["processing"] = False
                 return
+            if (
+                reply_target_id is not None
+                and int(reply_target_id) != int(user_id)
+            ):
+                log.warning("私聊 reply epoch 目标与持久路由不一致，本轮不推送")
+                with self.buffer_lock:
+                    current = self.pending_buffers.get(sender_id)
+                    if current is not None:
+                        current["processing"] = False
+                return
 
         if is_group:
             group_id = state._wxid_to_int(
@@ -698,7 +981,9 @@ class WeFlowBridge:
                                        account=account,
                                        session=session_id_data,
                                        source_messages=source_messages,
-                                       routing_name=contact)
+                                       routing_name=contact,
+                                       bridge_generation=reply_generation,
+                                       reply_epoch=reply_epoch)
 
         if not self._active():
             return
@@ -723,18 +1008,79 @@ class WeFlowBridge:
         else:
             state._ob_id_to_contact[user_id] = contact
 
-        sent = push_event(event)
-        if sent > 0:
-            log.info("✅ 已推送至 AstrBot 客户端: clients=%s", sent)
+        if is_group or not _merged_runtime_available():
+            sent = push_event(event)
+            if sent:
+                log.info("✅ 已推送至 AstrBot 客户端")
+            else:
+                log.warning("⚠️ 无 AstrBot 客户端在线")
         else:
-            log.warning("⚠️ 无 AstrBot 客户端在线")
+            try:
+                default_store().spool_batch(
+                    event,
+                    target_id=int(user_id),
+                    generation=int(reply_generation),
+                    epoch=int(reply_epoch),
+                    raw_ids=(
+                        source_message.get("rawid", "")
+                        for source_message in source_messages
+                    ),
+                )
+            except (ReplyStoreError, TypeError, ValueError):
+                log.warning(
+                    "私聊批次无法写入持久 spool: code=E_INGRESS_SPOOL",
+                )
+                with self.buffer_lock:
+                    current = self.pending_buffers.get(sender_id)
+                    if current is not None:
+                        current["messages"] = msgs + current.get("messages", [])
+                        current["source_messages"] = (
+                            source_messages + current.get("source_messages", [])
+                        )
+                        current["reply_target_id"] = reply_target_id
+                        current["reply_epoch"] = reply_epoch
+                        current["bridge_generation"] = reply_generation
+                        current["processing"] = False
+                        self._schedule_buffer_locked(sender_id, delay=1.0)
+                return
+            # Readiness/admission may still be closed.  The durable spool owns
+            # the batch now and the background drain will retry without loss.
+            self._drain_private_spool()
 
         with self.buffer_lock:
             if sender_id in self.pending_buffers:
                 entry = self.pending_buffers[sender_id]
                 entry["processing"] = False
                 if entry.get("messages"):
-                    self._schedule_buffer_locked(sender_id, config.BUFFER_SECONDS)
+                    self._schedule_buffer_locked(sender_id)
+
+    @staticmethod
+    def _buffer_deadline_locked(entry: dict) -> float | None:
+        started = entry.get("batch_started_monotonic")
+        latest = entry.get("last_accepted_monotonic")
+        if not isinstance(started, (int, float)) or not isinstance(
+            latest,
+            (int, float),
+        ):
+            return None
+        quiet_seconds = float(
+            getattr(
+                config,
+                "BUFFER_QUIET_SECONDS",
+                getattr(config, "BUFFER_SECONDS", 5.0),
+            )
+        )
+        max_seconds = float(
+            getattr(
+                config,
+                "BUFFER_MAX_SECONDS",
+                getattr(config, "BUFFER_SECONDS", 5.0),
+            )
+        )
+        return min(
+            float(started) + max(0.0, max_seconds),
+            float(latest) + max(0.0, quiet_seconds),
+        )
 
     def _schedule_buffer_locked(self, buffer_key: str, delay: float | None = None):
         """Start or restart a buffer timer. Caller must hold buffer_lock."""
@@ -747,7 +1093,15 @@ class WeFlowBridge:
             entry["timer"].cancel()
         entry["timer_version"] = entry.get("timer_version", 0) + 1
         version = entry["timer_version"]
-        wait_seconds = config.BUFFER_SECONDS if delay is None else delay
+        if delay is None:
+            deadline = self._buffer_deadline_locked(entry)
+            wait_seconds = (
+                getattr(config, "BUFFER_SECONDS", 5.0)
+                if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+        else:
+            wait_seconds = max(0.0, float(delay))
         timer = threading.Timer(
             wait_seconds,
             lambda v=version, sid=buffer_key: self.process_sender(sid, v),
@@ -789,9 +1143,10 @@ class WeFlowBridge:
                         if raw_id:
                             if raw_id in self.processed_ids:
                                 continue
-                            self.processed_ids.add(raw_id)
                         filtered_type = self._inbound_filter_type(data)
                         if filtered_type:
+                            if raw_id:
+                                self.processed_ids.add(raw_id)
                             if filtered_type == "group":
                                 self._remember_filtered_group_route(data)
                             log.info(
@@ -803,6 +1158,8 @@ class WeFlowBridge:
                             self.money_actions is not None
                             and self.money_actions.handle_sse(data)
                         ):
+                            if raw_id:
+                                self.processed_ids.add(raw_id)
                             self.log_money_event(data)
                             log.info("检测到红包/转账候选；普通 FIFO 已进入等待")
                             continue
@@ -811,7 +1168,11 @@ class WeFlowBridge:
                                 "📩 收到 SSE 消息: content_length=%d",
                                 len(data.get("content", "")),
                             )
-                            self.add_to_buffer(data)
+                            accepted = self.add_to_buffer(data)
+                            if accepted and raw_id:
+                                self.processed_ids.add(raw_id)
+                        elif raw_id:
+                            self.processed_ids.add(raw_id)
                     except json.JSONDecodeError:
                         pass
 
@@ -1203,6 +1564,33 @@ class WeFlowBridge:
                 except OSError:
                     pass
 
+    @staticmethod
+    def _reply_metadata_from_data(
+        data: dict,
+    ) -> tuple[int, int, int] | None:
+        try:
+            target_id = int(data.get("_akasha_reply_target_id"))
+            generation = int(data.get("_akasha_bridge_generation"))
+            reply_epoch = int(data.get("_akasha_reply_epoch"))
+        except (TypeError, ValueError):
+            return None
+        if target_id <= 0 or generation <= 0 or reply_epoch <= 0:
+            return None
+        return target_id, generation, reply_epoch
+
+    @classmethod
+    def _touch_media_buffer_entry(cls, entry: dict, data: dict) -> None:
+        accepted_at = time.monotonic()
+        if entry.get("batch_started_monotonic") is None:
+            entry["batch_started_monotonic"] = accepted_at
+        entry["last_accepted_monotonic"] = accepted_at
+        metadata = cls._reply_metadata_from_data(data)
+        if metadata is not None:
+            target_id, generation, reply_epoch = metadata
+            entry["reply_target_id"] = target_id
+            entry["bridge_generation"] = generation
+            entry["reply_epoch"] = reply_epoch
+
     def _enqueue_media_caption(
         self,
         data: dict,
@@ -1221,6 +1609,13 @@ class WeFlowBridge:
         )
         talker_id = _text_value(data.get("talkerId")) or session_id
         media_text = f"[{media_label}: {caption_text}]"
+        reply_metadata = self._reply_metadata_from_data(data)
+        if (
+            reply_metadata is not None
+            and not state.is_reply_current(*reply_metadata)
+        ):
+            log.info("丢弃已被新消息淘汰的媒体描述")
+            return
         with self.buffer_lock:
             if is_group and state.group_reply_mode == "batch" and group_name:
                 base_name = re.sub(r"\s*\(\d+\)\s*$", "", group_name).strip()
@@ -1229,14 +1624,23 @@ class WeFlowBridge:
                     f'成员"{source_name}"在群"{group_name}"中对你说：{media_text}'
                 )
             else:
-                buffer_key = talker_id
+                media_identity = (
+                    _text_value(data.get("rawid"))
+                    or _event_fingerprint(data)
+                )
+                buffer_key = f"{talker_id}::__media__:{media_identity}"
                 rendered = media_text
 
             if buffer_key in self.pending_buffers:
                 entry = self.pending_buffers[buffer_key]
                 entry["messages"].insert(0, rendered)
                 _insert_source_message_ref(entry, data, 0)
-                self._schedule_buffer_locked(buffer_key, 2)
+                self._touch_media_buffer_entry(entry, data)
+                self._schedule_buffer_locked(buffer_key)
+                if not is_group:
+                    default_store().mark_raw_envelope_buffered(
+                        _text_value(data.get("rawid"))
+                    )
                 return
 
             self.pending_buffers[buffer_key] = {
@@ -1251,16 +1655,21 @@ class WeFlowBridge:
                 "group_name": group_name if is_group else "",
                 "sender_in_group": source_name if is_group else "",
                 "source_messages": [_source_message_ref(data, 1)],
+                "batch_started_monotonic": None,
+                "last_accepted_monotonic": None,
+                "reply_target_id": None,
+                "reply_epoch": None,
+                "bridge_generation": None,
             }
-            timer_delay = 5 if is_group and state.group_reply_mode == "batch" else 2
-            timer = threading.Timer(
-                timer_delay,
-                lambda v=1, sid=buffer_key: self.process_sender(sid, v),
+            self._touch_media_buffer_entry(
+                self.pending_buffers[buffer_key],
+                data,
             )
-            timer.daemon = True
-            timer.start()
-            self.pending_buffers[buffer_key]["timer"] = timer
-            self.pending_buffers[buffer_key]["timer_version"] = 1
+            self._schedule_buffer_locked(buffer_key)
+            if not is_group:
+                default_store().mark_raw_envelope_buffered(
+                    _text_value(data.get("rawid"))
+                )
 
     def _enqueue_video_caption(self, data: dict, caption_text: str) -> None:
         self._enqueue_media_caption(data, "视频", caption_text)
@@ -1383,6 +1792,19 @@ class WeFlowBridge:
             if not self._active():
                 return
 
+            reply_metadata = self._reply_metadata_from_data(data)
+            if (
+                reply_metadata is not None
+                and not state.is_reply_current(*reply_metadata)
+            ):
+                log.info("丢弃已被新消息淘汰的图片描述")
+                return
+
+            # Media is an independent inbound batch.  Its asynchronous
+            # caption completion never appends into an open text batch.
+            self._enqueue_media_caption(data, "图片", caption_text)
+            return
+
             # 注入图片描述到缓冲区
             with self.buffer_lock:
                 self._pending_image[talker_id] = {"caption": caption_text, "event": img_event}
@@ -1396,7 +1818,8 @@ class WeFlowBridge:
                         entry["messages"].insert(0, f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]')
                         _insert_source_message_ref(entry, data, 0)
                         entry["image_ready"] = True
-                        self._schedule_buffer_locked(batch_key, 2)
+                        self._touch_media_buffer_entry(entry, data)
+                        self._schedule_buffer_locked(batch_key)
                         log.info(f"📝 图片已注入批处理队列")
                         return
                     # 没有文字排队，用 batch key 创建独立条目
@@ -1412,21 +1835,26 @@ class WeFlowBridge:
                         "group_name": group_name,
                         "sender_in_group": source_name,
                         "source_messages": [_source_message_ref(data, 1)],
+                        "batch_started_monotonic": None,
+                        "last_accepted_monotonic": None,
+                        "reply_target_id": None,
+                        "reply_epoch": None,
+                        "bridge_generation": None,
                     }
                     log.info(f"📩 图片无文本跟随，创建批处理图片条目")
-                    version = 1
-                    timer = threading.Timer(5, lambda v=version, sid=batch_key: self.process_sender(sid, v))
-                    timer.daemon = True
-                    timer.start()
-                    self.pending_buffers[batch_key]["timer"] = timer
-                    self.pending_buffers[batch_key]["timer_version"] = version
+                    self._touch_media_buffer_entry(
+                        self.pending_buffers[batch_key],
+                        data,
+                    )
+                    self._schedule_buffer_locked(batch_key)
                 elif talker_id in self.pending_buffers:
                     # 已有文本在排队，注入图片上下文
                     entry = self.pending_buffers[talker_id]
                     entry["messages"].insert(0, f"[图片: {caption_text}]")
                     _insert_source_message_ref(entry, data, 0)
                     entry["image_ready"] = True
-                    self._schedule_buffer_locked(talker_id, 2)
+                    self._touch_media_buffer_entry(entry, data)
+                    self._schedule_buffer_locked(talker_id)
                     log.info(f"📝 图片已注入待处理文本队列")
                 else:
                     # 没有文本排队，创建单条图片消息处理
@@ -1443,13 +1871,17 @@ class WeFlowBridge:
                         "group_name": group_name if is_group else "",
                         "sender_in_group": "",
                         "source_messages": [_source_message_ref(data, 1)],
+                        "batch_started_monotonic": None,
+                        "last_accepted_monotonic": None,
+                        "reply_target_id": None,
+                        "reply_epoch": None,
+                        "bridge_generation": None,
                     }
-                    version = 1
-                    timer = threading.Timer(2, lambda v=version, sid=talker_id: self.process_sender(sid, v))
-                    timer.daemon = True
-                    timer.start()
-                    self.pending_buffers[talker_id]["timer"] = timer
-                    self.pending_buffers[talker_id]["timer_version"] = version
+                    self._touch_media_buffer_entry(
+                        self.pending_buffers[talker_id],
+                        data,
+                    )
+                    self._schedule_buffer_locked(talker_id)
         finally:
             # 确保 Event 被设置
             img_event.set()

@@ -66,6 +66,64 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return value if minimum <= value <= maximum else default
 
 
+def _valid_buffer_number(
+    value: object,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
+        return None
+    return parsed
+
+
+def resolve_buffer_windows(
+    values: dict[str, object],
+    previous: tuple[float, float] | None = None,
+) -> tuple[float, float, bool]:
+    """Apply the upgrade precedence without silently swapping bad pairs."""
+
+    quiet = _valid_buffer_number(
+        values.get("buffer_quiet_seconds"),
+        minimum=0.2,
+        maximum=10.0,
+    )
+    maximum = _valid_buffer_number(
+        values.get("buffer_max_seconds"),
+        minimum=0.2,
+        maximum=30.0,
+    )
+    legacy = _valid_buffer_number(
+        values.get("buffer_seconds"),
+        minimum=0.2,
+        maximum=30.0,
+    )
+    rejected_pair = bool(
+        quiet is not None and maximum is not None and maximum < quiet
+    )
+    if rejected_pair:
+        if previous is not None and previous[1] >= previous[0]:
+            return float(previous[0]), float(previous[1]), True
+        return 1.5, 5.0, True
+    if quiet is not None and maximum is not None:
+        return quiet, maximum, False
+    if quiet is not None:
+        derived_max = (
+            legacy if legacy is not None and legacy >= quiet else max(5.0, quiet)
+        )
+        return quiet, derived_max, False
+    if maximum is not None:
+        return min(1.5, maximum), maximum, False
+    derived_max = legacy if legacy is not None else 5.0
+    return min(1.5, derived_max), derived_max, False
+
+
 WE_FLOW_BASE_URL = config["weflow_base_url"]
 ACCESS_TOKEN = config["access_token"]
 ASTRBOT_ATTACHMENTS = config.get("astrbot_attachments", "")
@@ -84,7 +142,20 @@ UIA_FIXED_SETTLE_JITTER_MAX_SECONDS = _bounded_float(
 FAVORITE_STICKER_RECEIPT_TIMEOUT_SECONDS = _bounded_float(
     "favorite_sticker_receipt_timeout_seconds", 8.0, 10.0
 )
-BUFFER_SECONDS = config.get("buffer_seconds", 5)
+(
+    BUFFER_QUIET_SECONDS,
+    BUFFER_MAX_SECONDS,
+    _BUFFER_PAIR_REJECTED,
+) = resolve_buffer_windows(config)
+if _BUFFER_PAIR_REJECTED:
+    logging.getLogger("ob11-bridge").warning(
+        "输入合并窗口配置被拒绝：buffer_max_seconds 小于 quiet；已使用安全值"
+    )
+# Kept as a compatibility alias for older integrations and tests.
+BUFFER_SECONDS = BUFFER_MAX_SECONDS
+MERGED_REPLY_PROTOCOL_VERSION = _bounded_int(
+    "merged_reply_protocol_version", 1, 1, 1
+)
 WEB_PORT = _bounded_int("web_port", 8766, 1024, 65535)
 GROUP_REPLY_MODE = config.get("group_reply_mode", "mention")  # "mention" / "all"
 

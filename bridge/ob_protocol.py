@@ -10,8 +10,10 @@ OneBot v11 协议处理模块。
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 import logging
@@ -19,15 +21,22 @@ import uuid
 
 import requests
 
+_BRIDGE_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BRIDGE_MODULE_DIR not in sys.path:
+    sys.path.insert(0, _BRIDGE_MODULE_DIR)
+
 import state
 import config
 from privacy import chat_record
 from favorite_sticker import STICKER_KEYS
+from reply_store import ReplyStoreError, default_store
 
 log = logging.getLogger("ob11-bridge")
 _CONTACTS_LIMIT = 10000
 _CONTACTS_TIMEOUT_SECONDS = 5
 _FAVORITE_STICKER_COMMIT_BUDGET_SECONDS = 25.0
+_MERGED_REPLY_MAX_CODEPOINTS = 2000
+_MERGED_REPLY_MAX_UTF8_BYTES = 16 * 1024
 _READ_ONLY_ACTIONS = {
     "get_login_info",
     "get_status",
@@ -135,6 +144,104 @@ def _parse_favorite_sticker_request(
     if str(parsed_request_id) != request_id.lower():
         return None
     return scope, target_id, sticker_key, request_id.lower()
+
+
+def _parse_merged_reply_request(
+    submitted_params: object,
+) -> tuple[int, int, int, str, str, str, str, str] | None:
+    if not isinstance(submitted_params, dict) or set(submitted_params) != {
+        "user_id",
+        "bridge_generation",
+        "reply_epoch",
+        "request_id",
+        "text",
+        "plugin_instance_id",
+        "lease_id",
+        "admission_token",
+    }:
+        return None
+    target_id = _normalize_target_id(submitted_params.get("user_id"))
+    bridge_generation = _normalize_target_id(
+        submitted_params.get("bridge_generation")
+    )
+    reply_epoch = _normalize_target_id(submitted_params.get("reply_epoch"))
+    request_id = submitted_params.get("request_id")
+    text = submitted_params.get("text")
+    plugin_instance_id = submitted_params.get("plugin_instance_id")
+    lease_id = submitted_params.get("lease_id")
+    admission_token = submitted_params.get("admission_token")
+    normalized_text = _normalize_merged_reply_text(text) if isinstance(text, str) else ""
+    if (
+        target_id is None
+        or bridge_generation is None
+        or reply_epoch is None
+        or not isinstance(request_id, str)
+        or not isinstance(text, str)
+        or not normalized_text.strip()
+        or len(normalized_text) > _MERGED_REPLY_MAX_CODEPOINTS
+        or len(normalized_text.encode("utf-8")) > _MERGED_REPLY_MAX_UTF8_BYTES
+        or any(ord(char) < 32 and char not in "\t\n" for char in normalized_text)
+        or not isinstance(plugin_instance_id, str)
+        or not isinstance(lease_id, str)
+        or not isinstance(admission_token, str)
+        or not (20 <= len(lease_id) <= 128)
+        or not (20 <= len(admission_token) <= 128)
+    ):
+        return None
+    try:
+        parsed_request_id = uuid.UUID(request_id)
+    except (ValueError, AttributeError):
+        return None
+    if str(parsed_request_id) != request_id.lower():
+        return None
+    try:
+        parsed_plugin_id = uuid.UUID(plugin_instance_id)
+    except (ValueError, AttributeError):
+        return None
+    if str(parsed_plugin_id) != plugin_instance_id.lower():
+        return None
+    return (
+        target_id,
+        bridge_generation,
+        reply_epoch,
+        request_id.lower(),
+        normalized_text,
+        plugin_instance_id.lower(),
+        lease_id,
+        admission_token,
+    )
+
+
+def _normalize_merged_reply_text(value: str) -> str:
+    """Protocol normalization shared with the bundled AstrBot plugin."""
+
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip(" \t") for line in normalized.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    output: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line == "":
+            blank_run += 1
+            if blank_run <= 1:
+                output.append("")
+        else:
+            blank_run = 0
+            output.append(line)
+    return "\n".join(output)
+
+
+def _merged_reply_fingerprint(
+    target_id: int,
+    bridge_generation: int,
+    reply_epoch: int,
+    text: str,
+) -> str:
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"{target_id}:{bridge_generation}:{reply_epoch}:{digest}"
 
 
 def _private_failure_identity(target_id: int) -> tuple[str, str, str] | None:
@@ -342,6 +449,34 @@ async def _send_private_send_failure(
     )
 
 
+async def _send_action_failure(
+    *,
+    has_echo: bool,
+    echo: object,
+    code: str,
+    stage: str = "request",
+    retcode: int = 1400,
+    extra: dict[str, object] | None = None,
+) -> None:
+    data: dict[str, object] = {
+        "confirmed": False,
+        "error_code": code,
+        "error_stage": stage,
+        "committed": False,
+    }
+    if extra:
+        data.update(extra)
+    _record_safe_send_failure(code, stage)
+    await _send_api_response(
+        {
+            "status": "failed",
+            "retcode": retcode,
+            "data": data,
+            **({"echo": echo} if has_echo else {}),
+        }
+    )
+
+
 async def _handle_ob_api(data: dict, generation=None):
     """处理 AstrBot 发来的 API 请求。"""
     action = data.get("action", "")
@@ -361,6 +496,14 @@ async def _handle_ob_api(data: dict, generation=None):
         "send_msg",
         "send_private_msg",
         "send_group_msg",
+        "send_akasha_merged_reply",
+        "register_akasha_merged_reply",
+        "renew_akasha_merged_reply",
+        "activate_akasha_merged_reply",
+        "release_akasha_reply_admission",
+        "finish_akasha_reply_admission",
+        "get_akasha_reply_admission",
+        "ack_akasha_send_result",
         "send_wechat_favorite_sticker",
     } | _READ_ONLY_ACTIONS
     if action not in supported_actions:
@@ -443,6 +586,413 @@ async def _handle_ob_api(data: dict, generation=None):
     resp_data = {"status": "ok", "retcode": 0, "data": {}}
     if has_echo:
         resp_data["echo"] = echo
+
+    if action == "register_akasha_merged_reply":
+        expected = {
+            "plugin_instance_id",
+            "protocol_version",
+            "action_version",
+            "result_schema",
+            "memory_schema",
+            "streaming_response",
+            "lifecycle_tracker_ready",
+        }
+        if not params_valid or set(params) != expected:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        try:
+            lease = state.register_merged_reply_capability(
+                plugin_instance_id=params.get("plugin_instance_id"),
+                generation=int(generation or state.lifecycle_generation),
+                protocol_version=params.get("protocol_version"),
+                action_version=params.get("action_version"),
+                result_schema=params.get("result_schema"),
+                memory_schema=params.get("memory_schema"),
+                streaming_response=params.get("streaming_response"),
+                lifecycle_tracker_ready=params.get("lifecycle_tracker_ready"),
+                connection=state._ob_ws,
+            )
+        except (ReplyStoreError, TypeError, ValueError) as error:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code=getattr(error, "code", "E_MERGED_REPLY_NOT_READY"),
+                retcode=1403,
+            )
+            return
+        await _send_api_response(
+            {
+                "status": "ok",
+                "retcode": 0,
+                "data": lease,
+                **({"echo": echo} if has_echo else {}),
+            }
+        )
+        return
+
+    if action == "renew_akasha_merged_reply":
+        expected = {"plugin_instance_id", "lease_id", "bridge_generation"}
+        if not params_valid or set(params) != expected:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        bridge_generation = _normalize_target_id(params.get("bridge_generation"))
+        if bridge_generation is None:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        try:
+            lease = state.renew_merged_reply_capability(
+                plugin_instance_id=str(params.get("plugin_instance_id") or ""),
+                lease_id=str(params.get("lease_id") or ""),
+                generation=bridge_generation,
+                connection=state._ob_ws,
+            )
+        except ReplyStoreError as error:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code=error.code,
+                retcode=1403,
+            )
+            return
+        await _send_api_response(
+            {
+                "status": "ok",
+                "retcode": 0,
+                "data": lease,
+                **({"echo": echo} if has_echo else {}),
+            }
+        )
+        return
+
+    if action == "activate_akasha_merged_reply":
+        expected = {"plugin_instance_id", "lease_id", "bridge_generation"}
+        if not params_valid or set(params) != expected:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        bridge_generation = _normalize_target_id(params.get("bridge_generation"))
+        if bridge_generation is None:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        try:
+            readiness = state.activate_merged_reply_capability(
+                plugin_instance_id=str(params.get("plugin_instance_id") or ""),
+                lease_id=str(params.get("lease_id") or ""),
+                generation=bridge_generation,
+                connection=state._ob_ws,
+            )
+        except ReplyStoreError as error:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code=error.code,
+                retcode=1403,
+            )
+            return
+        await _send_api_response(
+            {
+                "status": "ok",
+                "retcode": 0,
+                "data": readiness,
+                **({"echo": echo} if has_echo else {}),
+            }
+        )
+        return
+
+    if action in {
+        "release_akasha_reply_admission",
+        "finish_akasha_reply_admission",
+        "get_akasha_reply_admission",
+    }:
+        base_expected = {
+            "plugin_instance_id",
+            "lease_id",
+            "bridge_generation",
+            "admission_token",
+        }
+        expected = set(base_expected)
+        if action == "release_akasha_reply_admission":
+            expected.add("reason")
+        elif action == "finish_akasha_reply_admission":
+            expected.update({"request_id", "outcome", "reason"})
+        if not params_valid or set(params) != expected:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        bridge_generation = _normalize_target_id(params.get("bridge_generation"))
+        plugin_instance_id = str(params.get("plugin_instance_id") or "")
+        lease_id = str(params.get("lease_id") or "")
+        if (
+            bridge_generation is None
+            or not state.validate_merged_reply_lease(
+                plugin_instance_id=plugin_instance_id,
+                lease_id=lease_id,
+                generation=bridge_generation,
+                require_ready=False,
+            )
+        ):
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_MERGED_REPLY_LEASE_INVALID",
+                retcode=1403,
+            )
+            return
+        token = str(params.get("admission_token") or "")
+        try:
+            if action == "get_akasha_reply_admission":
+                admission = default_store().admission_status(token)
+                if admission is None:
+                    raise ReplyStoreError("E_ADMISSION_INVALID")
+                result = {
+                    "state": str(admission.get("state") or ""),
+                    "outcome": str(admission.get("outcome") or ""),
+                    "reason": str(admission.get("reason") or ""),
+                    "request_id": str(admission.get("request_id") or ""),
+                }
+            else:
+                outcome = (
+                    "released"
+                    if action == "release_akasha_reply_admission"
+                    else str(params.get("outcome") or "")
+                )
+                admission = state.finish_reply_admission(
+                    token,
+                    plugin_instance_id=plugin_instance_id,
+                    generation=bridge_generation,
+                    outcome=outcome,
+                    reason=str(params.get("reason") or ""),
+                    request_id=str(params.get("request_id") or ""),
+                )
+                result = {
+                    "state": str(admission.get("state") or ""),
+                    "outcome": str(admission.get("outcome") or ""),
+                    "reason": str(admission.get("reason") or ""),
+                    "request_id": str(admission.get("request_id") or ""),
+                }
+        except ReplyStoreError as error:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code=error.code,
+                retcode=1409,
+            )
+            return
+        await _send_api_response(
+            {
+                "status": "ok",
+                "retcode": 0,
+                "data": result,
+                **({"echo": echo} if has_echo else {}),
+            }
+        )
+        return
+
+    if action == "ack_akasha_send_result":
+        expected = {
+            "plugin_instance_id",
+            "lease_id",
+            "bridge_generation",
+            "notice_id",
+            "result_digest",
+        }
+        if not params_valid or set(params) != expected:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        bridge_generation = _normalize_target_id(params.get("bridge_generation"))
+        plugin_instance_id = str(params.get("plugin_instance_id") or "")
+        if (
+            bridge_generation is None
+            or not state.validate_merged_reply_lease(
+                plugin_instance_id=plugin_instance_id,
+                lease_id=str(params.get("lease_id") or ""),
+                generation=bridge_generation,
+            )
+        ):
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_MERGED_REPLY_LEASE_INVALID",
+                retcode=1403,
+            )
+            return
+        acked = default_store().ack_notice(
+            str(params.get("notice_id") or ""),
+            str(params.get("result_digest") or ""),
+        )
+        if not acked:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+                retcode=1409,
+            )
+            return
+        await _send_api_response(
+            {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"acked": True},
+                **({"echo": echo} if has_echo else {}),
+            }
+        )
+        return
+
+    if action == "send_akasha_merged_reply":
+        parsed = _parse_merged_reply_request(submitted_params)
+        if parsed is None:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_INVALID_REQUEST",
+            )
+            return
+        (
+            target_id,
+            bridge_generation,
+            reply_epoch,
+            request_id,
+            text,
+            plugin_instance_id,
+            lease_id,
+            admission_token,
+        ) = parsed
+        fingerprint = _merged_reply_fingerprint(
+            target_id,
+            bridge_generation,
+            reply_epoch,
+            text,
+        )
+
+        # Idempotency is authoritative even after the originating lease or
+        # epoch expires.  A terminal replay must never create a second job.
+        try:
+            cached = default_store().lookup_request(request_id, fingerprint)
+        except ReplyStoreError as error:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code=error.code,
+                retcode=1409,
+                extra={"request_id": request_id},
+            )
+            return
+        if cached is not None:
+            await _send_api_response(
+                {
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": cached,
+                    **({"echo": echo} if has_echo else {}),
+                }
+            )
+            return
+
+        active_generation = int(
+            generation
+            if generation is not None
+            else getattr(state, "lifecycle_generation", 0)
+        )
+        if (
+            active_generation != bridge_generation
+            or not state.validate_merged_reply_lease(
+                plugin_instance_id=plugin_instance_id,
+                lease_id=lease_id,
+                generation=bridge_generation,
+            )
+        ):
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_MERGED_REPLY_LEASE_INVALID",
+                retcode=1403,
+                extra={"request_id": request_id},
+            )
+            return
+
+        identity = await asyncio.to_thread(_private_failure_identity, target_id)
+        if identity is None:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_OB_PRIVATE_ROUTE",
+                stage="route",
+                retcode=1404,
+                extra={"request_id": request_id},
+            )
+            return
+        routing_name, account, session = identity
+        try:
+            result = state.accept_merged_reply_job(
+                lease_id=lease_id,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                target_id=target_id,
+                generation=bridge_generation,
+                epoch=reply_epoch,
+                text=text,
+                plugin_instance_id=plugin_instance_id,
+                admission_token=admission_token,
+                routing_name=routing_name,
+                account=account,
+                session=session,
+            )
+        except ReplyStoreError as error:
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code=error.code,
+                retcode=(
+                    1403
+                    if error.code == "E_MERGED_REPLY_LEASE_INVALID"
+                    else 1409
+                ),
+                extra={"request_id": request_id},
+            )
+            return
+
+        result["fingerprint"] = fingerprint
+        await _send_api_response(
+            {
+                "status": "ok",
+                "retcode": 0,
+                "data": result,
+                **({"echo": echo} if has_echo else {}),
+            }
+        )
+        log.info(
+            "[MERGED] 请求已持久受理: request=%s epoch=%s outcome=%s",
+            request_id,
+            reply_epoch,
+            result.get("outcome"),
+        )
+        return
 
     if action == "send_wechat_favorite_sticker":
         parsed = _parse_favorite_sticker_request(submitted_params)
@@ -590,6 +1140,34 @@ async def _handle_ob_api(data: dict, generation=None):
             await _send_api_response(failed_response)
             contact = "未知"
             _write_outbound_log(scope, contact, "[无效消息]", False)
+            return
+
+        admission_active = getattr(
+            state,
+            "merged_reply_admission_active",
+            lambda _target_id: False,
+        )
+        if (
+            not is_group
+            and any(
+                isinstance(segment, dict)
+                and segment.get("type") == "text"
+                for segment in message
+            )
+            and admission_active(target_id)
+        ):
+            await _send_action_failure(
+                has_echo=has_echo,
+                echo=echo,
+                code="E_MERGED_REPLY_ADMISSION_REQUIRED",
+                retcode=1403,
+            )
+            _write_outbound_log(
+                "private",
+                "未知",
+                "[合并回复 admission 缺失]",
+                False,
+            )
             return
 
         private_identity: tuple[str, str, str] | None = None
@@ -893,7 +1471,11 @@ def make_message_event(message_type: str, user_id: int, message: list,
                        group_id: int = 0, group_name: str = "",
                        nickname: str = "", account: str = "",
                        session: str = "", source_messages: list | None = None,
-                       routing_name: str = "") -> dict:
+                       routing_name: str = "",
+                       bridge_generation: object = None,
+                       reply_epoch: object = None,
+                       plugin_instance_id: str = "",
+                       admission_token: str = "") -> dict:
     """构造 OneBot v11 消息事件"""
     event = {
         "time": int(time.time()),
@@ -930,6 +1512,14 @@ def make_message_event(message_type: str, user_id: int, message: list,
             if seg.get("type") == "text"
         )
         event["sender"] = {"user_id": user_id, "nickname": nickname or str(user_id)}
+        normalized_generation = _normalize_target_id(bridge_generation)
+        normalized_epoch = _normalize_target_id(reply_epoch)
+        if normalized_generation is not None and normalized_epoch is not None:
+            event["akasha_reply_schema"] = 1
+            event["bridge_generation"] = normalized_generation
+            event["reply_epoch"] = normalized_epoch
+            event["plugin_instance_id"] = str(plugin_instance_id)
+            event["admission_token"] = str(admission_token)
     return event
 
 

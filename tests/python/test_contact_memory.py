@@ -322,7 +322,7 @@ class ContactMemoryTests(unittest.TestCase):
                     }
                 finally:
                     connection.close()
-                self.assertEqual(10, version)
+                self.assertEqual(13, version)
                 self.assertIn("memory_revision", contact_columns)
                 self.assertIn("next_seed_recent_limit", contact_columns)
                 self.assertIn("memory_revision", session_columns)
@@ -376,7 +376,7 @@ class ContactMemoryTests(unittest.TestCase):
                     ).fetchone()[0]
                 finally:
                     connection.close()
-                self.assertEqual(10, version)
+                self.assertEqual(13, version)
 
         asyncio.run(scenario())
 
@@ -412,7 +412,7 @@ class ContactMemoryTests(unittest.TestCase):
                     ).fetchone()[0]
                 finally:
                     connection.close()
-                self.assertEqual(10, version)
+                self.assertEqual(13, version)
                 self.assertEqual(0, revision)
                 self.assertEqual(0, recent_limit)
 
@@ -450,7 +450,7 @@ class ContactMemoryTests(unittest.TestCase):
                 finally:
                     connection.close()
 
-                self.assertEqual(10, version)
+                self.assertEqual(13, version)
                 self.assertIsNotNone(delivery_table)
 
         asyncio.run(scenario())
@@ -509,7 +509,7 @@ class ContactMemoryTests(unittest.TestCase):
                 finally:
                     connection.close()
 
-                self.assertEqual(10, version)
+                self.assertEqual(13, version)
                 self.assertIsNotNone(marker_table)
                 migrated = await store.active_qwen_session(contact.id)
                 self.assertIsNotNone(migrated)

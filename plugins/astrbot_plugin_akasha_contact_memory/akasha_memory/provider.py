@@ -368,6 +368,7 @@ class AkashaQwenMemoryProvider(Provider):
             await self.runtime.archive_fallback_output(
                 str(session_id),
                 response.completion_text,
+                response_id=str(getattr(response, "id", "") or ""),
             )
         return response
 
