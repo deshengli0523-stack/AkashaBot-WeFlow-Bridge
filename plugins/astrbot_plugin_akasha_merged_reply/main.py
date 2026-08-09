@@ -1048,14 +1048,11 @@ class Main(Star):
         _run_context: Any,
         _response: Any,
     ) -> None:
-        if event.get_extra(CLAIMED_KEY, False):
-            return
-        await self._finalize_unconsumed(
-            event,
-            self._reply_context(event),
-            outcome="failed",
-            reason="E_PROVIDER_NO_RESULT",
-        )
+        # AstrBot invokes this hook before on_decorating_result, so CLAIMED_KEY
+        # cannot distinguish a valid model result here.  Later result hooks and
+        # the admission tracker own every terminal path without ending a normal
+        # reply before it can be claimed.
+        return
 
     @_after_message_sent()
     async def finalize_after_default_send(self, event: AstrMessageEvent) -> None:

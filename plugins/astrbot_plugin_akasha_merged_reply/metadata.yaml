@@ -2,7 +2,7 @@ name: astrbot_plugin_akasha_merged_reply
 display_name: Akasha 合并回复
 desc: 将 Akasha 微信私聊的一轮纯文本模型回复合并为一条，并淘汰同联系人未提交的旧回复。
 author: deshengli0523-stack
-version: 0.2.0
+version: 0.2.1
 repo: https://github.com/deshengli0523-stack/AkashaBot-WeFlow-Bridge
 astrbot_version: "==4.26.6"
 support_platforms:
