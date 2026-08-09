@@ -665,7 +665,7 @@ class MergedReplyPluginTests(unittest.TestCase):
         self.assertEqual(65, len(terminal))
         self.assertEqual([], pending)
 
-    def test_plain_model_chain_is_claimed_once_and_default_result_is_stopped(self):
+    def test_agent_done_before_decoration_preserves_plain_result_for_one_send(self):
         module, Plain = self._load_plugin()
         calls = []
 
@@ -691,7 +691,7 @@ class MergedReplyPluginTests(unittest.TestCase):
 
             def __init__(self):
                 self.extra = {module.MEMORY_BIND_STATUS_KEY: "bound"}
-                self.result = Result()
+                self.result = None
                 self.stopped = False
                 self.message_obj = types.SimpleNamespace(raw_message={})
 
@@ -740,6 +740,12 @@ class MergedReplyPluginTests(unittest.TestCase):
             }
             request = types.SimpleNamespace(system_prompt="角色设定")
             await plugin.prepare_merged_reply(event, request)
+            await plugin.finalize_agent(
+                event,
+                None,
+                types.SimpleNamespace(completion_text="第一句。第二句。"),
+            )
+            event.result = Result()
             await plugin.claim_and_normalize(event)
             await plugin.send_merged_reply(event)
             return event, request

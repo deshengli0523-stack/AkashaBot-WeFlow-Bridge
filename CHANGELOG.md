@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.5 - 2026-08-09
+
+- Keep a valid merged-reply admission active when AstrBot fires
+  `on_agent_done` before the result-decoration stage.
+- Leave empty-result, non-text, default-send, and abandoned-event cleanup to
+  the existing result hooks and admission tracker instead of terminating a
+  normal model response before it can be claimed.
+- Cover the real Agent-done to result-decoration ordering in the focused
+  merged-reply regression.
+
+### Automated verification
+
+- The focused lifecycle-order regression and the complete release gate pass.
+
 ## 0.4.4 - 2026-08-06
 
 - Add contact-scoped merged replies: each private inbound batch advances a
