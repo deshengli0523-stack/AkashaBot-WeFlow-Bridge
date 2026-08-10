@@ -128,13 +128,14 @@ Bridge 配置中的 `money_receive_enabled` 默认开启，`money_receive_timeou
 
 全部成功才返回 0；任一 `[FAIL]` 都返回非零。安装结束时的聚合失败码是 `E_HEALTH_FAILED`。
 
-## 8. 手动更新
+## 8. 一键更新
 
-1. 运行当前安装目录的 `停止.bat`，确认 WeFlow 已完全关闭。
-2. 下载并完整解压新版源码，或在另一个源码目录执行 Git 更新。
-3. 从新版源码目录运行新的 `安装.bat`。
-4. 如果显示环境或微信布局变化，运行安装目录的 `校准.bat` 重新校准。
-5. 运行 `启动.bat` 和 `健康检查.bat`。
+1. 下载并完整解压新版源码，或在现有源码目录执行 Git 更新。源码目录必须位于当前安装目录之外。
+2. 从新版源码根目录双击 `一键更新.bat`。
+3. 更新器自动停止 AkashaBot、AstrBot、Bridge 和 WeFlow，再调用事务式安装器更新程序与四个 AstrBot 插件。
+4. 如果现有校准有效，安装器自动启动服务并运行聚合健康检查。如果提示需要校准，请运行安装目录的 `校准.bat`，完成后运行 `启动.bat` 和 `健康检查.bat`。
+
+`一键更新.bat` 是源码包入口，不会复制到安装目录。首次安装请运行 `安装.bat`。默认更新 `%LOCALAPPDATA%\AkashaBot-WeFlow-Bridge`；自定义位置可在命令行运行 `一键更新.bat -InstallRoot "<自定义安装目录>"`。需要只更新而不启动时，可追加 `-SkipStart`。
 
 安装器拒绝在已记录服务仍运行时覆盖文件，并返回 `E_INSTALL_RUNNING`。正常重装保留安装根目录下的 `data`、联系人记忆数据库、收藏表情模板、持久语义目录和现有配置；旧桥接目录以及修改前的 WeFlow/AstrBot 配置会备份到 `data\backups`。三个 AstrBot 插件的代码都会在 AstrBot 初始化完成后分别暂存并原子替换，失败会恢复旧插件代码，不会删除 `data\astrbot\data\plugin_data` 或 `data\state` 中的收藏表情数据。
 
@@ -150,6 +151,11 @@ Bridge 配置中的 `money_receive_enabled` 默认开启，`money_receive_timeou
 | `E_WEFLOW_RUNNING` | WeFlow 正在运行，安装器拒绝改写配置；完全关闭后重试。 |
 | `E_LIFECYCLE_BUSY` | 另一安装、校准、启动或停止操作占用生命周期锁；等待完成。 |
 | `E_INSTALL_RUNNING` | 进程状态仍记录服务；先停止并确认后再更新。 |
+| `E_UPDATE_LOCATION` | 更新包与安装目录重叠；把 ZIP 完整解压到安装目录之外。 |
+| `E_UPDATE_PACKAGE` | 更新包缺少必要文件；重新下载并完整解压。 |
+| `E_UPDATE_NOT_INSTALLED` | 未找到现有安装；首次安装应运行 `安装.bat`。 |
+| `E_UPDATE_STOP` | 无法安全停止现有服务；检查上方错误后重试。 |
+| `E_UPDATE_INSTALL` | 安装阶段失败；检查 `data\logs\install.log`。 |
 | `E_PROCESS_STATE` | `data\state\processes.json` 缺少可信结构或已损坏；保留错误码求助。 |
 | `E_HEALTH_FAILED` | 四项健康检查至少一项失败；记录每项结果。 |
 | `E_UIA_CALIBRATION_REQUIRED` | 尚未完成校准；运行 `校准.bat`。 |

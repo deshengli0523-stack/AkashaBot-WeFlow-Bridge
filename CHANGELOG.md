@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.6 - 2026-08-11
+
+- Keep a late request carrying the previous merged-reply lease from revoking
+  the replacement capability that is already active in Bridge.
+- Require activation confirmation before the plugin publishes a lease for
+  sends, and calculate its local deadline conservatively from request start.
+- Replay the same request and admission after
+  `E_MERGED_REPLY_LEASE_INVALID` instead of failing a long-running reply at a
+  renewal boundary.
+- Add a source-package `一键更新.bat` entrypoint that safely stops the existing
+  installation, preserves local data and configuration, runs the existing
+  transactional installer, and restarts only when calibration remains valid.
+
+### Automated verification
+
+- All seven PowerShell release suites and 317 Python tests pass through
+  `tests\Run-All.ps1`; the updater also covers package-location, missing-install,
+  argument-transport, preserved-data, and successful orchestration regressions.
+
 ## 0.4.5 - 2026-08-09
 
 - Keep a valid merged-reply admission active when AstrBot fires

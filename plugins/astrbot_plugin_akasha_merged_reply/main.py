@@ -35,6 +35,7 @@ MEMORY_SCHEMA = 1
 LEASE_RENEW_SECONDS = 5.0
 LEASE_SECONDS = 15.0
 ACTION_TIMEOUT_SECONDS = 5.0
+LEASE_INVALID_ERROR = "E_MERGED_REPLY_LEASE_INVALID"
 MAX_CODEPOINTS = 2000
 MAX_UTF8_BYTES = 16 * 1024
 
@@ -150,6 +151,7 @@ class Main(Star):
         self._lease_lock = asyncio.Lock()
         self._lease: dict[str, Any] | None = None
         self._lease_task: asyncio.Task | None = None
+        self._lease_wake = asyncio.Event()
         self._tracker_tasks: dict[str, asyncio.Task] = {}
         self._acceptance_tasks: dict[str, asyncio.Task] = {}
         self._recovered_generation: int | None = None
@@ -212,6 +214,32 @@ class Main(Star):
         if self._lease_task is None or self._lease_task.done():
             self._lease_task = asyncio.create_task(self._lease_supervisor())
 
+    async def _pause_lease_supervisor(self, delay: float) -> None:
+        try:
+            await asyncio.wait_for(self._lease_wake.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._lease_wake.clear()
+
+    async def _discard_lease_snapshot(self, lease: dict[str, Any]) -> bool:
+        """Discard only the rejected snapshot, preserving a concurrent renewal."""
+
+        discarded = False
+        async with self._lease_lock:
+            if (
+                self._lease is not None
+                and self._lease.get("lease_id") == lease.get("lease_id")
+                and self._lease.get("bridge_generation")
+                == lease.get("bridge_generation")
+            ):
+                self._lease = None
+                discarded = True
+        if discarded:
+            self._lease_wake.set()
+            self._ensure_supervisor()
+        return discarded
+
     async def initialize(self) -> None:
         self._ensure_supervisor()
 
@@ -233,7 +261,7 @@ class Main(Star):
                 ):
                     async with self._lease_lock:
                         self._lease = None
-                    await asyncio.sleep(1.0)
+                    await self._pause_lease_supervisor(1.0)
                     continue
                 async with self._lease_lock:
                     lease = None if self._lease is None else dict(self._lease)
@@ -242,6 +270,7 @@ class Main(Star):
                     was_activation_confirmed = bool(
                         lease and lease.get("activation_confirmed")
                     )
+                    lease_request_started = time.monotonic()
                     if lease is None:
                         response = await asyncio.wait_for(
                             call_action(
@@ -270,6 +299,10 @@ class Main(Star):
                             timeout=ACTION_TIMEOUT_SECONDS,
                         )
                     data = _response_data(response)
+                    if data.get("error_code") == LEASE_INVALID_ERROR:
+                        if lease is not None:
+                            await self._discard_lease_snapshot(lease)
+                        raise RuntimeError("merged reply lease rejected")
                     lease_id = str(data.get("lease_id") or "")
                     generation = _positive_int(data.get("bridge_generation"))
                     if not lease_id or generation is None:
@@ -278,7 +311,10 @@ class Main(Star):
                         self._lease = {
                             "lease_id": lease_id,
                             "bridge_generation": generation,
-                            "expires_at": time.monotonic() + float(
+                            # Bridge starts this duration before the response
+                            # reaches AstrBot.  Base the local deadline on the
+                            # request start so the plugin never overestimates it.
+                            "expires_at": lease_request_started + float(
                                 data.get("expires_in_seconds") or LEASE_SECONDS
                             ),
                             "activated": was_activated,
@@ -310,7 +346,7 @@ class Main(Star):
                             current_lease["bridge_generation"]
                         )
                     else:
-                        await asyncio.sleep(1.0)
+                        await self._pause_lease_supervisor(1.0)
                         continue
                 if not bool(current_lease.get("activation_confirmed")):
                     activation = _response_data(
@@ -335,7 +371,7 @@ class Main(Star):
                             == current_lease.get("lease_id")
                         ):
                             self._lease["activation_confirmed"] = True
-                await asyncio.sleep(LEASE_RENEW_SECONDS)
+                await self._pause_lease_supervisor(LEASE_RENEW_SECONDS)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -351,7 +387,7 @@ class Main(Star):
                     "Akasha 合并回复 readiness 未就绪：%s",
                     type(exc).__name__,
                 )
-                await asyncio.sleep(1.0)
+                await self._pause_lease_supervisor(1.0)
 
     async def _lease_snapshot(self) -> dict[str, Any] | None:
         async with self._lease_lock:
@@ -359,6 +395,7 @@ class Main(Star):
                 self._lease is None
                 or float(self._lease.get("expires_at") or 0.0) <= time.monotonic()
                 or self._lease.get("activated") is not True
+                or self._lease.get("activation_confirmed") is not True
             ):
                 return None
             return dict(self._lease)
@@ -879,6 +916,9 @@ class Main(Star):
                 except Exception:
                     continue
                 data = _response_data(response)
+                if data.get("error_code") == LEASE_INVALID_ERROR:
+                    await self._discard_lease_snapshot(lease)
+                    continue
                 if not data:
                     continue
                 if data.get("pre_action_terminal") is True:
@@ -984,6 +1024,12 @@ class Main(Star):
                         timeout=ACTION_TIMEOUT_SECONDS,
                     )
                     data = _response_data(response)
+                    if data.get("error_code") == LEASE_INVALID_ERROR:
+                        last_error = RuntimeError("merged reply lease rejected")
+                        await self._discard_lease_snapshot(lease)
+                        data = {}
+                        await asyncio.sleep(0.2)
+                        continue
                     if data:
                         break
                 except Exception as exc:

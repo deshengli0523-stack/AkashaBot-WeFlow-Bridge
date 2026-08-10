@@ -548,6 +548,23 @@ def clear_merged_reply_capability(connection: object = None) -> None:
         _merged_capability = None
 
 
+def _merged_capability_runtime_valid(
+    capability: Optional[dict[str, object]],
+    now: float,
+) -> bool:
+    """Validate the stored lease independently of caller-supplied credentials."""
+
+    return bool(
+        capability is not None
+        and _ob_ws is not None
+        and capability.get("connection_id") == id(_ob_ws)
+        and capability.get("generation") == lifecycle_generation
+        and float(capability.get("expires_monotonic") or 0.0) > now
+        and is_generation_running(lifecycle_generation)
+        and not stopping
+    )
+
+
 def register_merged_reply_capability(
     *,
     plugin_instance_id: str,
@@ -621,19 +638,21 @@ def renew_merged_reply_capability(
     now = time.monotonic()
     with _merged_capability_lock:
         capability = _merged_capability
-        if (
-            capability is None
-            or capability.get("plugin_instance_id") != plugin_instance_id
-            or capability.get("lease_id") != lease_id
-            or capability.get("generation") != generation
-            or capability.get("connection_id") != id(connection)
-            or connection is not _ob_ws
-            or float(capability.get("expires_monotonic") or 0.0) <= now
-            or not is_generation_running(generation)
-            or stopping
-        ):
+        runtime_valid = _merged_capability_runtime_valid(capability, now)
+        credentials_match = bool(
+            runtime_valid
+            and capability is not None
+            and capability.get("plugin_instance_id") == plugin_instance_id
+            and capability.get("lease_id") == lease_id
+            and capability.get("generation") == generation
+            and capability.get("connection_id") == id(connection)
+            and connection is _ob_ws
+        )
+        if capability is not None and not runtime_valid:
             _merged_capability = None
+        if not credentials_match:
             raise ReplyStoreError("E_MERGED_REPLY_LEASE_INVALID")
+        assert capability is not None
         capability["expires_monotonic"] = now + _MERGED_LEASE_SECONDS
     _merged_outbox_wake.set()
     return {
@@ -683,15 +702,7 @@ def merged_reply_ready() -> bool:
     now = time.monotonic()
     with _merged_capability_lock:
         capability = _merged_capability
-        valid = bool(
-            capability is not None
-            and _ob_ws is not None
-            and capability.get("connection_id") == id(_ob_ws)
-            and capability.get("generation") == lifecycle_generation
-            and float(capability.get("expires_monotonic") or 0.0) > now
-            and is_generation_running(lifecycle_generation)
-            and not stopping
-        )
+        valid = _merged_capability_runtime_valid(capability, now)
         if capability is not None and not valid:
             _merged_capability = None
         return bool(valid and capability.get("recovery_ready") is True)
@@ -721,21 +732,18 @@ def validate_merged_reply_lease(
     now = time.monotonic()
     with _merged_capability_lock:
         capability = _merged_capability
-        valid = bool(
-            capability is not None
+        runtime_valid = _merged_capability_runtime_valid(capability, now)
+        credentials_match = bool(
+            runtime_valid
+            and capability is not None
             and capability.get("plugin_instance_id") == plugin_instance_id
             and capability.get("lease_id") == lease_id
             and capability.get("generation") == generation
-            and capability.get("connection_id") == id(_ob_ws)
-            and _ob_ws is not None
-            and float(capability.get("expires_monotonic") or 0.0) > now
-            and is_generation_running(generation)
-            and not stopping
         )
-        if capability is not None and not valid:
+        if capability is not None and not runtime_valid:
             _merged_capability = None
         return bool(
-            valid
+            credentials_match
             and (
                 not require_ready
                 or capability.get("recovery_ready") is True

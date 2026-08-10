@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('Akasha installer tests with spaces ' + [guid]::NewGuid().ToString('N'))
+$fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('Akasha it ' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 
 function Join-Chars {
   param([int[]]$Values)
@@ -16,7 +16,7 @@ function Get-TestLauncherNames {
     Start = (Join-Chars @(0x542F, 0x52A8)) + '.bat'
     Stop = (Join-Chars @(0x505C, 0x6B62)) + '.bat'
     Health = (Join-Chars @(0x5065, 0x5EB7, 0x68C0, 0x67E5)) + '.bat'
-    Update = (Join-Chars @(0x66F4, 0x65B0)) + '.bat'
+    Update = (Join-Chars @(0x4E00, 0x952E, 0x66F4, 0x65B0)) + '.bat'
   }
 }
 
@@ -53,6 +53,42 @@ function Stop-TestProcessTree {
         [void]$Process.WaitForExit(5000)
       }
     } catch {
+    }
+  }
+}
+
+function Invoke-TestUpdaterProcess {
+  param(
+    [string]$ScriptPath,
+    [string]$InstallRoot,
+    [switch]$SkipStart
+  )
+
+  $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $processInfo.FileName = 'powershell.exe'
+  $processInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $ScriptPath + '" -InstallRoot "' + $InstallRoot + '"'
+  if ($SkipStart) { $processInfo.Arguments += ' -SkipStart' }
+  $processInfo.UseShellExecute = $false
+  $processInfo.CreateNoWindow = $true
+  $processInfo.RedirectStandardOutput = $true
+  $processInfo.RedirectStandardError = $true
+  $process = $null
+  try {
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
+    Assert-True $process.Start() 'Updater fixture process did not start.'
+    if (-not $process.WaitForExit(15000)) {
+      Stop-TestProcessTree -Process $process
+      throw 'Updater fixture process timed out.'
+    }
+    return [pscustomobject]@{
+      ExitCode = [int]$process.ExitCode
+      Output = $process.StandardOutput.ReadToEnd() + $process.StandardError.ReadToEnd()
+    }
+  } finally {
+    if ($null -ne $process) {
+      Stop-TestProcessTree -Process $process
+      $process.Dispose()
     }
   }
 }
@@ -252,11 +288,10 @@ function New-TestSourceFixture {
 }
 
 $launchers = Get-TestLauncherNames
-$entrypoints = @('scripts\Install.ps1', $launchers.Install, $launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health)
+$entrypoints = @('scripts\Install.ps1', 'scripts\Update-Installed.ps1', $launchers.Install, $launchers.Update, $launchers.Calibrate, $launchers.Start, $launchers.Stop, $launchers.Health)
 foreach ($relative in $entrypoints) {
   if (-not (Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf)) { throw "Installer entrypoint missing: $relative" }
 }
-Assert-True (-not (Test-Path -LiteralPath (Join-Path $root $launchers.Update))) 'Phase 1 shipped an update entrypoint.'
 
 $installSource = Get-Content -LiteralPath (Join-Path $root 'scripts\Install.ps1') -Raw -Encoding UTF8
 Assert-True ($installSource -match 'OpenFileDialog') 'Installer does not offer a local WeFlow file picker.'
@@ -266,8 +301,13 @@ Assert-True ($installSource -match "Start-Process -FilePath 'msiexec\.exe'" -and
 Assert-True ($installSource -notmatch '[^\x00-\x7F]') 'Install.ps1 must remain ASCII-only for Windows PowerShell 5.1.'
 Assert-True ($installSource -match '\$installResult\s*=\s*Invoke-AkashaInstall' -and $installSource -match '\$installResult\.CalibrationRequired') 'Direct installer entrypoint does not retain the install result for calibration guidance.'
 Assert-True ($installSource -match '\$launchers\.Calibrate') 'Direct installer entrypoint does not construct the calibration launcher from codepoints.'
+$updateSource = Get-Content -LiteralPath (Join-Path $root 'scripts\Update-Installed.ps1') -Raw -Encoding UTF8
+Assert-True ($updateSource -notmatch '[^\x00-\x7F]') 'Update-Installed.ps1 must remain ASCII-only for Windows PowerShell 5.1.'
+Assert-True ($updateSource -match 'Test-PathOverlap' -and $updateSource -match 'E_UPDATE_LOCATION') 'Updater does not reject source/install overlap.'
+Assert-True ($updateSource -match 'Stop-Services\.ps1' -and $updateSource -match 'Install\.ps1') 'Updater does not orchestrate the existing stop and install boundaries.'
+Assert-True ($updateSource.Contains("'data\state\install.json'") -and $updateSource -match 'E_UPDATE_NOT_INSTALLED') 'Updater does not require an existing installation marker.'
 
-foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop, $launchers.Health)) {
+foreach ($name in @($launchers.Install, $launchers.Update, $launchers.Start, $launchers.Stop, $launchers.Health)) {
   $path = Join-Path $root $name
   $bytes = [System.IO.File]::ReadAllBytes($path)
   Assert-True (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0) "$name is not ASCII-only."
@@ -277,6 +317,10 @@ foreach ($name in @($launchers.Install, $launchers.Start, $launchers.Stop, $laun
   Assert-True ($text -match 'set "CODE=%ERRORLEVEL%"') "$name does not capture ERRORLEVEL immediately."
   Assert-True ($text -match 'exit /b %CODE%') "$name does not preserve ERRORLEVEL."
 }
+$updateBat = [System.IO.File]::ReadAllText((Join-Path $root $launchers.Update))
+Assert-True ($updateBat.Contains('%~dp0scripts\Update-Installed.ps1')) 'Update launcher does not use the source-relative updater script.'
+Assert-True ($updateBat -match '%\*') 'Update launcher does not forward an optional custom InstallRoot.'
+Assert-True ($updateBat -match '(?m)^pause\s*$') 'Update launcher must pause so an interactive user can inspect the final result.'
 $calibrateBat = [System.IO.File]::ReadAllText((Join-Path $root $launchers.Calibrate))
 Assert-True (@([System.IO.File]::ReadAllBytes((Join-Path $root $launchers.Calibrate)) | Where-Object { $_ -gt 127 }).Count -eq 0) "$($launchers.Calibrate) is not ASCII-only."
 Assert-True ($calibrateBat -match '%~dp0scripts\\Calibrate-Uia\.ps1') "$($launchers.Calibrate) does not use the source-relative calibration script."
@@ -335,6 +379,7 @@ Assert-Equal @($payload | Where-Object { $_.Source -like 'bridge\*' }).Count 18 
 Assert-Equal @($payload | Where-Object { $_.Source -like 'scripts\*' }).Count 9 'Script payload count changed.'
 Assert-Equal @($payload | Where-Object { $_.Source -notlike 'bridge\*' -and $_.Source -notlike 'scripts\*' }).Count 7 'Root payload count changed.'
 Assert-True (@($payload | Where-Object { $_.Source -ceq $launchers.Install }).Count -eq 0) 'Install launcher must not be installed.'
+Assert-True (@($payload | Where-Object { $_.Source -ceq $launchers.Update -or $_.Source -ceq 'scripts\Update-Installed.ps1' }).Count -eq 0) 'Source-package updater must not be copied into the installation root.'
 $expectedPayloadSources = @(
   'bridge\bridge_core.py', 'bridge\config.py', 'bridge\favorite_sticker.py', 'bridge\main.py', 'bridge\money_action.py', 'bridge\money_service.py', 'bridge\ob_client.py',
   'bridge\ob_protocol.py', 'bridge\privacy.py', 'bridge\reply_store.py', 'bridge\state.py',
@@ -470,6 +515,55 @@ exit 0
     Assert-True (-not $receivedRoot.Contains('"')) "$($case.Launcher) appended a literal quote to InstallRoot."
     Assert-Equal ([System.IO.Path]::GetFullPath($receivedRoot).TrimEnd('\', '/')) ([System.IO.Path]::GetFullPath($launcherProbeRoot).TrimEnd('\', '/')) "$($case.Launcher) changed InstallRoot during BAT to PowerShell transport."
   }
+
+  $updaterSourceRoot = Join-Path $fixtureRoot 'updater source with spaces'
+  $updaterScripts = Join-Path $updaterSourceRoot 'scripts'
+  New-Item -ItemType Directory -Force -Path $updaterScripts | Out-Null
+  Copy-Item -LiteralPath (Join-Path $root 'scripts\Update-Installed.ps1') -Destination (Join-Path $updaterScripts 'Update-Installed.ps1') -Force
+  [System.IO.File]::WriteAllText((Join-Path $updaterSourceRoot 'VERSION'), '9.9.9', (New-Object System.Text.UTF8Encoding($false)))
+  $stopStub = @'
+param([string]$InstallRoot)
+[System.IO.File]::WriteAllText((Join-Path $InstallRoot 'stop-marker.txt'), $InstallRoot, (New-Object System.Text.UTF8Encoding($false)))
+Write-Output 'fixture stop output'
+exit 0
+'@
+  $installStub = @'
+param([string]$SourceRoot, [string]$InstallRoot, [switch]$SkipStart)
+$record = [ordered]@{ source_root = $SourceRoot; install_root = $InstallRoot; skip_start = [bool]$SkipStart }
+[System.IO.File]::WriteAllText((Join-Path $InstallRoot 'install-marker.json'), ($record | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+Write-Output 'fixture install output'
+exit 0
+'@
+  [System.IO.File]::WriteAllText((Join-Path $updaterScripts 'Stop-Services.ps1'), $stopStub, (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText((Join-Path $updaterScripts 'Install.ps1'), $installStub, (New-Object System.Text.UTF8Encoding($false)))
+
+  $updaterTarget = Join-Path $fixtureRoot 'updater target with spaces'
+  $updaterState = Join-Path $updaterTarget 'data\state'
+  New-Item -ItemType Directory -Force -Path $updaterState | Out-Null
+  [System.IO.File]::WriteAllText((Join-Path $updaterState 'install.json'), '{"status":"installed"}', (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText((Join-Path $updaterTarget 'VERSION'), '9.9.8', (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText((Join-Path $updaterState 'preserved.txt'), 'preserved', (New-Object System.Text.UTF8Encoding($false)))
+  $updaterScript = Join-Path $updaterScripts 'Update-Installed.ps1'
+  $updaterResult = Invoke-TestUpdaterProcess -ScriptPath $updaterScript -InstallRoot $updaterTarget -SkipStart
+  Assert-Equal $updaterResult.ExitCode 0 "Updater orchestration failed: $($updaterResult.Output)"
+  Assert-True ($updaterResult.Output -match 'fixture stop output' -and $updaterResult.Output -match 'fixture install output') 'Updater hid child-script output or treated it as an exit code.'
+  Assert-Equal ([System.IO.File]::ReadAllText((Join-Path $updaterTarget 'stop-marker.txt'))) ([System.IO.Path]::GetFullPath($updaterTarget).TrimEnd('\', '/')) 'Updater passed the wrong target to the stop boundary.'
+  $installMarker = Get-Content -LiteralPath (Join-Path $updaterTarget 'install-marker.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-Equal ([System.IO.Path]::GetFullPath([string]$installMarker.source_root).TrimEnd('\', '/')) ([System.IO.Path]::GetFullPath($updaterSourceRoot).TrimEnd('\', '/')) 'Updater passed the wrong source root to the installer.'
+  Assert-Equal ([System.IO.Path]::GetFullPath([string]$installMarker.install_root).TrimEnd('\', '/')) ([System.IO.Path]::GetFullPath($updaterTarget).TrimEnd('\', '/')) 'Updater passed the wrong target root to the installer.'
+  Assert-True ([bool]$installMarker.skip_start) 'Updater did not forward SkipStart.'
+  Assert-Equal ([System.IO.File]::ReadAllText((Join-Path $updaterState 'preserved.txt'))) 'preserved' 'Updater changed preserved installation data outside the installer.'
+
+  $missingUpdaterTarget = Join-Path $fixtureRoot 'missing updater target'
+  $missingUpdaterResult = Invoke-TestUpdaterProcess -ScriptPath $updaterScript -InstallRoot $missingUpdaterTarget
+  Assert-Equal $missingUpdaterResult.ExitCode 1 'Updater accepted a missing installation.'
+  Assert-True ($missingUpdaterResult.Output -match 'E_UPDATE_NOT_INSTALLED') 'Missing-install updater failure lost its fixed code.'
+  Assert-True (-not (Test-Path -LiteralPath $missingUpdaterTarget)) 'Missing-install updater failure mutated the target path.'
+
+  $overlapUpdaterResult = Invoke-TestUpdaterProcess -ScriptPath $updaterScript -InstallRoot $updaterSourceRoot
+  Assert-Equal $overlapUpdaterResult.ExitCode 1 'Updater accepted its own source directory as the installation root.'
+  Assert-True ($overlapUpdaterResult.Output -match 'E_UPDATE_LOCATION') 'Overlapping updater failure lost its fixed code.'
+
   $externalRoot = Join-Path $fixtureRoot 'external packages and config'
   New-Item -ItemType Directory -Force -Path $externalRoot | Out-Null
   $weFlowExe = Join-Path $externalRoot 'WeFlow.exe'
