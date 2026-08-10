@@ -76,6 +76,7 @@ $expectedPublishFiles = @(
   'scripts/Initialize-Configuration.ps1',
   'scripts/Initialize-Environments.ps1',
   'scripts/Install.ps1',
+  'scripts/Update-Installed.ps1',
   'scripts/Start-Services.ps1',
   'scripts/Stop-Services.ps1',
   'scripts/Test-Prerequisites.ps1',
@@ -102,14 +103,15 @@ $expectedPublishFiles = @(
   ((-join @([char]0x542F, [char]0x52A8)) + '.bat'),
   ((-join @([char]0x505C, [char]0x6B62)) + '.bat'),
   ((-join @([char]0x5065, [char]0x5EB7, [char]0x68C0, [char]0x67E5)) + '.bat'),
-  ((-join @([char]0x6821, [char]0x51C6)) + '.bat')
+  ((-join @([char]0x6821, [char]0x51C6)) + '.bat'),
+  ((-join @([char]0x4E00, [char]0x952E, [char]0x66F4, [char]0x65B0)) + '.bat')
 )
-if ($expectedPublishFiles.Count -ne 90) {
-  throw "Release allowlist invariant is not 90 files: $($expectedPublishFiles.Count)"
+if ($expectedPublishFiles.Count -ne 92) {
+  throw "Release allowlist invariant is not 92 files: $($expectedPublishFiles.Count)"
 }
 $uniqueExpectedPublishFiles = @($expectedPublishFiles | Sort-Object -Unique)
-if ($uniqueExpectedPublishFiles.Count -ne 90) {
-  throw "Release allowlist must contain 90 unique entries; duplicate entries were found."
+if ($uniqueExpectedPublishFiles.Count -ne 92) {
+  throw "Release allowlist must contain 92 unique entries; duplicate entries were found."
 }
 $publishFiles = @(
   foreach ($entry in Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop |
@@ -137,8 +139,8 @@ foreach ($relativePath in $actualPublishFiles) {
   }
 }
 $uniqueActualPublishFiles = @($actualPublishFiles | Sort-Object -Unique)
-if ($actualPublishFiles.Count -ne 90 -or $uniqueActualPublishFiles.Count -ne 90) {
-  throw "Published files must contain exactly 90 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
+if ($actualPublishFiles.Count -ne 92 -or $uniqueActualPublishFiles.Count -ne 92) {
+  throw "Published files must contain exactly 92 unique entries; found $($actualPublishFiles.Count) entries and $($uniqueActualPublishFiles.Count) unique entries."
 }
 
 $bridgeRoot = Join-Path $root 'bridge'
@@ -802,8 +804,8 @@ foreach ($file in $textFiles) {
 }
 
 $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
-if ($version -cne '0.4.5') {
-  throw "VERSION must be 0.4.5, found '$version'."
+if ($version -cne '0.4.6') {
+  throw "VERSION must be 0.4.6, found '$version'."
 }
 
 $template = Get-Content -LiteralPath (Join-Path $root 'bridge\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json

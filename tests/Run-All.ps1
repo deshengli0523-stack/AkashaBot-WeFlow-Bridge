@@ -40,6 +40,7 @@ function Read-AkashaUtf8Strict {
 }
 
 function Assert-AkashaTask8Layout {
+  $updateLauncher = (Join-AkashaCharacters @(0x4E00, 0x952E, 0x66F4, 0x65B0)) + '.bat'
   $requiredFiles = @(
     'tests\Run-All.ps1',
     '.github\workflows\ci.yml',
@@ -58,6 +59,8 @@ function Assert-AkashaTask8Layout {
     'tests\python\test_favorite_sticker_plugin.py',
     'tests\python\test_merged_reply.py',
     'scripts\Calibrate-Uia.ps1',
+    'scripts\Update-Installed.ps1',
+    $updateLauncher,
     (((Join-AkashaCharacters @(0x6821, 0x51C6))) + '.bat')
   )
   foreach ($relativePath in $requiredFiles) {
@@ -73,13 +76,8 @@ function Assert-AkashaTask8Layout {
   }
 
   $publishedFiles = @(Get-AkashaPublishedFiles)
-  if ($publishedFiles.Count -ne 90) {
-    throw "Documentation/layout gate: expected 90 publish files, found $($publishedFiles.Count)."
-  }
-
-  $updateLauncher = (Join-AkashaCharacters @(0x66F4, 0x65B0)) + '.bat'
-  if (Test-Path -LiteralPath (Join-Path $root $updateLauncher)) {
-    throw 'Documentation/layout gate: Phase 1 must not publish an update launcher.'
+  if ($publishedFiles.Count -ne 92) {
+    throw "Documentation/layout gate: expected 92 publish files, found $($publishedFiles.Count)."
   }
 
   $ci = Read-AkashaUtf8Strict -Path (Join-Path $root '.github\workflows\ci.yml')
@@ -227,10 +225,10 @@ jobs:
     }
   }
 
-  Assert-AkashaContains -Text $changelog -Expected '## 0.4.5 - 2026-08-09' -Context 'CHANGELOG.md'
+  Assert-AkashaContains -Text $changelog -Expected '## 0.4.6 - 2026-08-11' -Context 'CHANGELOG.md'
   $version = (Read-AkashaUtf8Strict -Path (Join-Path $root 'VERSION')).Trim()
-  if ($version -cne '0.4.5') {
-    throw "Documentation/layout gate: VERSION must be 0.4.5, found '$version'."
+  if ($version -cne '0.4.6') {
+    throw "Documentation/layout gate: VERSION must be 0.4.6, found '$version'."
   }
 
   foreach ($relativeLink in @('INSTALL.md', 'SECURITY.md')) {
