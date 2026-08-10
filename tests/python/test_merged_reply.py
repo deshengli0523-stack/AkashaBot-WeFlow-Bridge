@@ -260,6 +260,68 @@ class MergedReplyStateTests(unittest.TestCase):
             )
             self.assertTrue(state.merged_reply_ready())
 
+    def test_stale_lease_cannot_revoke_replacement_capability(self):
+        with tempfile.TemporaryDirectory(prefix="akasha-merged-lease-") as temp:
+            store = REPLY_STORE.ReplyStore(pathlib.Path(temp) / "state.sqlite3")
+            state = _load_file(
+                f"state_lease_{uuid.uuid4().hex}",
+                BRIDGE / "state.py",
+                {},
+            )
+            state.default_store = lambda: store
+            state.running = True
+            state.stopping = False
+            state.lifecycle_generation = store.allocate_generation()
+            state._ob_ws = object()
+            plugin_instance_id = str(uuid.uuid4())
+
+            stale = state.register_merged_reply_capability(
+                plugin_instance_id=plugin_instance_id,
+                generation=state.lifecycle_generation,
+                protocol_version=1,
+                action_version=1,
+                result_schema=2,
+                memory_schema=1,
+                streaming_response=False,
+                lifecycle_tracker_ready=True,
+                connection=state._ob_ws,
+            )
+            current = state.register_merged_reply_capability(
+                plugin_instance_id=plugin_instance_id,
+                generation=state.lifecycle_generation,
+                protocol_version=1,
+                action_version=1,
+                result_schema=2,
+                memory_schema=1,
+                streaming_response=False,
+                lifecycle_tracker_ready=True,
+                connection=state._ob_ws,
+            )
+            state.activate_merged_reply_capability(
+                plugin_instance_id=plugin_instance_id,
+                lease_id=current["lease_id"],
+                generation=state.lifecycle_generation,
+                connection=state._ob_ws,
+            )
+            self.assertTrue(state.merged_reply_ready())
+
+            self.assertFalse(
+                state.validate_merged_reply_lease(
+                    plugin_instance_id=plugin_instance_id,
+                    lease_id=stale["lease_id"],
+                    generation=state.lifecycle_generation,
+                )
+            )
+            self.assertTrue(state.merged_reply_ready())
+            with self.assertRaises(state.ReplyStoreError):
+                state.renew_merged_reply_capability(
+                    plugin_instance_id=plugin_instance_id,
+                    lease_id=stale["lease_id"],
+                    generation=state.lifecycle_generation,
+                    connection=state._ob_ws,
+                )
+            self.assertTrue(state.merged_reply_ready())
+
 
 class MergedReplyBufferTests(unittest.TestCase):
     def test_quiet_window_resets_without_extending_max_window(self):
@@ -560,6 +622,27 @@ class MergedReplyPluginTests(unittest.TestCase):
             setattr(context, name, lambda *_args, **_kwargs: None)
         self.assertTrue(plugin._memory_ready())
 
+    def test_send_snapshot_waits_for_bridge_activation_confirmation(self):
+        module, _plain = self._load_plugin()
+
+        async def scenario():
+            plugin = module.Main(context=types.SimpleNamespace(), config={})
+            plugin._lease = {
+                "lease_id": "lease-1",
+                "bridge_generation": 7,
+                "expires_at": time.monotonic() + 60,
+                "activated": True,
+                "activation_confirmed": False,
+            }
+            before_confirmation = await plugin._lease_snapshot()
+            plugin._lease["activation_confirmed"] = True
+            after_confirmation = await plugin._lease_snapshot()
+            return before_confirmation, after_confirmation
+
+        before_confirmation, after_confirmation = asyncio.run(scenario())
+        self.assertIsNone(before_confirmation)
+        self.assertEqual("lease-1", after_confirmation["lease_id"])
+
     def test_finalizer_does_not_delete_memory_when_finish_reports_consumed(self):
         module, _plain = self._load_plugin()
         terminal_calls = []
@@ -589,6 +672,7 @@ class MergedReplyPluginTests(unittest.TestCase):
                 "bridge_generation": 7,
                 "expires_at": time.monotonic() + 60,
                 "activated": True,
+                "activation_confirmed": True,
             }
             resolved = await plugin._finalize_unconsumed(
                 Event(),
@@ -737,6 +821,7 @@ class MergedReplyPluginTests(unittest.TestCase):
                 "bridge_generation": 7,
                 "expires_at": time.monotonic() + 60,
                 "activated": True,
+                "activation_confirmed": True,
             }
             request = types.SimpleNamespace(system_prompt="角色设定")
             await plugin.prepare_merged_reply(event, request)
@@ -757,6 +842,136 @@ class MergedReplyPluginTests(unittest.TestCase):
         self.assertIsNone(event.result)
         self.assertTrue(event.stopped)
         self.assertIn("[AKASHA_MERGED_REPLY_V1]", request.system_prompt)
+
+    def test_send_replays_same_request_after_concurrent_lease_replacement(self):
+        module, Plain = self._load_plugin()
+        calls = []
+        acceptances = []
+        terminals = []
+        plugin_holder = {}
+
+        class Bot:
+            async def call_action(self, action, **params):
+                calls.append((action, params))
+                if len(calls) == 1:
+                    plugin_holder["plugin"]._lease = {
+                        "lease_id": "lease-new",
+                        "bridge_generation": 7,
+                        "expires_at": time.monotonic() + 60,
+                        "activated": True,
+                        "activation_confirmed": True,
+                    }
+                    return {
+                        "status": "failed",
+                        "retcode": 1403,
+                        "data": {
+                            "confirmed": False,
+                            "error_code": "E_MERGED_REPLY_LEASE_INVALID",
+                            "error_stage": "request",
+                            "committed": False,
+                        },
+                    }
+                return {"data": {"accepted": True, "outcome": "accepted"}}
+
+        class Context:
+            async def akasha_memory_acceptance(self, _event, status):
+                acceptances.append(status)
+                return True
+
+            async def akasha_memory_pre_action_terminal(
+                self,
+                _event,
+                outcome,
+                reason,
+            ):
+                terminals.append((outcome, reason))
+                return True
+
+        class Result:
+            chain = [Plain("续租竞态后的回复")]
+
+            @staticmethod
+            def is_llm_result():
+                return True
+
+        class Event:
+            bot = Bot()
+            unified_msg_origin = "aiocqhttp:FriendMessage:101"
+
+            def __init__(self):
+                self.extra = {module.MEMORY_BIND_STATUS_KEY: "bound"}
+                self.result = Result()
+                self.stopped = False
+                self.message_obj = types.SimpleNamespace(raw_message={})
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def is_private_chat(self):
+                return True
+
+            def get_sender_id(self):
+                return "101"
+
+            def get_extra(self, key, default=None):
+                return self.extra.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extra[key] = value
+
+            def get_result(self):
+                return self.result
+
+            def clear_result(self):
+                self.result = None
+
+            def stop_event(self):
+                self.stopped = True
+
+        async def scenario():
+            plugin = module.Main(context=Context(), config={})
+            plugin_holder["plugin"] = plugin
+            event = Event()
+            event.message_obj.raw_message = {
+                "akasha_reply_schema": 1,
+                "type": "private",
+                "user_id": 101,
+                "bridge_generation": 7,
+                "reply_epoch": 2,
+                "plugin_instance_id": plugin.plugin_instance_id,
+                "admission_token": "admission-" + "c" * 32,
+            }
+            plugin._lease = {
+                "lease_id": "lease-old",
+                "bridge_generation": 7,
+                "expires_at": time.monotonic() + 60,
+                "activated": True,
+                "activation_confirmed": True,
+            }
+            request = types.SimpleNamespace(system_prompt="角色设定")
+            await plugin.prepare_merged_reply(event, request)
+            await plugin.claim_and_normalize(event)
+            await plugin.send_merged_reply(event)
+            return event
+
+        event = asyncio.run(scenario())
+        self.assertEqual(2, len(calls))
+        self.assertEqual(
+            ["lease-old", "lease-new"],
+            [params["lease_id"] for _action, params in calls],
+        )
+        self.assertEqual(
+            calls[0][1]["request_id"],
+            calls[1][1]["request_id"],
+        )
+        self.assertEqual(
+            calls[0][1]["admission_token"],
+            calls[1][1]["admission_token"],
+        )
+        self.assertEqual(["accepted"], acceptances)
+        self.assertEqual([], terminals)
+        self.assertIsNone(event.result)
+        self.assertTrue(event.stopped)
 
 
 class MergedReplyMemoryTests(unittest.TestCase):
