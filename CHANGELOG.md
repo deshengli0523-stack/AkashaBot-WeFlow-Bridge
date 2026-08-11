@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.6hotfix - 2026-08-11
+
+- Recover the native Weixin main window from a hidden or tray-resident state
+  during calibration without weakening normal sender preflight checks.
+- Let the calibration click for the smile entry reach Weixin so the favorite
+  sticker panel can open, while continuing to capture fixed grid clicks.
+- Replace the managed draft probe's `Esc` cleanup with a right-arrow selection
+  collapse so recent Weixin builds no longer hide the main window before send.
+- Normalize calibration console output and pace retry failures so diagnostics
+  remain readable on Windows terminals.
+
+### Verification
+
+- The affected installation passed user end-to-end testing before release.
+- The fix previously passed 323 Python tests, all seven PowerShell release
+  suites, and both GitHub Actions Windows jobs on PR #28.
+
 ## 0.4.6 - 2026-08-11
 
 - Keep a late request carrying the previous merged-reply lease from revoking
