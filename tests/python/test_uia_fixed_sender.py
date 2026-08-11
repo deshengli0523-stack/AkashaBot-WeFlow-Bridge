@@ -1278,6 +1278,110 @@ class UiaFixedSenderTests(unittest.TestCase):
         self.assertNotIn("press_key(0x0D)", source)
         self.assertNotIn("VK_RETURN", source)
 
+    def test_managed_input_probe_collapses_selection_without_hiding_weixin(self):
+        sender = self._sender()
+        clipboard = types.ModuleType("pyperclip")
+        clipboard_state = {"text": ""}
+        clipboard.copy = lambda value: clipboard_state.update(text=str(value))
+        clipboard.paste = lambda: clipboard_state["text"]
+
+        with mock.patch.dict(sys.modules, {"pyperclip": clipboard}), mock.patch.object(
+            sender,
+            "_snapshot_clipboard",
+            return_value={"formats": []},
+        ), mock.patch.object(
+            sender,
+            "_restore_clipboard",
+            return_value=True,
+        ), mock.patch.object(
+            sender,
+            "_clipboard_sequence_number",
+            return_value=7,
+        ):
+            self.assertTrue(sender._managed_input_is_empty(101))
+
+        self.assertIn(
+            ("press_key_bound", 101, sender_module.VK_RIGHT),
+            self.driver.events,
+        )
+        self.assertNotIn(
+            ("press_key_bound", 101, sender_module.VK_ESCAPE),
+            self.driver.events,
+        )
+
+    def test_owned_draft_cleanup_collapses_selection_without_hiding_weixin(self):
+        clipboard = types.ModuleType("pyperclip")
+        clipboard_state = {"text": ""}
+        clipboard.copy = lambda value: clipboard_state.update(text=str(value))
+        clipboard.paste = lambda: clipboard_state["text"]
+        expected_text = "owned reply"
+
+        class DraftDriver(FakeDriver):
+            def hotkey_ctrl(self, virtual_key):
+                super().hotkey_ctrl(virtual_key)
+                if virtual_key == sender_module.VK_C:
+                    clipboard_state["text"] = expected_text
+
+        driver = DraftDriver()
+        sender = self._sender(driver=driver)
+        preview = {
+            "request_id": "request-1",
+            "target_id": "target-1",
+            "generation": 4,
+            "reply_epoch": 5,
+        }
+
+        with mock.patch.dict(sys.modules, {"pyperclip": clipboard}), mock.patch.object(
+            sender,
+            "_select_contact",
+        ), mock.patch.object(
+            sender,
+            "_snapshot_clipboard",
+            return_value={"formats": []},
+        ), mock.patch.object(
+            sender,
+            "_restore_clipboard",
+            return_value=True,
+        ), mock.patch.object(
+            sender,
+            "_clipboard_sequence_number",
+            return_value=11,
+        ), mock.patch.object(
+            sender_module.state,
+            "get_send_preview",
+            return_value=preview,
+        ), mock.patch.object(
+            sender_module.state,
+            "is_reply_current",
+            return_value=True,
+        ):
+            cleared = sender._discard_owned_pasted_text(
+                101,
+                "contact",
+                expected_text,
+                target_id="target-1",
+                generation=4,
+                reply_epoch=5,
+                request_id="request-1",
+            )
+
+        self.assertTrue(cleared)
+        self.assertEqual(
+            [
+                event
+                for event in driver.events
+                if event[0] == "press_key_bound"
+            ],
+            [
+                ("press_key_bound", 101, sender_module.VK_BACKSPACE),
+                ("press_key_bound", 101, sender_module.VK_RIGHT),
+            ],
+        )
+        self.assertNotIn(
+            ("press_key_bound", 101, sender_module.VK_ESCAPE),
+            driver.events,
+        )
+
     def test_favorite_sticker_clicks_fixed_slot_without_visual_capture(self):
         events = []
 

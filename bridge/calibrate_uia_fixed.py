@@ -141,7 +141,7 @@ def _capture_signature(metrics: ClientMetrics) -> tuple[int, int, int, int, int,
 
 
 def _capture_metrics(driver) -> ClientMetrics:
-    hwnd = driver.find_wechat_window()
+    hwnd = driver.prepare_calibration_window()
     metrics = driver.get_client_metrics(hwnd)
     if (
         metrics.hwnd != hwnd
@@ -180,6 +180,7 @@ def collect_calibration(
             if error.code != CALIBRATION_WINDOW:
                 raise
             _report_window_failure(output_fn)
+            time.sleep(0.25)
             continue
 
         current_signature = _capture_signature(metrics)
@@ -214,6 +215,7 @@ def collect_calibration(
             if error.code != CALIBRATION_WINDOW:
                 raise
             _report_window_failure(output_fn)
+            time.sleep(0.25)
             continue
 
         if point is None:
@@ -238,36 +240,45 @@ def collect_favorite_sticker_calibration(
 
     output_fn("步骤: 请关闭表情面板并保持目标微信窗口前台最大化")
     for point_name in FAVORITE_POINT_NAMES:
-        current = driver.get_client_metrics(metrics.hwnd)
-        if (
-            not current.visible
-            or not current.maximized
-            or current.width < 800
-            or current.height < 600
-            or _capture_signature(current) != signature
-        ):
-            raise CalibrationError(CALIBRATION_WINDOW)
-        output_fn(f"步骤: {FAVORITE_STEP_LABELS[point_name]}")
-        point = driver.capture_swallowed_click(
-            metrics.hwnd,
-            allow_same_process_popup=point_name != "smile_entry",
-        )
-        if point is None:
-            output_fn("失败: 用户取消")
-            return None
-        points[point_name] = point
-        output_fn(f"成功: {FAVORITE_STEP_LABELS[point_name]}")
+        while True:
+            current = (
+                _capture_metrics(driver)
+                if point_name == "smile_entry"
+                else driver.get_client_metrics(metrics.hwnd)
+            )
+            if (
+                not current.visible
+                or not current.maximized
+                or current.width < 800
+                or current.height < 600
+                or _capture_signature(current) != signature
+            ):
+                raise CalibrationError(CALIBRATION_WINDOW)
+            output_fn(f"步骤: {FAVORITE_STEP_LABELS[point_name]}")
+            try:
+                point = driver.capture_swallowed_click(
+                    metrics.hwnd,
+                    allow_same_process_popup=point_name != "smile_entry",
+                    passthrough=point_name in {"smile_entry", "favorite_tab"},
+                )
+                if point is None:
+                    output_fn("失败: 用户取消")
+                    return None
 
-        ratio = {
-            "x": (point[0] - metrics.left) / metrics.width,
-            "y": (point[1] - metrics.top) / metrics.height,
-        }
-        if point_name == "smile_entry":
-            driver.click_ratio(metrics.hwnd, ratio)
-            sleep_fn(0.45)
-        elif point_name == "favorite_tab":
-            driver.click_bound_process_ratio(metrics.hwnd, ratio)
-            sleep_fn(0.55)
+                if point_name == "smile_entry":
+                    sleep_fn(0.45)
+                elif point_name == "favorite_tab":
+                    sleep_fn(0.55)
+            except CalibrationError as error:
+                if error.code != CALIBRATION_WINDOW:
+                    raise
+                _report_window_failure(output_fn)
+                sleep_fn(0.25)
+                continue
+
+            points[point_name] = point
+            output_fn(f"成功: {FAVORITE_STEP_LABELS[point_name]}")
+            break
 
     manifest = build_favorite_manifest(points, metrics)
     answer = confirm_fn("输入 y 确认保存收藏表情槽位标定，其他输入取消: ")

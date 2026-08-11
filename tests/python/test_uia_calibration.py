@@ -77,10 +77,10 @@ class FakeDriver:
         self.last_metrics = self.metrics[-1]
         self.calls = []
 
-    def find_wechat_window(self):
+    def prepare_calibration_window(self):
         metrics = self.metrics[0] if self.metrics else self.last_metrics
         hwnd = self.last_metrics.hwnd if isinstance(metrics, BaseException) else metrics.hwnd
-        self.calls.append(("find", hwnd))
+        self.calls.append(("prepare", hwnd))
         return hwnd
 
     def get_client_metrics(self, hwnd):
@@ -151,7 +151,7 @@ class CalibrationCollectionTests(OutputPrivacyMixin, unittest.TestCase):
         self.assertEqual(len(capture_indices), 4)
         for index in capture_indices:
             self.assertEqual(driver.calls[index - 1][0], "metrics")
-            self.assertEqual(driver.calls[index - 2][0], "find")
+            self.assertEqual(driver.calls[index - 2][0], "prepare")
 
     def test_window_error_retries_the_same_step_without_advancing(self):
         driver = FakeDriver(
@@ -973,7 +973,7 @@ class FavoriteStickerBundleTests(unittest.TestCase):
                 )
                 self.events = []
 
-            def find_wechat_window(self):
+            def prepare_calibration_window(self):
                 return METRICS.hwnd
 
             def get_client_metrics(self, _hwnd):
@@ -984,8 +984,11 @@ class FavoriteStickerBundleTests(unittest.TestCase):
                 _hwnd,
                 *,
                 allow_same_process_popup=False,
+                passthrough=False,
             ):
-                self.events.append(("capture_point", allow_same_process_popup))
+                self.events.append(
+                    ("capture_point", allow_same_process_popup, passthrough)
+                )
                 return self.points.popleft()
 
             def click_ratio(self, _hwnd, _point):
@@ -1011,6 +1014,41 @@ class FavoriteStickerBundleTests(unittest.TestCase):
         self.assertEqual(len(captured["templates"]), 20)
         self.assertFalse(any(event[0] == "capture_frame" for event in driver.events))
         self.assertFalse(any(event[0] == "park_pointer" for event in driver.events))
+        capture_events = [event for event in driver.events if event[0] == "capture_point"]
+        self.assertEqual(
+            [event[2] for event in capture_events],
+            [True, True, False, False],
+        )
+        self.assertFalse(any(event[0] in {"open_panel", "favorite_tab"} for event in driver.events))
+
+    def test_favorite_calibration_refocuses_and_retries_an_invalid_click(self):
+        driver = mock.Mock()
+        driver.prepare_calibration_window.return_value = METRICS.hwnd
+        driver.get_client_metrics.return_value = METRICS
+        driver.capture_swallowed_click.side_effect = (
+            CalibrationError(CALIBRATION_WINDOW),
+            (180, 820),
+            (260, 820),
+            (300, 220),
+            (1100, 670),
+        )
+        messages = []
+        sleeps = []
+
+        captured = calibration_module.collect_favorite_sticker_calibration(
+            driver,
+            confirm_fn=lambda _prompt: "y",
+            output_fn=messages.append,
+            sleep_fn=sleeps.append,
+        )
+
+        self.assertEqual(len(captured["templates"]), 20)
+        self.assertEqual(driver.capture_swallowed_click.call_count, 5)
+        self.assertGreaterEqual(driver.prepare_calibration_window.call_count, 3)
+        self.assertIn(0.25, sleeps)
+        self.assertTrue(
+            any("失败" in message and CALIBRATION_WINDOW in message for message in messages)
+        )
 
     def test_runtime_matching_finds_a_template_after_grid_reordering(self):
         original = list(range(20))

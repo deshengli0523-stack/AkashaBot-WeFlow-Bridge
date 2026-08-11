@@ -105,6 +105,18 @@ class FakeUser32:
         self.calls.append(("BringWindowToTop", hwnd))
         return 1
 
+    def ShowWindow(self, hwnd, command):
+        self.calls.append(("ShowWindow", hwnd, command))
+        if hwnd not in self.windows:
+            return 0
+        was_visible = self.windows[hwnd].get("visible", False)
+        self.windows[hwnd]["visible"] = True
+        if command == 3:
+            self.maximized = True
+        elif command == 9:
+            self.maximized = False
+        return int(was_visible)
+
     def AttachThreadInput(self, source, target, attach):
         self.calls.append(("AttachThreadInput", source, target, bool(attach)))
         return 1
@@ -779,6 +791,45 @@ class Win32WindowBoundaryTests(unittest.TestCase):
             self.make_driver(user32=user32).find_wechat_window
         )
 
+    def test_prepare_calibration_window_restores_unique_large_hidden_main(self):
+        user32 = FakeUser32()
+        user32.windows[10]["visible"] = False
+        user32.windows[20] = {
+            "class": "Qt51514QWindowIcon",
+            "title": "Weixin",
+            "visible": False,
+        }
+        user32.window_order = [10, 20]
+        user32.window_rects[20] = (1192, 585, 1368, 784)
+        user32.pids[20] = 100
+        user32.foreground = 99
+        user32.maximized = False
+        driver = self.make_driver(user32=user32)
+
+        self.assertEqual(driver.prepare_calibration_window(), 10)
+        self.assertTrue(user32.windows[10]["visible"])
+        self.assertTrue(user32.maximized)
+        self.assertEqual(user32.foreground, 10)
+        self.assertIn(("ShowWindow", 10, 9), user32.calls)
+        self.assertIn(("ShowWindow", 10, 3), user32.calls)
+
+    def test_prepare_calibration_window_rejects_two_ambiguous_hidden_mains(self):
+        user32 = FakeUser32()
+        user32.windows[10]["visible"] = False
+        user32.windows[20] = {
+            "class": "Qt51514QWindowIcon",
+            "title": "Weixin",
+            "visible": False,
+        }
+        user32.window_order = [10, 20]
+        user32.window_rects[20] = (100, 50, 1600, 900)
+        user32.pids[20] = 100
+
+        self.assert_window_error(
+            self.make_driver(user32=user32).prepare_calibration_window
+        )
+        self.assertFalse(any(call[0] == "ShowWindow" for call in user32.calls))
+
     def test_multiple_candidates_require_the_foreground_candidate(self):
         user32 = FakeUser32()
         user32.windows[20] = {
@@ -925,6 +976,24 @@ class Win32CaptureTests(unittest.TestCase):
             [call for call in user32.calls if call[0] == "WindowFromPoint"],
             [("WindowFromPoint", 260, 140)],
         )
+        self.assertIn(("PostQuitMessage", 0), user32.calls)
+
+    def test_valid_passthrough_click_is_observed_without_swallowing(self):
+        user32 = FakeUser32()
+        runner = FakeHookRunner(
+            [
+                ("mouse", WM_LBUTTONDOWN, (260, 140)),
+                ("mouse", WM_LBUTTONUP, (260, 140)),
+            ]
+        )
+
+        point = self.make_driver(user32, runner).capture_swallowed_click(
+            10,
+            passthrough=True,
+        )
+
+        self.assertEqual(point, (260, 140))
+        self.assertEqual(runner.mouse_results, [0, 0])
         self.assertIn(("PostQuitMessage", 0), user32.calls)
 
     def test_other_window_click_swallows_complete_pair_then_raises(self):
