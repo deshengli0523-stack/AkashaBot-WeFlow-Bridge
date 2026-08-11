@@ -26,6 +26,8 @@ WM_LBUTTONUP = 0x0202
 VK_CONTROL = 0x11
 VK_ESCAPE = 0x1B
 GA_ROOT = 2
+SW_MAXIMIZE = 3
+SW_RESTORE = 9
 KEYEVENTF_KEYUP = 0x0002
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -34,6 +36,9 @@ CF_DIB = 8
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_IMAGE_BUFFER_SIZE = 32768
 WECHAT_PROCESS_BASENAMES = frozenset({"wechat.exe", "weixin.exe"})
+WECHAT_MAIN_WINDOW_CLASSES = frozenset(
+    {"Qt51514QWindowIcon", "WeChatMainWndForPC"}
+)
 WECHAT_SEARCH_POPUP_CLASS = "Qt51514QWindowToolSaveBits"
 PER_MONITOR_AWARE = ctypes.c_void_p(-3)
 PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
@@ -170,6 +175,7 @@ class Win32WeChatDriver:
                 ctypes.c_int,
             ),
             "GetForegroundWindow": ([], wintypes.HWND),
+            "ShowWindow": ([wintypes.HWND, ctypes.c_int], wintypes.BOOL),
             "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
             "BringWindowToTop": ([wintypes.HWND], wintypes.BOOL),
             "AttachThreadInput": (
@@ -400,10 +406,7 @@ class Win32WeChatDriver:
                 return True
             class_name = self._window_class(hwnd)
             title = self._window_title(hwnd)
-            supported_class = class_name in {
-                "Qt51514QWindowIcon",
-                "WeChatMainWndForPC",
-            }
+            supported_class = class_name in WECHAT_MAIN_WINDOW_CLASSES
             supported_title = "微信" in title or "WeChat" in title
             if not supported_class and not supported_title:
                 return True
@@ -434,6 +437,69 @@ class Win32WeChatDriver:
                 self._bound_window_identity = selected
                 return selected.hwnd
         raise CalibrationError(CALIBRATION_WINDOW)
+
+    def find_calibration_window(self) -> int:
+        """Find the one plausible WeChat main window, including a tray-hidden one.
+
+        Normal send/receive paths deliberately continue to use
+        ``find_wechat_window`` and therefore never select a hidden window.  The
+        calibration launcher is the only caller that may recover a tray-hidden
+        main window after its console takes focus.
+        """
+        try:
+            return self.find_wechat_window()
+        except CalibrationError as error:
+            if error.code != CALIBRATION_WINDOW:
+                raise
+
+        candidates: list[tuple[_WindowIdentity, int]] = []
+
+        @_WNDENUMPROC
+        def collect(hwnd, _lparam):
+            if self._window_class(hwnd) not in WECHAT_MAIN_WINDOW_CLASSES:
+                return True
+            rect = _RECT()
+            if not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            # Exclude login/toast/helper windows that share the generic Qt
+            # class.  A selected window will still be revalidated at >=800x600
+            # after it is maximized.
+            if width < 640 or height < 480:
+                return True
+            try:
+                identity = self._query_window_identity(int(hwnd))
+            except CalibrationError:
+                return True
+            candidates.append((identity, width * height))
+            return True
+
+        if not self.user32.EnumWindows(collect, 0) or not candidates:
+            raise CalibrationError(CALIBRATION_WINDOW)
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        if len(candidates) > 1 and candidates[0][1] < candidates[1][1] * 2:
+            # Two similarly sized main windows are ambiguous.  Fail closed so
+            # calibration cannot bind to the wrong signed-in account.
+            raise CalibrationError(CALIBRATION_WINDOW)
+
+        selected = candidates[0][0]
+        self._bound_window_identity = selected
+        return selected.hwnd
+
+    def prepare_calibration_window(self) -> int:
+        """Restore, maximize, and foreground one identity-validated main window."""
+        hwnd = self.find_calibration_window()
+        self._ensure_bound_window_identity(hwnd)
+        if not self.user32.IsWindowVisible(hwnd):
+            self.user32.ShowWindow(hwnd, SW_RESTORE)
+        if not self.user32.IsZoomed(hwnd):
+            self.user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        if not self.user32.IsWindowVisible(hwnd) or not self.user32.IsZoomed(hwnd):
+            raise CalibrationError(CALIBRATION_WINDOW)
+        self.activate_receive_window(hwnd)
+        return hwnd
 
     def get_client_metrics(self, hwnd: int) -> ClientMetrics:
         """Return client origin, size, DPI, visible/maximized/foreground flags."""
@@ -627,8 +693,9 @@ class Win32WeChatDriver:
         hwnd: int,
         *,
         allow_same_process_popup: bool = False,
+        passthrough: bool = False,
     ) -> tuple[int, int] | None:
-        """Swallow one complete left-click; Esc cancels and returns None."""
+        """Capture one left-click; optionally let safe navigation clicks through."""
         self._ensure_bound_window_identity(hwnd)
         state = {
             "active_inputs": set(),
@@ -661,10 +728,10 @@ class Win32WeChatDriver:
             if message not in {WM_LBUTTONDOWN, WM_LBUTTONUP}:
                 return 0
             if state["finished"]:
-                return 1
+                return 0 if passthrough else 1
             if message == WM_LBUTTONDOWN:
                 state["active_inputs"].add("mouse")
-                return 1
+                return 0 if passthrough else 1
             if "mouse" in state["active_inputs"]:
                 state["active_inputs"].remove("mouse")
                 if not (
@@ -685,7 +752,7 @@ class Win32WeChatDriver:
                         else:
                             queue_outcome("error")
                 finish_if_idle()
-            return 1
+            return 0 if passthrough else 1
 
         def keyboard_callback(message: int, virtual_key: int) -> int:
             if virtual_key != VK_ESCAPE or message not in {

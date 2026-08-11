@@ -34,6 +34,7 @@ VK_A = 0x41
 VK_C = 0x43
 VK_V = 0x56
 VK_BACKSPACE = 0x08
+VK_RIGHT = 0x27
 VK_ESCAPE = 0x1B
 
 _FAVORITE_ENTRY_TO_TAB_DELAY_RANGE = (0.8, 1.3)
@@ -553,7 +554,9 @@ class UiaFixedSender:
             )
             press_bound = getattr(self.driver, "press_key_bound_process", None)
             if callable(press_bound):
-                press_bound(hwnd, VK_ESCAPE)
+                # Collapse Ctrl+A without sending Esc.  Recent Weixin builds
+                # interpret Esc as "hide the main window to the tray".
+                press_bound(hwnd, VK_RIGHT)
             return bool(empty and restored)
         except Exception:
             return False
@@ -777,7 +780,9 @@ class UiaFixedSender:
                     None,
                 )
                 if callable(press_bound):
-                    press_bound(hwnd, VK_ESCAPE)
+                    # Preserve an unknown draft while only collapsing its
+                    # selection; Esc can hide the entire Weixin window.
+                    press_bound(hwnd, VK_RIGHT)
             except Exception:
                 pass
 
