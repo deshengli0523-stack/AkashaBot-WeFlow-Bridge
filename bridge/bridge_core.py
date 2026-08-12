@@ -758,6 +758,7 @@ class WeFlowBridge:
     def _drain_private_spool(self) -> None:
         if (
             not self._active()
+            or state.paused.is_set()
             or not state.merged_reply_ready()
             or not state.ordinary_ingress_open()
         ):
@@ -817,6 +818,8 @@ class WeFlowBridge:
                         "E_ADMISSION_CAPACITY",
                         "E_OB_STATE_CAPACITY",
                         "E_MERGED_REPLY_NOT_READY",
+                        "E_UIA_DRAFT_QUARANTINED",
+                        "E_UIA_COMMIT_UNKNOWN",
                     }:
                         return
                     if error.code == "E_REPLY_SUPERSEDED":

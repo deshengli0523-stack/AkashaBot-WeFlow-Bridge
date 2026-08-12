@@ -671,6 +671,19 @@ class ReplyStore:
                 or int(current["epoch"]) != epoch
             ):
                 raise ReplyStoreError("E_REPLY_SUPERSEDED")
+            if connection.execute(
+                "SELECT 1 FROM quarantines WHERE target_id=? LIMIT 1",
+                (target_id,),
+            ).fetchone():
+                raise ReplyStoreError("E_UIA_DRAFT_QUARANTINED")
+            if connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE target_id=? AND outcome='commit_unknown' LIMIT 1
+                """,
+                (target_id,),
+            ).fetchone():
+                raise ReplyStoreError("E_UIA_COMMIT_UNKNOWN")
             active_count = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM admissions WHERE state='active'"
@@ -1363,8 +1376,16 @@ class ReplyStore:
                 dict(row)
                 for row in connection.execute(
                     """
-                    SELECT target_id,request_id,reason,created_at
-                    FROM quarantines ORDER BY created_at,target_id
+                    SELECT quarantine.target_id,quarantine.request_id,
+                           quarantine.reason,quarantine.created_at,
+                           COALESCE((
+                               SELECT latest.routing_name FROM jobs AS latest
+                               WHERE latest.target_id=quarantine.target_id
+                               ORDER BY latest.updated_at DESC,latest.rowid DESC
+                               LIMIT 1
+                           ),'') AS routing_name
+                    FROM quarantines AS quarantine
+                    ORDER BY quarantine.created_at,quarantine.target_id
                     """
                 ).fetchall()
             ]
@@ -1376,7 +1397,8 @@ class ReplyStore:
                 dict(row)
                 for row in connection.execute(
                     """
-                    SELECT request_id,target_id,result_revision,error_code,updated_at
+                    SELECT request_id,target_id,result_revision,error_code,
+                           updated_at,routing_name
                     FROM jobs
                     WHERE outcome='commit_unknown'
                     ORDER BY updated_at,request_id
@@ -1384,6 +1406,241 @@ class ReplyStore:
                 ).fetchall()
             ]
         )
+
+    def recovery_snapshot(self) -> dict[str, Any]:
+        """Return privacy-safe per-contact state for the local recovery UI.
+
+        Message text, route credentials, admission tokens and plugin instance
+        identifiers deliberately never leave the store.  The web panel only
+        needs enough identity and state to let an operator resolve one exact
+        ambiguity or release one stale pre-action admission.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            targets: dict[int, dict[str, Any]] = {}
+
+            def target_row(target_id: object) -> dict[str, Any] | None:
+                normalized = _positive_int(target_id)
+                if normalized is None:
+                    return None
+                row = targets.get(normalized)
+                if row is None:
+                    row = {
+                        "target_id": normalized,
+                        "routing_name": "",
+                        "quarantine": None,
+                        "commit_unknown": [],
+                        "active_admissions": [],
+                        "open_jobs": [],
+                        "pending_batches": 0,
+                        "bound_pending_batches": 0,
+                        "oldest_pending_batch_at": None,
+                    }
+                    targets[normalized] = row
+                return row
+
+            # The latest job gives a useful display name without exposing any
+            # reply text, account identifier or source session identifier.
+            for row in connection.execute(
+                """
+                SELECT target_id,routing_name FROM jobs AS candidate
+                WHERE candidate.rowid=(
+                    SELECT latest.rowid FROM jobs AS latest
+                    WHERE latest.target_id=candidate.target_id
+                    ORDER BY latest.updated_at DESC,latest.rowid DESC LIMIT 1
+                )
+                """
+            ).fetchall():
+                item = target_row(row["target_id"])
+                if item is not None:
+                    item["routing_name"] = str(row["routing_name"] or "")
+
+            for row in connection.execute(
+                """
+                SELECT target_id,request_id,reason,created_at
+                FROM quarantines ORDER BY created_at,target_id
+                """
+            ).fetchall():
+                item = target_row(row["target_id"])
+                if item is not None:
+                    item["quarantine"] = {
+                        "request_id": str(row["request_id"]),
+                        "reason": str(row["reason"]),
+                        "created_at": float(row["created_at"]),
+                    }
+
+            for row in connection.execute(
+                """
+                SELECT request_id,target_id,result_revision,error_code,updated_at
+                FROM jobs WHERE outcome='commit_unknown'
+                ORDER BY updated_at,request_id
+                """
+            ).fetchall():
+                item = target_row(row["target_id"])
+                if item is not None:
+                    item["commit_unknown"].append(
+                        {
+                            "request_id": str(row["request_id"]),
+                            "revision": int(row["result_revision"]),
+                            "error_code": str(row["error_code"] or ""),
+                            "updated_at": float(row["updated_at"]),
+                        }
+                    )
+
+            for row in connection.execute(
+                """
+                SELECT target_id,generation,epoch,created_at,updated_at
+                FROM admissions WHERE state='active'
+                ORDER BY created_at,target_id
+                """
+            ).fetchall():
+                item = target_row(row["target_id"])
+                if item is not None:
+                    item["active_admissions"].append(
+                        {
+                            "generation": int(row["generation"]),
+                            "epoch": int(row["epoch"]),
+                            "created_at": float(row["created_at"]),
+                            "updated_at": float(row["updated_at"]),
+                        }
+                    )
+
+            for row in connection.execute(
+                """
+                SELECT target_id,state,stage,created_at,updated_at
+                FROM jobs WHERE outcome=''
+                ORDER BY created_at,request_id
+                """
+            ).fetchall():
+                item = target_row(row["target_id"])
+                if item is not None:
+                    item["open_jobs"].append(
+                        {
+                            "state": str(row["state"]),
+                            "stage": str(row["stage"]),
+                            "created_at": float(row["created_at"]),
+                            "updated_at": float(row["updated_at"]),
+                        }
+                    )
+
+            for row in connection.execute(
+                """
+                SELECT target_id,COUNT(*) AS pending_count,
+                       SUM(CASE WHEN admission_token<>'' THEN 1 ELSE 0 END)
+                           AS bound_count,
+                       MIN(created_at) AS oldest_at
+                FROM ingress_batches
+                WHERE state='pending' AND target_id IS NOT NULL
+                GROUP BY target_id ORDER BY oldest_at,target_id
+                """
+            ).fetchall():
+                item = target_row(row["target_id"])
+                if item is not None:
+                    item["pending_batches"] = int(row["pending_count"])
+                    item["bound_pending_batches"] = int(row["bound_count"] or 0)
+                    item["oldest_pending_batch_at"] = float(row["oldest_at"])
+
+            # Hide ordinary historical contacts.  The initial route-name pass
+            # intentionally populated them so names were available to later
+            # issue rows; only contacts with current work or blockers remain.
+            actionable = [
+                row
+                for row in targets.values()
+                if row["quarantine"] is not None
+                or row["commit_unknown"]
+                or row["active_admissions"]
+                or row["open_jobs"]
+                or row["pending_batches"]
+            ]
+            actionable.sort(
+                key=lambda row: (
+                    0
+                    if row["quarantine"] is not None or row["commit_unknown"]
+                    else 1,
+                    int(row["target_id"]),
+                )
+            )
+            return {
+                "targets": actionable,
+                "summary": {
+                    "contacts": len(actionable),
+                    "blocked_contacts": sum(
+                        1
+                        for row in actionable
+                        if row["quarantine"] is not None
+                        or bool(row["commit_unknown"])
+                    ),
+                    "active_admissions": sum(
+                        len(row["active_admissions"]) for row in actionable
+                    ),
+                    "open_jobs": sum(len(row["open_jobs"]) for row in actionable),
+                    "pending_batches": sum(
+                        int(row["pending_batches"]) for row in actionable
+                    ),
+                },
+            }
+
+        return self._read(operation)
+
+    def release_stale_target(self, target_id: int) -> dict[str, int]:
+        """Release pre-action state for one contact without risking a resend.
+
+        Ambiguous submit outcomes and pasted-draft quarantines must be resolved
+        through their exact, existing workflows first.  An active UI job is
+        also refused because changing it underneath the sender could violate
+        the at-most-once boundary.
+        """
+
+        normalized_target = _positive_int(target_id)
+        if normalized_target is None:
+            raise ReplyStoreError("E_RECOVERY_INVALID_TARGET")
+
+        def operation(connection: sqlite3.Connection) -> dict[str, int]:
+            if connection.execute(
+                "SELECT 1 FROM quarantines WHERE target_id=? LIMIT 1",
+                (normalized_target,),
+            ).fetchone():
+                raise ReplyStoreError("E_RECOVERY_DRAFT_REVIEW_REQUIRED")
+            if connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE target_id=? AND outcome='commit_unknown' LIMIT 1
+                """,
+                (normalized_target,),
+            ).fetchone():
+                raise ReplyStoreError("E_RECOVERY_COMMIT_REVIEW_REQUIRED")
+            if connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE target_id=? AND outcome='' LIMIT 1
+                """,
+                (normalized_target,),
+            ).fetchone():
+                raise ReplyStoreError("E_RECOVERY_JOB_BUSY")
+
+            now = time.time()
+            admissions = connection.execute(
+                """
+                UPDATE admissions
+                SET state='released',outcome='failed',
+                    reason='E_MANUAL_CONTACT_RECOVERY',updated_at=?
+                WHERE target_id=? AND state='active'
+                """,
+                (now, normalized_target),
+            ).rowcount
+            batches = connection.execute(
+                """
+                UPDATE ingress_batches SET admission_token='',updated_at=?
+                WHERE target_id=? AND state='pending' AND admission_token<>''
+                """,
+                (now, normalized_target),
+            ).rowcount
+            return {
+                "released_admissions": int(admissions),
+                "requeued_batches": int(batches),
+            }
+
+        return self._write(operation)
 
     # ------------------------------------------------------------------
     # Closed ingress batch spool.  The in-memory quiet/max window remains in
