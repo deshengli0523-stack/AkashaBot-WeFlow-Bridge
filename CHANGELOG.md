@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.7 - 2026-08-13
+
+- Add a local fault-recovery console with credential-free capability and lease-status, queue,
+  WeChat-window, quarantine, and per-contact diagnostics.
+- Allow an operator to restore/maximize the validated WeChat window, request a
+  safe merged-reply capability re-handshake, and dismiss historical send
+  notices without deleting durable reply state.
+- Add exact human-resolution controls for draft quarantines and unknown commit
+  results, plus a pause-gated action that releases only stale pre-action
+  admissions and requeues their still-pending ingress batches.
+- Keep new batches for a quarantined or commit-unknown contact in the durable
+  spool instead of spending a model reply that cannot yet be sent; the newest
+  batch resumes after the exact blocker is resolved.
+- Stop draining durable private batches while the bridge is paused so a manual
+  contact recovery cannot be immediately reoccupied in the background.
+
+### Automated verification
+
+- All seven PowerShell release suites and 327 Python tests pass through
+  `tests\Run-All.ps1`.
+
 ## 0.4.6hotfix - 2026-08-11
 
 - Recover the native Weixin main window from a hidden or tray-resident state

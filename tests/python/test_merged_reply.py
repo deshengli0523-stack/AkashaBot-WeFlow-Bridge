@@ -154,7 +154,11 @@ class MergedReplyDurabilityTests(unittest.TestCase):
                 error_stage="submit",
             )
             unknown_rows = reopened.list_commit_unknown()
-            self.assertEqual([unknown_request], [row["request_id"] for row in unknown_rows])
+            self.assertEqual(
+                [unknown_request],
+                [row["request_id"] for row in unknown_rows],
+            )
+            self.assertEqual("唯一备注", unknown_rows[0]["routing_name"])
             revision = int(unknown_rows[0]["result_revision"])
             self.assertFalse(
                 reopened.resolve_commit_unknown(unknown_request, revision + 1, "not_sent")
@@ -168,8 +172,182 @@ class MergedReplyDurabilityTests(unittest.TestCase):
                 reopened.lookup_request(unknown_request, unknown_fingerprint)["outcome"],
             )
 
+    def test_recovery_snapshot_and_manual_release_preserve_submit_boundaries(self):
+        with tempfile.TemporaryDirectory(prefix="akasha-recovery-store-") as temp:
+            store = REPLY_STORE.ReplyStore(pathlib.Path(temp) / "reply.sqlite3")
+            generation = store.allocate_generation()
+            plugin_instance = str(uuid.uuid4())
+
+            epoch = store.advance_epoch(101, generation)
+            admission = store.create_admission(
+                target_id=101,
+                generation=generation,
+                epoch=epoch,
+                plugin_instance_id=plugin_instance,
+            )
+            batch_id = store.spool_batch(
+                {"post_type": "message", "message_type": "private"},
+                target_id=101,
+                generation=generation,
+                epoch=epoch,
+            )
+            self.assertTrue(store.bind_batch_admission(batch_id, admission))
+
+            snapshot = store.recovery_snapshot()
+            self.assertEqual(1, snapshot["summary"]["contacts"])
+            self.assertEqual(1, snapshot["summary"]["active_admissions"])
+            self.assertEqual(1, snapshot["summary"]["pending_batches"])
+            self.assertNotIn(
+                admission,
+                json.dumps(snapshot, ensure_ascii=False),
+            )
+            self.assertNotIn(
+                plugin_instance,
+                json.dumps(snapshot, ensure_ascii=False),
+            )
+
+            store.set_quarantine(101, "draft-request", "E_UIA_DRAFT_RECOVERY_REQUIRED")
+            with self.assertRaisesRegex(
+                REPLY_STORE.ReplyStoreError,
+                "E_UIA_DRAFT_QUARANTINED",
+            ):
+                store.create_admission(
+                    target_id=101,
+                    generation=generation,
+                    epoch=epoch,
+                    plugin_instance_id=plugin_instance,
+                )
+            self.assertEqual("active", store.admission_status(admission)["state"])
+            with self.assertRaisesRegex(
+                REPLY_STORE.ReplyStoreError,
+                "E_RECOVERY_DRAFT_REVIEW_REQUIRED",
+            ):
+                store.release_stale_target(101)
+            self.assertTrue(store.resolve_quarantine(101, "draft-request"))
+
+            released = store.release_stale_target(101)
+            self.assertEqual(
+                {"released_admissions": 1, "requeued_batches": 1},
+                released,
+            )
+            self.assertEqual("released", store.admission_status(admission)["state"])
+            self.assertEqual("", store.pending_batches()[0]["admission_token"])
+
+            # Once a request reaches the submit ambiguity boundary, the broad
+            # recovery operation must refuse it; only exact human resolution
+            # with request_id + revision is allowed.
+            second_epoch = store.advance_epoch(202, generation)
+            second_admission = store.create_admission(
+                target_id=202,
+                generation=generation,
+                epoch=second_epoch,
+                plugin_instance_id=plugin_instance,
+            )
+            request_id = str(uuid.uuid4())
+            text = "等待人工确认"
+            fingerprint = (
+                f"202:{generation}:{second_epoch}:"
+                + hashlib.sha256(text.encode("utf-8")).hexdigest()
+            )
+            store.accept_job(
+                request_id=request_id,
+                fingerprint=fingerprint,
+                target_id=202,
+                generation=generation,
+                epoch=second_epoch,
+                text=text,
+                plugin_instance_id=plugin_instance,
+                admission_token=second_admission,
+                routing_name="恢复测试联系人",
+                account="wxid-bot",
+                session="wxid-contact",
+            )
+            store.finish_job(
+                request_id,
+                outcome="commit_unknown",
+                error_code="E_UIA_COMMIT_UNKNOWN",
+                error_stage="submit",
+            )
+            with self.assertRaisesRegex(
+                REPLY_STORE.ReplyStoreError,
+                "E_RECOVERY_COMMIT_REVIEW_REQUIRED",
+            ):
+                store.release_stale_target(202)
+            unknown_target = next(
+                row
+                for row in store.recovery_snapshot()["targets"]
+                if row["target_id"] == 202
+            )
+            self.assertEqual("恢复测试联系人", unknown_target["routing_name"])
+            self.assertEqual(request_id, unknown_target["commit_unknown"][0]["request_id"])
+
+            # A new inbound epoch remains durable but is not sent to AstrBot
+            # while this contact still has an exact human-review boundary.
+            next_epoch = store.advance_epoch(202, generation)
+            with self.assertRaisesRegex(
+                REPLY_STORE.ReplyStoreError,
+                "E_UIA_COMMIT_UNKNOWN",
+            ):
+                store.create_admission(
+                    target_id=202,
+                    generation=generation,
+                    epoch=next_epoch,
+                    plugin_instance_id=plugin_instance,
+                )
+            revision = unknown_target["commit_unknown"][0]["revision"]
+            self.assertTrue(
+                store.resolve_commit_unknown(request_id, revision, "not_sent")
+            )
+            self.assertTrue(
+                store.create_admission(
+                    target_id=202,
+                    generation=generation,
+                    epoch=next_epoch,
+                    plugin_instance_id=plugin_instance,
+                )
+            )
+
 
 class MergedReplyStateTests(unittest.TestCase):
+    def test_manual_rehandshake_exposes_no_capability_credentials(self):
+        state = _load_file(
+            f"state_rehandshake_{uuid.uuid4().hex}",
+            BRIDGE / "state.py",
+            {},
+        )
+        connection = object()
+        state.running = True
+        state.stopping = False
+        state.lifecycle_generation = 9
+        state._ob_ws = connection
+        state._ob_ws_ready.set()
+        state._merged_capability = {
+            "plugin_instance_id": str(uuid.uuid4()),
+            "lease_id": "private-lease-value",
+            "generation": 9,
+            "connection_id": id(connection),
+            "expires_monotonic": time.monotonic() + 10,
+            "recovery_ready": True,
+        }
+
+        public = state.merged_reply_capability_status()
+        self.assertTrue(public["ready"])
+        self.assertNotIn("lease_id", public)
+        self.assertNotIn("plugin_instance_id", public)
+
+        requested = state.request_merged_reply_rehandshake()
+        self.assertTrue(requested["requested"])
+        self.assertEqual(9, requested["generation"])
+        self.assertIsNone(state._merged_capability)
+        self.assertEqual("disconnected", state.merged_reply_capability_status()["phase"])
+
+        state.running = False
+        with self.assertRaisesRegex(
+            state.ReplyStoreError,
+            "E_RECOVERY_MERGED_OFFLINE",
+        ):
+            state.request_merged_reply_rehandshake()
+
     def test_same_contact_epoch_cancels_before_but_not_after_commit(self):
         with tempfile.TemporaryDirectory(prefix="akasha-merged-state-") as temp:
             store = REPLY_STORE.ReplyStore(pathlib.Path(temp) / "state.sqlite3")

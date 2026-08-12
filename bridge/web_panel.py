@@ -21,8 +21,15 @@ if _BRIDGE_MODULE_DIR not in sys.path:
 import state
 import config
 from money_service import MoneyRequestError
-from reply_store import default_store
-from uia_support import CalibrationError, validate_calibration
+from reply_store import ReplyStoreError, default_store
+from uia_support import (
+    CALIBRATION_REQUIRED,
+    CALIBRATION_WINDOW,
+    CalibrationError,
+    Win32WeChatDriver,
+    validate_calibration,
+    validate_runtime_metrics,
+)
 
 log = logging.getLogger("ob11-bridge")
 
@@ -242,6 +249,30 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
 .send-result-title{font-size:12px;font-weight:650;margin-bottom:4px}
 .send-result-message{font-size:13px;line-height:1.5}
 
+/* ===== 故障恢复 ===== */
+.recovery-intro{font-size:13px;line-height:1.65;color:#374151;background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:12px 14px}
+.recovery-panel{border:1px solid var(--line);border-radius:6px;background:#fff;padding:14px}
+.recovery-panel h3{font-size:14px;font-weight:650;margin-bottom:5px}
+.recovery-panel .panel-note{font-size:12px;color:var(--muted);line-height:1.55;margin-bottom:12px}
+.recovery-actions{display:flex;gap:8px;flex-wrap:wrap}
+.recovery-list{display:flex;flex-direction:column;gap:8px}
+.recovery-empty{font-size:13px;color:#047857;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:12px}
+.recovery-item{border:1px solid var(--line);border-radius:6px;padding:12px;background:#fff}
+.recovery-item.blocked{border-color:#fecaca;background:#fffafa}
+.recovery-item.waiting{border-color:#fde68a;background:#fffdf7}
+.recovery-item-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px}
+.recovery-contact{font-size:14px;font-weight:650;overflow-wrap:anywhere}
+.recovery-id{font-size:11px;color:var(--muted);font-weight:400;margin-top:2px}
+.recovery-age{font-size:11px;color:var(--muted);white-space:nowrap}
+.issue-list{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px}
+.issue-chip{font-size:11px;color:#374151;background:#f3f4f6;border:1px solid var(--line);border-radius:999px;padding:3px 8px}
+.issue-chip.blocker{color:#991b1b;background:#fef2f2;border-color:#fecaca}
+.issue-chip.warning{color:#92400e;background:#fffbeb;border-color:#fde68a}
+.diagnostic-lines{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.diagnostic-line{font-size:12px;line-height:1.5;border:1px solid var(--line);border-radius:6px;padding:9px 10px;background:var(--soft)}
+.diagnostic-line strong{display:block;font-size:11px;color:var(--muted);margin-bottom:2px}
+.recovery-scroll{overflow-y:auto;padding-right:3px;display:flex;flex-direction:column;gap:12px}
+
 /* ===== 日志 ===== */
 .log-box{flex:1;min-height:100px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px;font-size:12px;font-family:'Cascadia Code','Fira Code',monospace;color:#374151;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
 .log-box:empty::before{content:'暂无聊天记录';color:#9ca3af}
@@ -294,6 +325,9 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
   <button class="nav-item active" data-tab="dashboard" onclick="switchTab('dashboard')">
     <span>控制面板</span>
   </button>
+  <button class="nav-item" data-tab="recovery" onclick="switchTab('recovery')">
+    <span>故障恢复</span>
+  </button>
   <button class="nav-item" data-tab="settings" onclick="switchTab('settings')">
     <span>基础设置</span>
   </button>
@@ -324,6 +358,7 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
     <div class="send-result" id="sendResult" role="status" aria-live="polite">
       <div class="send-result-title" id="sendResultTitle"></div>
       <div class="send-result-message" id="sendResultMessage"></div>
+      <button class="btn btn-outline" id="btnDismissResult" onclick="dismissLastResult()" style="display:none;margin-top:8px;padding:5px 10px;font-size:11px">清除此条历史提示</button>
     </div>
 
     <div class="send-result" id="draftQuarantinePanel" role="status" aria-live="polite">
@@ -355,6 +390,50 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
       <span class="privacy-note">包含联系人名称和收发正文，仅限本机查看</span>
     </div>
     <div class="log-box" id="chatHistory"></div>
+  </div>
+
+  <!-- ===== 故障恢复页 ===== -->
+  <div class="tab-page" id="page-recovery">
+    <div class="header">
+      <h1>故障恢复</h1>
+      <div class="badge" id="recoveryBadge">检测中...</div>
+    </div>
+
+    <div class="recovery-intro">
+      这里区分“历史发送提示”和“仍在阻塞的状态”。草稿隔离与发送结果未知不会因重启自动消失，必须由你核对微信后精确确认；租约可以安全地重新握手，卡住的联系人任务只能在桥接暂停时释放。
+    </div>
+
+    <div class="status-row">
+      <div class="status-card"><div class="label">微信窗口</div><div class="value" id="recoveryWindow">-</div></div>
+      <div class="status-card"><div class="label">合并回复能力</div><div class="value" id="recoveryCapability">-</div></div>
+      <div class="status-card"><div class="label">阻塞联系人</div><div class="value" id="recoveryBlocked">-</div></div>
+      <div class="status-card"><div class="label">待处理批次</div><div class="value" id="recoveryPending">-</div></div>
+    </div>
+
+    <div class="recovery-scroll">
+      <div class="recovery-panel">
+        <h3>快速恢复</h3>
+        <div class="panel-note">这些操作不会删除聊天记录。恢复微信窗口会把微信置于前台并最大化；重新握手不会重发任何已经提交的回复。</div>
+        <div class="recovery-actions">
+          <button class="btn btn-pink" onclick="restoreWechatWindow()">恢复并最大化微信窗口</button>
+          <button class="btn btn-outline" onclick="restartMergedHandshake()">重新建立合并回复能力</button>
+          <button class="btn btn-outline" onclick="dismissLastResult()">清除历史发送提示</button>
+          <button class="btn btn-outline" onclick="refreshRecovery()">立即重新检测</button>
+        </div>
+      </div>
+
+      <div class="recovery-panel">
+        <h3>联系人恢复</h3>
+        <div class="panel-note">红色项目需要人工核对。黄色项目是仍在排队或处理中；释放卡住任务前请先点击主面板“暂停”。</div>
+        <div class="recovery-list" id="recoveryContacts"></div>
+      </div>
+
+      <div class="recovery-panel">
+        <h3>运行诊断</h3>
+        <div class="panel-note">仅显示数量和状态，不显示消息正文、微信账号、会话 ID、租约或 admission 凭据。</div>
+        <div class="diagnostic-lines" id="recoveryDiagnostics"></div>
+      </div>
+    </div>
   </div>
 
   <!-- ===== 设置页 ===== -->
@@ -406,6 +485,7 @@ function switchTab(name) {
   document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});
   document.querySelector('[data-tab="' + name + '"]').classList.add('active');
   if (name === 'settings') loadConfig();
+  if (name === 'recovery') refreshRecovery();
 }
 
 // ===== 面板刷新 =====
@@ -465,12 +545,14 @@ function refreshDashboard() {
     ) {
       resultPanel.className = 'send-result active ' + outcome.status;
       document.getElementById('sendResultTitle').textContent =
-        outcome.status === 'failed' ? '发送失败' : '已提交，等待 WeFlow 确认';
+        outcome.status === 'failed' ? '最近一次发送失败（历史提示）' : '最近一次发送已提交';
       document.getElementById('sendResultMessage').textContent = outcome.message;
+      document.getElementById('btnDismissResult').style.display = 'inline-flex';
     } else {
       resultPanel.className = 'send-result';
       document.getElementById('sendResultTitle').textContent = '';
       document.getElementById('sendResultMessage').textContent = '';
+      document.getElementById('btnDismissResult').style.display = 'none';
     }
 
     document.getElementById('btnStart').disabled = s.running;
@@ -504,7 +586,7 @@ function refreshDraftQuarantines() {
     while (body.firstChild) body.removeChild(body.firstChild);
     rows.forEach(function(row){
       var line = document.createElement('div');
-      line.textContent = '目标 ' + row.target_id + '：请先人工检查微信输入框。 ';
+      line.textContent = (row.routing_name || ('目标 ' + row.target_id)) + '：请先人工检查微信输入框。 ';
       var button = document.createElement('button');
       button.className = 'btn btn-outline';
       button.textContent = '我已人工检查，恢复此联系人';
@@ -535,7 +617,7 @@ function refreshCommitUnknown() {
     body.replaceChildren();
     rows.forEach(function(row){
       var line = document.createElement('div');
-      line.textContent = '目标 ' + row.target_id + '：请查看微信聊天记录后确认。 ';
+      line.textContent = (row.routing_name || ('目标 ' + row.target_id)) + '：请查看微信聊天记录后确认。 ';
       [['已发送','sent'],['未发送','not_sent']].forEach(function(choice){
         var button = document.createElement('button');
         button.className = 'btn btn-outline';
@@ -556,6 +638,255 @@ function refreshCommitUnknown() {
       body.appendChild(line);
     });
   });
+}
+
+// ===== 故障恢复 =====
+var recoveryRefreshBusy = false;
+var recoveryErrorMap = {
+  'E_RECOVERY_PAUSE_REQUIRED':'请先在控制面板暂停桥接，再释放卡住的联系人任务',
+  'E_RECOVERY_DRAFT_REVIEW_REQUIRED':'请先检查该联系人的微信输入框并解除草稿隔离',
+  'E_RECOVERY_COMMIT_REVIEW_REQUIRED':'请先确认这条回复在微信中到底是否已经发送',
+  'E_RECOVERY_JOB_BUSY':'该联系人仍有发送任务执行中，暂时不能释放',
+  'E_RECOVERY_MERGED_OFFLINE':'AstrBot 尚未连接，当前无法重新握手',
+  'E_UIA_CALIBRATION_REQUIRED':'尚未完成固定坐标标定',
+  'E_UIA_CALIBRATION_INVALID':'固定坐标标定数据无效',
+  'E_UIA_CALIBRATION_WINDOW':'未找到符合要求的微信主窗口',
+  'E_UIA_RECALIBRATION_REQUIRED':'窗口尺寸或 DPI 已变化，需要重新标定',
+  'E_RECOVERY_READ':'恢复状态读取失败',
+  'E_RECOVERY_REQUEST':'恢复请求无效'
+};
+
+function recoveryMessage(code) {
+  return recoveryErrorMap[String(code || '')] || ('操作失败：' + String(code || '未知错误'));
+}
+
+function recoveryPost(path, payload) {
+  return fetch(path, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload || {})
+  }).then(function(response){
+    return response.json().then(function(result){
+      if (!response.ok || result.ok === false) {
+        throw new Error(result.error || 'E_RECOVERY_REQUEST');
+      }
+      return result;
+    });
+  });
+}
+
+function formatRecoveryTime(value) {
+  if (typeof value !== 'number' || !isFinite(value)) return '';
+  var elapsed = Math.max(0, Date.now() / 1000 - value);
+  if (elapsed < 60) return Math.floor(elapsed) + ' 秒前';
+  if (elapsed < 3600) return Math.floor(elapsed / 60) + ' 分钟前';
+  if (elapsed < 86400) return Math.floor(elapsed / 3600) + ' 小时前';
+  return Math.floor(elapsed / 86400) + ' 天前';
+}
+
+function appendIssue(container, label, kind) {
+  var chip = document.createElement('span');
+  chip.className = 'issue-chip' + (kind ? ' ' + kind : '');
+  chip.textContent = label;
+  container.appendChild(chip);
+}
+
+function appendRecoveryButton(container, label, click, className) {
+  var button = document.createElement('button');
+  button.className = 'btn ' + (className || 'btn-outline');
+  button.style.padding = '6px 10px';
+  button.style.fontSize = '11px';
+  button.textContent = label;
+  button.onclick = click;
+  container.appendChild(button);
+}
+
+function resolveDraftRecovery(row) {
+  var name = row.routing_name || ('目标 ' + row.target_id);
+  if (!confirm('请先打开微信检查“' + name + '”的输入框。\\n\\n确认其中没有需要保留的草稿后，才可继续。')) return;
+  recoveryPost('/resolve-draft-quarantine', {
+    target_id:row.target_id,
+    request_id:row.quarantine.request_id
+  }).then(function(result){
+    if (!result.resolved) throw new Error('E_RECOVERY_REQUEST');
+    toast('已解除该联系人的草稿隔离', 'success');
+    refreshDraftQuarantines();
+    refreshRecovery();
+  }).catch(function(error){toast(recoveryMessage(error.message), 'error')});
+}
+
+function resolveCommitRecovery(row, item, resolution) {
+  var name = row.routing_name || ('目标 ' + row.target_id);
+  var prompt = resolution === 'sent'
+    ? '确认微信聊天记录中已经出现这条 Bot 回复？\\n\\n确认后系统会把它记为已发送，不会重试。'
+    : '确认微信聊天记录中没有这条 Bot 回复？\\n\\n确认后系统会把它记为失败，也不会自动重试。';
+  if (!confirm(name + '\\n\\n' + prompt)) return;
+  recoveryPost('/resolve-commit-unknown', {
+    request_id:item.request_id,
+    revision:item.revision,
+    resolution:resolution
+  }).then(function(result){
+    if (!result.resolved) throw new Error('E_RECOVERY_REQUEST');
+    toast('发送结果已确认', 'success');
+    refreshCommitUnknown();
+    refreshRecovery();
+  }).catch(function(error){toast(recoveryMessage(error.message), 'error')});
+}
+
+function releaseContactRecovery(row) {
+  var name = row.routing_name || ('目标 ' + row.target_id);
+  if (!confirm('释放“' + name + '”卡住的发送许可？\\n\\n请先暂停桥接。此操作不会重发已经提交的消息；如果没有待处理批次，需要让联系人再发一条新消息。')) return;
+  recoveryPost('/api/recovery/contact', {target_id:row.target_id}).then(function(result){
+    toast('已释放 ' + result.released_admissions + ' 个卡住任务，重新排队 ' + result.requeued_batches + ' 个批次', 'success');
+    refreshRecovery();
+  }).catch(function(error){toast(recoveryMessage(error.message), 'error')});
+}
+
+function renderRecoveryContacts(rows) {
+  var list = document.getElementById('recoveryContacts');
+  list.replaceChildren();
+  if (!rows.length) {
+    var empty = document.createElement('div');
+    empty.className = 'recovery-empty';
+    empty.textContent = '没有发现被隔离、结果未知或卡住的联系人。';
+    list.appendChild(empty);
+    return;
+  }
+  rows.forEach(function(row){
+    var blocked = !!row.quarantine || (Array.isArray(row.commit_unknown) && row.commit_unknown.length > 0);
+    var item = document.createElement('div');
+    item.className = 'recovery-item ' + (blocked ? 'blocked' : 'waiting');
+
+    var head = document.createElement('div');
+    head.className = 'recovery-item-head';
+    var identity = document.createElement('div');
+    var contact = document.createElement('div');
+    contact.className = 'recovery-contact';
+    contact.textContent = row.routing_name || '未知联系人';
+    var target = document.createElement('div');
+    target.className = 'recovery-id';
+    target.textContent = '本机目标 ID：' + row.target_id;
+    identity.appendChild(contact);
+    identity.appendChild(target);
+    var age = document.createElement('div');
+    age.className = 'recovery-age';
+    var oldest = row.quarantine ? row.quarantine.created_at : row.oldest_pending_batch_at;
+    if (!oldest && row.commit_unknown.length) oldest = row.commit_unknown[0].updated_at;
+    if (!oldest && row.active_admissions.length) oldest = row.active_admissions[0].created_at;
+    if (!oldest && row.open_jobs.length) oldest = row.open_jobs[0].created_at;
+    age.textContent = formatRecoveryTime(oldest);
+    head.appendChild(identity);
+    head.appendChild(age);
+    item.appendChild(head);
+
+    var issues = document.createElement('div');
+    issues.className = 'issue-list';
+    if (row.quarantine) appendIssue(issues, '草稿隔离：需检查输入框', 'blocker');
+    if (row.commit_unknown.length) appendIssue(issues, row.commit_unknown.length + ' 条发送结果未知', 'blocker');
+    if (row.active_admissions.length) appendIssue(issues, row.active_admissions.length + ' 个发送许可未结束', 'warning');
+    if (row.open_jobs.length) {
+      var stages = Array.from(new Set(row.open_jobs.map(function(job){return String(job.stage || job.state || 'unknown')})));
+      appendIssue(issues, row.open_jobs.length + ' 个任务处理中：' + stages.join('、'), 'warning');
+    }
+    if (row.pending_batches) appendIssue(issues, row.pending_batches + ' 个消息批次待推送', 'warning');
+    item.appendChild(issues);
+
+    var actions = document.createElement('div');
+    actions.className = 'recovery-actions';
+    if (row.quarantine) {
+      appendRecoveryButton(actions, '已检查输入框，解除隔离', function(){resolveDraftRecovery(row)}, 'btn-red');
+    }
+    row.commit_unknown.forEach(function(unknown){
+      appendRecoveryButton(actions, '确认已发送', function(){resolveCommitRecovery(row, unknown, 'sent')}, 'btn-outline');
+      appendRecoveryButton(actions, '确认未发送', function(){resolveCommitRecovery(row, unknown, 'not_sent')}, 'btn-outline');
+    });
+    if (
+      row.active_admissions.length
+      && !row.open_jobs.length
+      && !row.quarantine
+      && !row.commit_unknown.length
+    ) {
+      appendRecoveryButton(actions, '释放卡住任务', function(){releaseContactRecovery(row)}, 'btn-amber');
+    }
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+}
+
+function appendDiagnostic(container, title, value) {
+  var line = document.createElement('div');
+  line.className = 'diagnostic-line';
+  var heading = document.createElement('strong');
+  heading.textContent = title;
+  var body = document.createElement('span');
+  body.textContent = value;
+  line.appendChild(heading);
+  line.appendChild(body);
+  container.appendChild(line);
+}
+
+function renderRecovery(data) {
+  var summary = data.summary || {};
+  var windowState = data.window || {};
+  var capability = data.capability || {};
+  var windowEl = document.getElementById('recoveryWindow');
+  windowEl.textContent = windowState.ready ? '前台最大化' : (windowState.found ? '需要置前' : '未找到');
+  windowEl.style.color = windowState.ready ? '#4caf50' : (windowState.found ? '#ff9800' : '#b91c1c');
+  var capabilityEl = document.getElementById('recoveryCapability');
+  capabilityEl.textContent = capability.ready ? '已就绪' : (capability.valid ? '恢复中' : '未就绪');
+  capabilityEl.style.color = capability.ready ? '#4caf50' : (capability.valid ? '#ff9800' : '#b91c1c');
+  document.getElementById('recoveryBlocked').textContent = String(summary.blocked_contacts || 0);
+  document.getElementById('recoveryBlocked').style.color = summary.blocked_contacts ? '#b91c1c' : '#4caf50';
+  document.getElementById('recoveryPending').textContent = String(summary.pending_batches || 0);
+  document.getElementById('recoveryPending').style.color = summary.pending_batches ? '#ff9800' : '#4caf50';
+  document.getElementById('recoveryBadge').textContent = summary.blocked_contacts ? '需要人工处理' : '无人工阻塞';
+
+  renderRecoveryContacts(Array.isArray(data.targets) ? data.targets : []);
+  var diagnostics = document.getElementById('recoveryDiagnostics');
+  diagnostics.replaceChildren();
+  appendDiagnostic(diagnostics, '桥接', data.running ? (data.paused ? '运行中 · 已暂停' : '运行中') : '未运行');
+  appendDiagnostic(diagnostics, '能力租约', capability.ready ? ('有效 · 约 ' + Number(capability.expires_in_seconds || 0).toFixed(1) + ' 秒后续租') : String(capability.phase || '未连接'));
+  appendDiagnostic(diagnostics, '发送队列', (summary.open_jobs || 0) + ' 个执行中 · ' + (summary.active_admissions || 0) + ' 个许可');
+  appendDiagnostic(diagnostics, '持久批次', (summary.pending_batches || 0) + ' 个等待推送');
+  appendDiagnostic(diagnostics, '微信窗口', windowState.ready ? '检查通过' : recoveryMessage(windowState.error_code));
+  var last = data.last_send_result;
+  appendDiagnostic(diagnostics, '最近发送记录', last && last.message ? last.message : '无历史提示');
+}
+
+function refreshRecovery() {
+  if (recoveryRefreshBusy) return;
+  recoveryRefreshBusy = true;
+  fetch('/api/recovery').then(function(response){
+    return response.json().then(function(result){
+      if (!response.ok || result.error) throw new Error(result.error || 'E_RECOVERY_READ');
+      return result;
+    });
+  }).then(renderRecovery).catch(function(error){
+    document.getElementById('recoveryBadge').textContent = '检测失败';
+    toast(recoveryMessage(error.message), 'error');
+  }).finally(function(){recoveryRefreshBusy = false});
+}
+
+function restoreWechatWindow() {
+  recoveryPost('/api/recovery/wechat-window', {}).then(function(){
+    toast('微信窗口已恢复并置于前台', 'success');
+  }).catch(function(error){toast(recoveryMessage(error.message), 'error')});
+}
+
+function restartMergedHandshake() {
+  if (!confirm('重新建立合并回复能力？\\n\\n系统只会作废当前短期租约并重新注册，不会删除任务或重发消息。')) return;
+  recoveryPost('/api/recovery/rehandshake', {}).then(function(){
+    toast('已请求重新握手，通常会在数秒内恢复', 'success');
+    setTimeout(refreshRecovery, 1500);
+  }).catch(function(error){toast(recoveryMessage(error.message), 'error')});
+}
+
+function dismissLastResult() {
+  recoveryPost('/api/recovery/dismiss-result', {}).then(function(){
+    toast('历史发送提示已清除', 'success');
+    refreshDashboard();
+    refreshRecovery();
+  }).catch(function(error){toast(recoveryMessage(error.message), 'error')});
 }
 
 function refreshChatHistory() {
@@ -735,10 +1066,16 @@ refreshDashboard();
 refreshChatHistory();
 refreshDraftQuarantines();
 refreshCommitUnknown();
+refreshRecovery();
 setInterval(refreshDashboard, 500);
 setInterval(refreshChatHistory, 2000);
 setInterval(refreshDraftQuarantines, 2000);
 setInterval(refreshCommitUnknown, 2000);
+setInterval(function(){
+  if (document.getElementById('page-recovery').classList.contains('active')) {
+    refreshRecovery();
+  }
+}, 3000);
 </script>
 </body>
 </html>"""
@@ -754,6 +1091,99 @@ def _is_calibrated() -> bool:
 
 def _sender_status() -> dict[str, object]:
     return {"sender_mode": "uia_fixed", "calibrated": _is_calibrated()}
+
+
+def _window_recovery_status(*, activate: bool = False) -> dict[str, object]:
+    """Inspect or explicitly restore the calibrated WeChat main window."""
+
+    result: dict[str, object] = {
+        "calibrated": _is_calibrated(),
+        "found": False,
+        "visible": False,
+        "maximized": False,
+        "foreground": False,
+        "ready": False,
+        "error_code": "",
+    }
+    if not result["calibrated"]:
+        result["error_code"] = CALIBRATION_REQUIRED
+        return result
+    try:
+        driver = Win32WeChatDriver()
+        hwnd = (
+            driver.prepare_calibration_window()
+            if activate
+            else driver.find_wechat_window()
+        )
+        metrics = driver.get_client_metrics(hwnd)
+        result.update(
+            {
+                "found": True,
+                "visible": bool(metrics.visible),
+                "maximized": bool(metrics.maximized),
+                "foreground": bool(metrics.foreground),
+                "client_width": int(metrics.width),
+                "client_height": int(metrics.height),
+                "dpi": int(metrics.dpi),
+            }
+        )
+        validate_runtime_metrics(config.UIA_FIXED_CALIBRATION, metrics)
+        result["ready"] = True
+    except CalibrationError as error:
+        result["error_code"] = str(getattr(error, "code", CALIBRATION_WINDOW))
+    except Exception:
+        log.exception("[Web] 微信窗口状态检测失败")
+        result["error_code"] = CALIBRATION_WINDOW
+    return result
+
+
+def _recovery_store_snapshot() -> dict[str, object]:
+    snapshot = default_store().recovery_snapshot()
+    route_lookup = getattr(state, "get_private_route", None)
+    if callable(route_lookup):
+        for row in snapshot["targets"]:
+            if row.get("routing_name"):
+                continue
+            try:
+                route = route_lookup(row.get("target_id"))
+            except Exception:
+                route = None
+            if isinstance(route, dict):
+                row["routing_name"] = str(route.get("routing_name") or "")
+    return snapshot
+
+
+def _recovery_snapshot(*, inspect_window: bool = True) -> dict[str, object]:
+    snapshot = _recovery_store_snapshot()
+
+    capability_getter = getattr(state, "merged_reply_capability_status", None)
+    capability = (
+        capability_getter()
+        if callable(capability_getter)
+        else {
+            "present": False,
+            "valid": False,
+            "ready": False,
+            "generation": 0,
+            "expires_in_seconds": 0.0,
+            "phase": "disconnected",
+        }
+    )
+    health_getter = getattr(state, "merged_reply_health", None)
+    health = health_getter() if callable(health_getter) else snapshot["summary"]
+    return {
+        **snapshot,
+        "window": (
+            _window_recovery_status()
+            if inspect_window
+            else {"ready": False, "error_code": "E_NOT_INSPECTED"}
+        ),
+        "capability": capability,
+        "health": health,
+        "last_send_result": state.get_last_send_result(),
+        "running": bool(state.running),
+        "paused": bool(state.paused.is_set()),
+    }
 
 
 def _money_service():
@@ -972,12 +1402,24 @@ class WebHandler(BaseHTTPRequestHandler):
                 status.update(merged_health())
             status.update(_sender_status())
             self.send_json(status)
+        elif request.path == "/api/recovery":
+            try:
+                self.send_json(_recovery_snapshot())
+            except Exception:
+                log.exception("[Web] 故障恢复状态读取失败")
+                self.send_json({"error": "E_RECOVERY_READ"}, 500)
         elif request.path == "/draft-quarantines":
-            self.send_json(
-                {"quarantines": default_store().list_quarantines()}
-            )
+            try:
+                self.send_json(
+                    {"quarantines": default_store().list_quarantines()}
+                )
+            except Exception:
+                self.send_json({"error": "E_RECOVERY_READ"}, 500)
         elif request.path == "/commit-unknown":
-            self.send_json({"rows": default_store().list_commit_unknown()})
+            try:
+                self.send_json({"rows": default_store().list_commit_unknown()})
+            except Exception:
+                self.send_json({"error": "E_RECOVERY_READ"}, 500)
         elif request.path in {
             "/api/money-action/frame",
             "/api/money-action/status",
@@ -1081,6 +1523,81 @@ class WebHandler(BaseHTTPRequestHandler):
             state.paused.clear()
             log.info("[Web] 已恢复")
             self.send_json({"ok": True})
+        elif request_path == "/api/recovery/wechat-window":
+            try:
+                payload = self.read_json_body(1024)
+                if not isinstance(payload, dict) or payload:
+                    raise ValueError("unexpected window recovery payload")
+                result = _window_recovery_status(activate=True)
+                if result["ready"]:
+                    self.send_json({"ok": True, "window": result})
+                else:
+                    self.send_json(
+                        {
+                            "ok": False,
+                            "error": result.get("error_code")
+                            or CALIBRATION_WINDOW,
+                            "window": result,
+                        },
+                        409,
+                    )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.send_json(
+                    {"ok": False, "error": "E_RECOVERY_REQUEST"}, 400
+                )
+        elif request_path == "/api/recovery/rehandshake":
+            try:
+                payload = self.read_json_body(1024)
+                if not isinstance(payload, dict) or payload:
+                    raise ValueError("unexpected handshake payload")
+                restart = getattr(state, "request_merged_reply_rehandshake", None)
+                if not callable(restart):
+                    raise ReplyStoreError("E_RECOVERY_MERGED_OFFLINE")
+                self.send_json({"ok": True, **restart()})
+            except ReplyStoreError as error:
+                self.send_json({"ok": False, "error": error.code}, 409)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.send_json(
+                    {"ok": False, "error": "E_RECOVERY_REQUEST"}, 400
+                )
+        elif request_path == "/api/recovery/dismiss-result":
+            try:
+                payload = self.read_json_body(1024)
+                if not isinstance(payload, dict) or payload:
+                    raise ValueError("unexpected dismiss payload")
+                clear_result = getattr(state, "clear_last_send_result", None)
+                if callable(clear_result):
+                    clear_result()
+                self.send_json({"ok": True})
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.send_json(
+                    {"ok": False, "error": "E_RECOVERY_REQUEST"}, 400
+                )
+        elif request_path == "/api/recovery/contact":
+            try:
+                payload = self.read_json_body(2048)
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != {"target_id"}
+                    or isinstance(payload["target_id"], bool)
+                    or not isinstance(payload["target_id"], int)
+                    or payload["target_id"] <= 0
+                ):
+                    raise ValueError("invalid recovery target")
+                if state.running and not state.paused.is_set():
+                    raise ReplyStoreError("E_RECOVERY_PAUSE_REQUIRED")
+                if state.get_send_preview() is not None:
+                    raise ReplyStoreError("E_RECOVERY_JOB_BUSY")
+                result = default_store().release_stale_target(
+                    payload["target_id"]
+                )
+                self.send_json({"ok": True, **result})
+            except ReplyStoreError as error:
+                self.send_json({"ok": False, "error": error.code}, 409)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self.send_json(
+                    {"ok": False, "error": "E_RECOVERY_REQUEST"}, 400
+                )
         elif request_path == "/cancel-current":
             try:
                 payload = self.read_json_body(1024)

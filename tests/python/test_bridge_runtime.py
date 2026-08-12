@@ -1611,6 +1611,9 @@ class BridgeRuntimeTests(unittest.TestCase):
                 else None
             )
         )
+        state_module.clear_last_send_result = (
+            lambda: setattr(state_module, "last_send_result", None)
+        )
 
         config_module = types.ModuleType("config")
         config_module.CONFIG_FILE = str(config_path)
@@ -1658,6 +1661,103 @@ class BridgeRuntimeTests(unittest.TestCase):
             handler.rfile = io.BytesIO(payload)
         getattr(handler, method)()
         return captured
+
+    def test_web_recovery_api_requires_pause_and_keeps_actions_scoped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            panel, state_module, _ = self._load_web_panel(
+                {
+                    "version": 1,
+                    "points": {
+                        name: {"x": 0.5, "y": 0.5}
+                        for name in (
+                            "search_box",
+                            "first_result",
+                            "message_input",
+                            "send_button",
+                        )
+                    },
+                    "reference": {
+                        "client_width": 1200,
+                        "client_height": 800,
+                        "aspect_ratio": 1.5,
+                        "dpi": 96,
+                    },
+                },
+                config_path,
+                log_path,
+            )
+            self.assertIn("输入框。\\n\\n确认", panel.PAGE)
+            self.assertNotIn("输入框。\n\n确认", panel.PAGE)
+
+            fake_store = types.SimpleNamespace(
+                release_stale_target=mock.Mock(
+                    return_value={
+                        "released_admissions": 1,
+                        "requeued_batches": 1,
+                    }
+                )
+            )
+            state_module.running = True
+            with mock.patch.object(panel, "default_store", return_value=fake_store):
+                refused = self._invoke_web_handler(
+                    panel,
+                    "do_POST",
+                    "/api/recovery/contact",
+                    {"target_id": 101},
+                )
+                self.assertEqual(409, refused["code"])
+                self.assertEqual(
+                    "E_RECOVERY_PAUSE_REQUIRED",
+                    refused["data"]["error"],
+                )
+                fake_store.release_stale_target.assert_not_called()
+
+                state_module.paused.set()
+                recovered = self._invoke_web_handler(
+                    panel,
+                    "do_POST",
+                    "/api/recovery/contact",
+                    {"target_id": 101},
+                )
+                self.assertEqual(200, recovered["code"])
+                self.assertTrue(recovered["data"]["ok"])
+                fake_store.release_stale_target.assert_called_once_with(101)
+
+            state_module.last_send_result = {"status": "failed"}
+            dismissed = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/api/recovery/dismiss-result",
+                {},
+            )
+            self.assertEqual(200, dismissed["code"])
+            self.assertIsNone(state_module.last_send_result)
+
+            snapshot = {
+                "targets": [],
+                "summary": {"blocked_contacts": 0, "pending_batches": 0},
+            }
+            with mock.patch.object(panel, "_recovery_snapshot", return_value=snapshot):
+                status = self._invoke_web_handler(
+                    panel,
+                    "do_GET",
+                    "/api/recovery",
+                )
+            self.assertEqual(snapshot, status["data"])
+
+    def test_web_recovery_ui_never_exposes_private_capability_fields(self):
+        source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
+        self.assertIn("故障恢复", source)
+        self.assertIn("恢复并最大化微信窗口", source)
+        self.assertIn("释放卡住任务", source)
+        self.assertNotIn("row.admission_token", source)
+        self.assertNotIn("capability.lease_id", source)
+        self.assertNotIn("capability.plugin_instance_id", source)
 
     def _load_main_runtime(self, request_get):
         state_module = types.ModuleType("state")

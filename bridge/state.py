@@ -548,6 +548,69 @@ def clear_merged_reply_capability(connection: object = None) -> None:
         _merged_capability = None
 
 
+def merged_reply_capability_status() -> dict[str, object]:
+    """Return a credential-free lease snapshot for local diagnostics."""
+
+    global _merged_capability
+    now = time.monotonic()
+    with _merged_capability_lock:
+        capability = _merged_capability
+        valid = _merged_capability_runtime_valid(capability, now)
+        if capability is not None and not valid:
+            _merged_capability = None
+            capability = None
+        expires_in = (
+            max(0.0, float(capability.get("expires_monotonic") or 0.0) - now)
+            if capability is not None
+            else 0.0
+        )
+        recovery_ready = bool(
+            valid
+            and capability is not None
+            and capability.get("recovery_ready") is True
+        )
+        return {
+            "present": capability is not None,
+            "valid": bool(valid),
+            "ready": recovery_ready,
+            "generation": (
+                int(capability.get("generation") or 0)
+                if capability is not None
+                else 0
+            ),
+            "expires_in_seconds": round(expires_in, 3),
+            "phase": (
+                "ready"
+                if recovery_ready
+                else "recovering"
+                if valid
+                else "disconnected"
+            ),
+        }
+
+
+def request_merged_reply_rehandshake() -> dict[str, object]:
+    """Invalidate only the live lease so the plugin supervisor registers anew.
+
+    Durable admissions and jobs are deliberately left untouched.  Their
+    idempotency boundary remains authoritative while the plugin obtains a new
+    connection-bound capability.
+    """
+
+    global _merged_capability
+    connected = bool(_ob_ws is not None and _ob_ws_ready.is_set())
+    if not running or stopping or not connected:
+        raise ReplyStoreError("E_RECOVERY_MERGED_OFFLINE")
+    with _merged_capability_lock:
+        _merged_capability = None
+    _merged_worker_wake.set()
+    _merged_outbox_wake.set()
+    return {
+        "requested": True,
+        "generation": int(lifecycle_generation),
+    }
+
+
 def _merged_capability_runtime_valid(
     capability: Optional[dict[str, object]],
     now: float,
@@ -1036,7 +1099,9 @@ def merged_reply_health() -> dict[str, object]:
             "spool_pending": 0,
             "draft_quarantines": 0,
         }
-    health["merged_reply_ready"] = merged_reply_ready()
+    capability = merged_reply_capability_status()
+    health["merged_reply_ready"] = bool(capability["ready"])
+    health["merged_reply_capability"] = capability
     return health
 
 # ============ OneBot WebSocket 客户端管理 ============
