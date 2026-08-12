@@ -443,9 +443,8 @@ class Win32WeChatDriver:
 
         Normal send/receive paths deliberately continue to use
         ``find_wechat_window`` and therefore never select a hidden window.  The
-        interactive calibration launcher and the explicit loopback recovery
-        action are the only callers that may recover a tray-hidden main window
-        after their own UI takes focus.
+        interactive calibration launcher is the only caller that may recover
+        a tray-hidden main window after its own UI takes focus.
         """
         try:
             return self.find_wechat_window()

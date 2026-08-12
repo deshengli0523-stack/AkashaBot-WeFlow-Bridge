@@ -412,10 +412,9 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:#fff;height:100v
 
     <div class="recovery-scroll">
       <div class="recovery-panel">
-        <h3>快速恢复</h3>
-        <div class="panel-note">这些操作不会删除聊天记录。恢复微信窗口会把微信置于前台并最大化；重新握手不会重发任何已经提交的回复。</div>
+        <h3>恢复操作</h3>
+        <div class="panel-note">微信窗口状态仅作只读检测；如未就绪，请回到微信手动恢复、置前并最大化。重新握手不会重发任何已经提交的回复。</div>
         <div class="recovery-actions">
-          <button class="btn btn-pink" onclick="restoreWechatWindow()">恢复并最大化微信窗口</button>
           <button class="btn btn-outline" onclick="restartMergedHandshake()">重新建立合并回复能力</button>
           <button class="btn btn-outline" onclick="dismissLastResult()">清除历史发送提示</button>
           <button class="btn btn-outline" onclick="refreshRecovery()">立即重新检测</button>
@@ -867,12 +866,6 @@ function refreshRecovery() {
   }).finally(function(){recoveryRefreshBusy = false});
 }
 
-function restoreWechatWindow() {
-  recoveryPost('/api/recovery/wechat-window', {}).then(function(){
-    toast('微信窗口已恢复并置于前台', 'success');
-  }).catch(function(error){toast(recoveryMessage(error.message), 'error')});
-}
-
 function restartMergedHandshake() {
   if (!confirm('重新建立合并回复能力？\\n\\n系统只会作废当前短期租约并重新注册，不会删除任务或重发消息。')) return;
   recoveryPost('/api/recovery/rehandshake', {}).then(function(){
@@ -1093,8 +1086,8 @@ def _sender_status() -> dict[str, object]:
     return {"sender_mode": "uia_fixed", "calibrated": _is_calibrated()}
 
 
-def _window_recovery_status(*, activate: bool = False) -> dict[str, object]:
-    """Inspect or explicitly restore the calibrated WeChat main window."""
+def _window_diagnostic_status() -> dict[str, object]:
+    """Inspect the calibrated WeChat main window without changing UI state."""
 
     result: dict[str, object] = {
         "calibrated": _is_calibrated(),
@@ -1110,11 +1103,7 @@ def _window_recovery_status(*, activate: bool = False) -> dict[str, object]:
         return result
     try:
         driver = Win32WeChatDriver()
-        hwnd = (
-            driver.prepare_calibration_window()
-            if activate
-            else driver.find_wechat_window()
-        )
+        hwnd = driver.find_wechat_window()
         metrics = driver.get_client_metrics(hwnd)
         result.update(
             {
@@ -1174,7 +1163,7 @@ def _recovery_snapshot(*, inspect_window: bool = True) -> dict[str, object]:
     return {
         **snapshot,
         "window": (
-            _window_recovery_status()
+            _window_diagnostic_status()
             if inspect_window
             else {"ready": False, "error_code": "E_NOT_INSPECTED"}
         ),
@@ -1523,28 +1512,6 @@ class WebHandler(BaseHTTPRequestHandler):
             state.paused.clear()
             log.info("[Web] 已恢复")
             self.send_json({"ok": True})
-        elif request_path == "/api/recovery/wechat-window":
-            try:
-                payload = self.read_json_body(1024)
-                if not isinstance(payload, dict) or payload:
-                    raise ValueError("unexpected window recovery payload")
-                result = _window_recovery_status(activate=True)
-                if result["ready"]:
-                    self.send_json({"ok": True, "window": result})
-                else:
-                    self.send_json(
-                        {
-                            "ok": False,
-                            "error": result.get("error_code")
-                            or CALIBRATION_WINDOW,
-                            "window": result,
-                        },
-                        409,
-                    )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                self.send_json(
-                    {"ok": False, "error": "E_RECOVERY_REQUEST"}, 400
-                )
         elif request_path == "/api/recovery/rehandshake":
             try:
                 payload = self.read_json_body(1024)
