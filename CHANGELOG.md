@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.7hotfix - 2026-08-13
+
+- Remove the web-console action that programmatically restored, foregrounded,
+  and maximized Weixin.  The console now performs read-only window diagnosis
+  and directs the operator to adjust the Weixin window manually.
+- Keep active window preparation confined to the explicit, interactive
+  calibration launcher; ordinary Bridge and web-console operation never calls
+  that preparation path.
+
+### Automated verification
+
+- All seven PowerShell release suites and 328 Python tests pass through
+  `tests\Run-All.ps1`.
+
 ## 0.4.7 - 2026-08-13
 
 - Add a local fault-recovery console with credential-free capability and lease-status, queue,

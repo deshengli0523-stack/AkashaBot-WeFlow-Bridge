@@ -1753,11 +1753,76 @@ class BridgeRuntimeTests(unittest.TestCase):
     def test_web_recovery_ui_never_exposes_private_capability_fields(self):
         source = (BRIDGE / "web_panel.py").read_text(encoding="utf-8")
         self.assertIn("故障恢复", source)
-        self.assertIn("恢复并最大化微信窗口", source)
+        self.assertIn("微信窗口状态仅作只读检测", source)
         self.assertIn("释放卡住任务", source)
+        self.assertNotIn("restoreWechatWindow", source)
+        self.assertNotIn("/api/recovery/wechat-window", source)
+        self.assertNotIn("prepare_calibration_window", source)
         self.assertNotIn("row.admission_token", source)
         self.assertNotIn("capability.lease_id", source)
         self.assertNotIn("capability.plugin_instance_id", source)
+
+    def test_web_window_diagnostic_is_read_only_and_write_endpoint_is_gone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            log_path = root / "bridge.log"
+            log_path.write_text("", encoding="utf-8")
+            calibration = {
+                "schema_version": 1,
+                "completed": True,
+                "coordinate_space": "client_area_ratio",
+                "points": {
+                    name: {"x": 0.5, "y": 0.5}
+                    for name in (
+                        "search_box",
+                        "first_result",
+                        "message_input",
+                        "send_button",
+                    )
+                },
+                "reference": {
+                    "client_width": 1200,
+                    "client_height": 800,
+                    "aspect_ratio": 1.5,
+                    "dpi": 96,
+                },
+            }
+            panel, _, _ = self._load_web_panel(
+                calibration,
+                config_path,
+                log_path,
+            )
+            driver = mock.Mock()
+            driver.find_wechat_window.return_value = 101
+            driver.get_client_metrics.return_value = types.SimpleNamespace(
+                visible=True,
+                maximized=True,
+                foreground=True,
+                width=1200,
+                height=800,
+                dpi=96,
+            )
+            driver.prepare_calibration_window = mock.Mock(
+                side_effect=AssertionError("active window preparation is forbidden")
+            )
+            with mock.patch.object(
+                panel, "Win32WeChatDriver", return_value=driver
+            ):
+                status = panel._window_diagnostic_status()
+            self.assertTrue(status["ready"])
+            driver.find_wechat_window.assert_called_once_with()
+            driver.prepare_calibration_window.assert_not_called()
+
+            removed = self._invoke_web_handler(
+                panel,
+                "do_POST",
+                "/api/recovery/wechat-window",
+                {},
+            )
+            self.assertEqual(404, removed["code"])
+            self.assertEqual({"ok": False}, removed["data"])
 
     def _load_main_runtime(self, request_get):
         state_module = types.ModuleType("state")
